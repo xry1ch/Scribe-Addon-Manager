@@ -96,7 +96,7 @@ function render() {
       </aside>
       <section class="content">
         ${state.error ? `<div class="notice error">${escapeHtml(state.error)}</div>` : ""}
-        ${state.loading ? `<div class="notice">Loading...</div>` : ""}
+        ${state.loading ? `<div class="notice">Working...</div>` : ""}
         ${renderCurrentTab()}
       </section>
     </main>
@@ -125,14 +125,15 @@ function renderSettings() {
     <header class="toolbar">
       <div>
         <h2>Settings</h2>
-        <p>Persist desktop-only defaults for install and update flows.</p>
+        <p>Desktop defaults for install and update actions.</p>
       </div>
       <div class="toolbar-actions">
-        <button class="secondary" id="reset-settings">Reset</button>
-        <button class="primary" id="save-settings">Save</button>
+        <button class="secondary" id="reset-settings" ${disabledAttr()}>Reset</button>
+        <button class="primary" id="save-settings" ${disabledAttr()}>Save</button>
       </div>
     </header>
     ${addonsMissing ? `<div class="notice error">Configured AddOns path does not exist: ${escapeHtml(settings?.addons_dir_override ?? "")}</div>` : ""}
+    <div class="notice">Blank paths use auto-detection or built-in defaults. Backup and download directories are created only when an install or update writes files there.</div>
     <section class="details-grid">
       ${settingField("AddOns path override", "settings-addons-dir", settings?.addons_dir_override ?? "")}
       ${settingField("Backup directory override", "settings-backup-dir", settings?.backup_dir_override ?? "")}
@@ -149,9 +150,9 @@ function renderInstalled() {
     <header class="toolbar">
       <div>
         <h2>Installed Addons</h2>
-        <p>${escapeHtml(state.installed?.addons_dir ?? "No AddOns directory loaded")}</p>
+        ${pathDisplay(state.installed?.addons_dir ?? "No AddOns directory loaded")}
       </div>
-      <button class="primary" id="refresh-installed">Refresh</button>
+      <button class="primary" id="refresh-installed" ${disabledAttr()}>Refresh</button>
     </header>
     <div class="path-row">
       <label for="path-input">AddOns path</label>
@@ -170,9 +171,12 @@ function renderInstalled() {
           </tr>
         </thead>
         <tbody>
-          ${addons
-            .map(
-              (addon) => `
+          ${
+            addons.length === 0
+              ? emptyRow(6, state.installed ? "No installed addons were found in this AddOns directory." : "Refresh to scan your AddOns directory.")
+              : addons
+                  .map(
+                    (addon) => `
                 <tr>
                   <td>${escapeHtml(addon.folder_name)}</td>
                   <td>${escapeHtml(addon.title ?? "-")}</td>
@@ -182,8 +186,9 @@ function renderInstalled() {
                   <td><span class="pill ${addon.valid_manifest ? "ok" : "bad"}">${addon.valid_manifest ? "yes" : "no"}</span></td>
                 </tr>
               `,
-            )
-            .join("")}
+                  )
+                  .join("")
+          }
         </tbody>
       </table>
     </div>
@@ -195,9 +200,9 @@ function renderSearch() {
     <header class="toolbar">
       <div>
         <h2>Search</h2>
-        <p>Search ESOUI/MMOUI metadata on demand.</p>
+        <p>Search remote addon metadata on demand.</p>
       </div>
-      <button class="primary" id="run-search">Search</button>
+      <button class="primary" id="run-search" ${disabledAttr()}>Search</button>
     </header>
     <div class="search-row">
       <input id="search-query" value="${escapeAttr(state.searchQuery)}" placeholder="Addon name, author, or keyword" />
@@ -217,9 +222,12 @@ function renderSearch() {
           </tr>
         </thead>
         <tbody>
-          ${state.searchResults
-            .map(
-              (addon) => `
+          ${
+            state.searchResults.length === 0
+              ? emptyRow(5, state.searchQuery.trim() ? "No remote addons matched this search." : "Enter a search term, then run Search.")
+              : state.searchResults
+                  .map(
+                    (addon) => `
                 <tr class="click-row" data-addon-id="${escapeAttr(addon.uid ?? "")}">
                   <td>${escapeHtml(addon.name ?? "-")}</td>
                   <td>${escapeHtml(addon.author_name ?? "-")}</td>
@@ -228,8 +236,9 @@ function renderSearch() {
                   <td>${escapeHtml(addon.uid ?? "-")}</td>
                 </tr>
               `,
-            )
-            .join("")}
+                  )
+                  .join("")
+          }
         </tbody>
       </table>
     </div>
@@ -255,7 +264,7 @@ function renderDetails() {
         <h2>${escapeHtml(details.name ?? "Addon Details")}</h2>
         <p>${escapeHtml(details.uid ?? "-")}</p>
       </div>
-      <button class="primary" id="plan-install">Plan Install</button>
+      <button class="primary" id="plan-install" ${disabledAttr()}>Plan Install</button>
     </header>
     <div class="path-row">
       <label for="details-path-input">AddOns path</label>
@@ -290,7 +299,7 @@ function renderInstallPlan() {
           <h3>Install Preview</h3>
           <p>Review this plan before continuing.</p>
         </div>
-        <button class="danger" id="confirm-install">Install</button>
+        <button class="danger" id="confirm-install" ${disabledAttr()}>Install</button>
       </div>
       <section class="details-grid">
         ${detailItem("Remote name", plan.remote.name)}
@@ -377,7 +386,7 @@ function renderInstallResult() {
           </tbody>
         </table>
       </div>
-      <button class="primary" id="refresh-installed-after-install">Refresh Installed</button>
+      <button class="primary" id="refresh-installed-after-install" ${disabledAttr()}>Refresh Installed</button>
     </section>
   `;
 }
@@ -389,20 +398,20 @@ function renderUpdates() {
     <header class="toolbar">
       <div>
         <h2>Updates</h2>
-        <p>${escapeHtml(state.updates?.addons_dir ?? "No update check loaded")}</p>
+        ${pathDisplay(state.updates?.addons_dir ?? "No update check loaded")}
       </div>
       <div class="toolbar-actions">
-        <button class="secondary" id="plan-update-all">Plan All Updates</button>
-        <button class="primary" id="refresh-updates">Refresh</button>
+        <button class="secondary" id="plan-update-all" ${disabledAttr()} ${state.updatePlan ? "" : "disabled"}>Plan All Updates</button>
+        <button class="primary" id="refresh-updates" ${disabledAttr()}>Refresh</button>
       </div>
     </header>
     <label class="checkbox-line">
-      <input type="checkbox" id="include-unknown" ${state.includeUnknown ? "checked" : ""} />
-      Include unknown version matches in the read-only plan
+      <input type="checkbox" id="include-unknown" ${state.includeUnknown ? "checked" : ""} ${disabledAttr()} />
+      Include unknown version matches in update plans
     </label>
     <label class="checkbox-line">
-      <input type="checkbox" id="force-update" ${state.forceUpdate ? "checked" : ""} />
-      Allow reinstall planning for current, local-newer, or unknown-version matches
+      <input type="checkbox" id="force-update" ${state.forceUpdate ? "checked" : ""} ${disabledAttr()} />
+      Allow single-addon reinstall planning for current, local-newer, or unknown-version matches
     </label>
     <div class="summary">
       ${summaryItem("Updates", state.updatePlan?.summary.would_update ?? 0)}
@@ -424,10 +433,13 @@ function renderUpdates() {
           </tr>
         </thead>
         <tbody>
-          ${matches
-            .map((match) => {
-              const action = actions.find((item) => item.local_folder === match.local.folder_name);
-              return `
+          ${
+            matches.length === 0
+              ? emptyRow(7, state.updates ? "No installed addons were found to check." : "Refresh to check installed addons against remote metadata.")
+              : matches
+                  .map((match) => {
+                    const action = actions.find((item) => item.local_folder === match.local.folder_name);
+                    return `
                 <tr>
                   <td>${escapeHtml(match.local.folder_name)}</td>
                   <td>${escapeHtml(match.local.display_version ?? "-")}</td>
@@ -438,8 +450,9 @@ function renderUpdates() {
                   <td>${renderUpdatePlanButton(match.status, match.local.folder_name)}</td>
                 </tr>
               `;
-            })
-            .join("")}
+                  })
+                  .join("")
+          }
         </tbody>
       </table>
     </div>
@@ -462,7 +475,7 @@ function renderUpdateAllPlan() {
           <h3>All Updates Preview</h3>
           <p>${plan.summary.planned_updates} planned update${plan.summary.planned_updates === 1 ? "" : "s"} in ${escapeHtml(plan.addons_dir)}</p>
         </div>
-        ${plan.summary.planned_updates > 0 ? `<button class="danger" id="apply-update-all">Apply All Updates</button>` : ""}
+        ${plan.summary.planned_updates > 0 ? `<button class="danger" id="apply-update-all" ${disabledAttr()}>Apply All Updates</button>` : ""}
       </div>
       <div class="summary">
         ${summaryItem("Planned", plan.summary.planned_updates)}
@@ -483,9 +496,12 @@ function renderUpdateAllPlan() {
             </tr>
           </thead>
           <tbody>
-            ${plan.actions
-              .map(
-                (action) => `
+            ${
+              plan.actions.length === 0
+                ? emptyRow(6, "No update candidates were found in this plan.")
+                : plan.actions
+                    .map(
+                      (action) => `
                   <tr>
                     <td>${escapeHtml(action.local_folder)}</td>
                     <td>${escapeHtml(action.local_version ?? "-")}</td>
@@ -495,8 +511,9 @@ function renderUpdateAllPlan() {
                     <td><span class="pill ${action.update_all_action === "would-update" ? "ok" : ""}">${escapeHtml(action.update_all_action)}</span></td>
                   </tr>
                 `,
-              )
-              .join("")}
+                    )
+                    .join("")
+            }
           </tbody>
         </table>
       </div>
@@ -531,9 +548,12 @@ function renderUpdateAllResult() {
             </tr>
           </thead>
           <tbody>
-            ${result.results
-              .map(
-                (item) => `
+            ${
+              result.results.length === 0
+                ? emptyRow(6, "No addons were updated.")
+                : result.results
+                    .map(
+                      (item) => `
                   <tr>
                     <td>${escapeHtml(item.target.local_folder)}</td>
                     <td>${escapeHtml(item.remote_details.name ?? item.target.remote_name ?? "-")}</td>
@@ -543,8 +563,9 @@ function renderUpdateAllResult() {
                     <td>${escapeHtml(item.backup_dir ?? "-")}</td>
                   </tr>
                 `,
-              )
-              .join("")}
+                    )
+                    .join("")
+            }
           </tbody>
         </table>
       </div>
@@ -554,11 +575,11 @@ function renderUpdateAllResult() {
 
 function renderUpdatePlanButton(status: string, target: string) {
   if (status === "possible-update") {
-    return `<button class="primary small" data-plan-update-target="${escapeAttr(target)}">Plan Update</button>`;
+    return `<button class="primary small" data-plan-update-target="${escapeAttr(target)}" ${disabledAttr()}>Plan Update</button>`;
   }
 
   if (state.forceUpdate && ["matched", "unknown-update", "local-newer"].includes(status)) {
-    return `<button class="secondary small" data-plan-update-target="${escapeAttr(target)}">Plan Reinstall</button>`;
+    return `<button class="secondary small" data-plan-update-target="${escapeAttr(target)}" ${disabledAttr()}>Plan Reinstall</button>`;
   }
 
   return "-";
@@ -586,7 +607,7 @@ function renderSingleUpdatePlan() {
           <h3>Update Preview</h3>
           <p>${escapeHtml(plan.local.folder_name)} -> ${escapeHtml(plan.remote?.name ?? "-")}</p>
         </div>
-        <button class="danger" id="confirm-update">Update</button>
+        <button class="danger" id="confirm-update" ${disabledAttr()}>Update</button>
       </div>
       <section class="details-grid">
         ${detailItem("Decision", plan.decision)}
@@ -767,6 +788,12 @@ function loadInstalled() {
 }
 
 function runSearch() {
+  if (!state.searchQuery.trim()) {
+    state.searchResults = [];
+    render();
+    return;
+  }
+
   return withLoading(async () => {
     const response = await invoke<SearchResponse>("search_remote_addons", {
       query: state.searchQuery,
@@ -873,13 +900,12 @@ function confirmUpdate() {
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
       path: state.path || null,
     });
-    state.updates = await invoke<CheckAddonsResponse>("check_addons", {
-      path: effectiveAddonsPath(),
-    });
-    state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
+    const updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
       path: effectiveAddonsPath(),
       includeUnknown: updateIncludeUnknownDefault(),
     });
+    state.updatePlan = updatePlan;
+    state.updates = updatesFromPlan(updatePlan);
   });
 }
 
@@ -920,26 +946,24 @@ function applyUpdateAll() {
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
       path: state.path || null,
     });
-    state.updates = await invoke<CheckAddonsResponse>("check_addons", {
-      path: effectiveAddonsPath(),
-    });
-    state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
+    const updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
       path: effectiveAddonsPath(),
       includeUnknown: updateIncludeUnknownDefault(),
     });
+    state.updatePlan = updatePlan;
+    state.updates = updatesFromPlan(updatePlan);
   });
 }
 
 function loadUpdates() {
   return withLoading(async () => {
-    state.updates = await invoke<CheckAddonsResponse>("check_addons", {
-      path: effectiveAddonsPath(),
-    });
-    state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
+    const updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
       path: effectiveAddonsPath(),
       includeUnknown: updateIncludeUnknownDefault(),
     });
-    state.path = state.updates.addons_dir;
+    state.updatePlan = updatePlan;
+    state.updates = updatesFromPlan(updatePlan);
+    state.path = updatePlan.addons_dir;
     state.singleUpdatePlan = null;
     state.singleUpdateResult = null;
     state.updateAllPlan = null;
@@ -1073,15 +1097,39 @@ function settingField(label: string, id: string, value: string) {
   return `
     <label class="setting-item" for="${escapeAttr(id)}">
       <span>${escapeHtml(label)}</span>
-      <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="Leave blank for default" />
+      <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="Leave blank for default" ${disabledAttr()} />
     </label>
   `;
+}
+
+function pathDisplay(value: string) {
+  return `<p class="path-display" title="${escapeAttr(value)}">${escapeHtml(value)}</p>`;
+}
+
+function emptyRow(colspan: number, message: string) {
+  return `
+    <tr>
+      <td class="empty-cell" colspan="${colspan}">${escapeHtml(message)}</td>
+    </tr>
+  `;
+}
+
+function disabledAttr() {
+  return state.loading ? "disabled" : "";
+}
+
+function updatesFromPlan(plan: PlanUpdatesResponse): CheckAddonsResponse {
+  return {
+    addons_dir: plan.addons_dir,
+    remote_addons_loaded: plan.remote_addons_loaded,
+    matches: plan.matches,
+  };
 }
 
 function settingCheckbox(label: string, id: string, value: boolean) {
   return `
     <label class="setting-item checkbox" for="${escapeAttr(id)}">
-      <input type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} />
+      <input type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} ${disabledAttr()} />
       <span>${escapeHtml(label)}</span>
     </label>
   `;

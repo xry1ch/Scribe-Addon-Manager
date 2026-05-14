@@ -72,6 +72,7 @@ export interface PlanUpdatesResponse {
   addons_dir: string;
   remote_addons_loaded: number;
   include_unknown: boolean;
+  matches: MatchResult[];
   actions: PlannedAction[];
   summary: {
     would_update: number;

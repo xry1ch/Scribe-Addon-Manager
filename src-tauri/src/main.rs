@@ -123,6 +123,7 @@ struct PlanUpdatesResponse {
     addons_dir: String,
     remote_addons_loaded: usize,
     include_unknown: bool,
+    matches: Vec<MatchResultDto>,
     actions: Vec<PlannedActionDto>,
     summary: UpdatePlanSummaryDto,
 }
@@ -428,6 +429,7 @@ async fn plan_updates(
         addons_dir: path_string(&addons_dir),
         remote_addons_loaded: remote_addons.len(),
         include_unknown,
+        matches: matches.iter().map(match_result_dto).collect(),
         actions: plan.actions.iter().map(planned_action_dto).collect(),
         summary: UpdatePlanSummaryDto {
             would_update: summary.would_update,

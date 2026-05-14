@@ -97,6 +97,13 @@ nav {
   margin: 8px 0 12px;
 }
 
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .toolbar h3 {
   margin: 0;
   font-size: 18px;
@@ -111,6 +118,13 @@ nav {
   margin: 4px 0 0;
   color: #637083;
   word-break: break-word;
+}
+
+.path-display {
+  max-width: min(760px, 62vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .primary {
@@ -158,6 +172,13 @@ nav {
 
 .danger:hover {
   background: #8f1d15;
+}
+
+button:disabled,
+input:disabled,
+select:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .notice {
@@ -228,6 +249,11 @@ td {
   text-align: left;
   vertical-align: top;
   overflow-wrap: anywhere;
+}
+
+.empty-cell {
+  color: #637083;
+  text-align: center;
 }
 
 th {
