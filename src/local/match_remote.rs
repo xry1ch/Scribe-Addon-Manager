@@ -1,12 +1,12 @@
-use std::cmp::Reverse;
-
 use crate::api::models::AddonSummary;
+use crate::local::version::{compare_versions, VersionComparison};
 use crate::local::LocalAddon;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchStatus {
     Matched,
     PossibleUpdate,
+    LocalNewer,
     UnknownUpdate,
     NoMatch,
     Library,
@@ -18,6 +18,7 @@ impl MatchStatus {
         match self {
             Self::Matched => "matched",
             Self::PossibleUpdate => "possible-update",
+            Self::LocalNewer => "local-newer",
             Self::UnknownUpdate => "unknown-update",
             Self::NoMatch => "no-match",
             Self::Library => "library",
@@ -32,6 +33,9 @@ pub struct RemoteCandidate {
     pub name: Option<String>,
     pub version: Option<String>,
     pub updated: Option<i64>,
+    pub tier: u8,
+    pub score: usize,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +44,7 @@ pub struct MatchResult {
     pub status: MatchStatus,
     pub remote: Option<RemoteCandidate>,
     pub candidates: Vec<RemoteCandidate>,
+    pub debug_candidates: Vec<RemoteCandidate>,
 }
 
 pub fn match_installed_addons(
@@ -53,113 +58,144 @@ pub fn match_installed_addons(
 }
 
 fn match_one(local: &LocalAddon, remote_addons: &[AddonSummary]) -> MatchResult {
-    let mut matches = exact_folder_matches(local, remote_addons);
-    if matches.is_empty() {
-        matches = exact_title_matches(local, remote_addons);
-    }
-    if matches.is_empty() {
-        matches = fuzzy_matches(local, remote_addons);
-    }
+    let mut candidates = scored_candidates(local, remote_addons);
+    candidates.sort_by(|left, right| {
+        left.tier
+            .cmp(&right.tier)
+            .then_with(|| right.score.cmp(&left.score))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let debug_candidates = candidates.iter().take(8).cloned().collect::<Vec<_>>();
 
-    if matches.len() > 1 {
-        matches.sort_by_key(|remote| Reverse(candidate_score(local, remote)));
+    let Some(best) = candidates.first() else {
+        return MatchResult {
+            local: local.clone(),
+            status: if local.is_library == Some(true) {
+                MatchStatus::Library
+            } else {
+                MatchStatus::NoMatch
+            },
+            remote: None,
+            candidates: Vec::new(),
+            debug_candidates,
+        };
+    };
+
+    let best_tier = best.tier;
+    let best_score = best.score;
+    let best_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.tier == best_tier && candidate.score == best_score)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if best_candidates.len() > 1 {
         return MatchResult {
             local: local.clone(),
             status: MatchStatus::Ambiguous,
             remote: None,
-            candidates: matches
-                .into_iter()
-                .take(5)
-                .map(RemoteCandidate::from)
-                .collect(),
+            candidates: best_candidates,
+            debug_candidates,
         };
     }
 
-    if let Some(remote) = matches.into_iter().next() {
+    let best = best_candidates.into_iter().next().expect("best candidate");
+    let Some(remote) = remote_addons
+        .iter()
+        .find(|remote| remote.uid == best.uid && remote.name == best.name)
+    else {
         return MatchResult {
             local: local.clone(),
-            status: version_status(local, remote),
-            remote: Some(RemoteCandidate::from(remote)),
+            status: MatchStatus::NoMatch,
+            remote: None,
             candidates: Vec::new(),
+            debug_candidates,
         };
-    }
+    };
 
     MatchResult {
         local: local.clone(),
-        status: if local.is_library == Some(true) {
-            MatchStatus::Library
-        } else {
-            MatchStatus::NoMatch
-        },
-        remote: None,
+        status: version_status(local, remote),
+        remote: Some(best),
         candidates: Vec::new(),
+        debug_candidates,
     }
 }
 
-fn exact_folder_matches<'a>(
-    local: &LocalAddon,
-    remote_addons: &'a [AddonSummary],
-) -> Vec<&'a AddonSummary> {
-    let local_folder = normalize_identity(&local.folder_name);
-    if local_folder.is_empty() {
-        return Vec::new();
-    }
-
-    remote_addons
-        .iter()
-        .filter(|remote| {
-            remote
-                .directories
-                .iter()
-                .any(|directory| normalize_identity(directory) == local_folder)
-        })
-        .collect()
-}
-
-fn exact_title_matches<'a>(
-    local: &LocalAddon,
-    remote_addons: &'a [AddonSummary],
-) -> Vec<&'a AddonSummary> {
-    let Some(title) = local.title.as_deref() else {
-        return Vec::new();
-    };
-    let title = normalize_identity(title);
-    if title.is_empty() {
-        return Vec::new();
-    }
-
-    remote_addons
-        .iter()
-        .filter(|remote| {
-            remote.name.as_deref().map(normalize_identity).as_deref() == Some(title.as_str())
-        })
-        .collect()
-}
-
-fn fuzzy_matches<'a>(
-    local: &LocalAddon,
-    remote_addons: &'a [AddonSummary],
-) -> Vec<&'a AddonSummary> {
+fn scored_candidates(local: &LocalAddon, remote_addons: &[AddonSummary]) -> Vec<RemoteCandidate> {
     let local_folder = normalize_identity(&local.folder_name);
     let local_title = local.title.as_deref().map(normalize_identity);
 
     remote_addons
         .iter()
-        .filter(|remote| {
-            let remote_name = remote.name.as_deref().map(normalize_identity);
-            let folder_match = remote.directories.iter().any(|directory| {
-                let remote_dir = normalize_identity(directory);
-                contains_either(&local_folder, &remote_dir)
-            });
-            let title_match = local_title
-                .as_deref()
-                .zip(remote_name.as_deref())
-                .map(|(local_title, remote_name)| contains_either(local_title, remote_name))
-                .unwrap_or(false);
-
-            folder_match || title_match
+        .filter_map(|remote| {
+            candidate_match(
+                remote,
+                &local_folder,
+                local_title.as_deref().filter(|title| !title.is_empty()),
+            )
         })
         .collect()
+}
+
+fn candidate_match(
+    remote: &AddonSummary,
+    local_folder: &str,
+    local_title: Option<&str>,
+) -> Option<RemoteCandidate> {
+    let remote_name = remote.name.as_deref().map(normalize_identity);
+    let primary_directory = remote
+        .directories
+        .first()
+        .map(|directory| normalize_identity(directory));
+    let bundled_directories = remote
+        .directories
+        .iter()
+        .skip(1)
+        .map(|directory| normalize_identity(directory))
+        .collect::<Vec<_>>();
+
+    let (tier, score, reason) = if remote_name.as_deref() == Some(local_folder) {
+        (1, 100, "exact-folder-ui-name")
+    } else if local_title
+        .zip(remote_name.as_deref())
+        .is_some_and(|(local_title, remote_name)| local_title == remote_name)
+    {
+        (1, 95, "exact-title-ui-name")
+    } else if primary_directory.as_deref() == Some(local_folder) {
+        (2, 80, "primary-directory")
+    } else if bundled_directories
+        .iter()
+        .any(|directory| directory == local_folder)
+    {
+        (3, 60, "bundled-directory")
+    } else if remote_name
+        .as_deref()
+        .is_some_and(|remote_name| contains_either(local_folder, remote_name))
+        || local_title
+            .zip(remote_name.as_deref())
+            .is_some_and(|(local_title, remote_name)| contains_either(local_title, remote_name))
+        || primary_directory
+            .as_deref()
+            .is_some_and(|primary_directory| contains_either(local_folder, primary_directory))
+        || bundled_directories
+            .iter()
+            .any(|directory| contains_either(local_folder, directory))
+    {
+        (4, 30, "loose-normalized")
+    } else {
+        return None;
+    };
+
+    Some(RemoteCandidate {
+        uid: remote.uid.clone(),
+        name: remote.name.clone(),
+        version: remote.version.clone(),
+        updated: remote.date,
+        tier,
+        score,
+        reason: reason.to_owned(),
+    })
 }
 
 fn contains_either(left: &str, right: &str) -> bool {
@@ -168,65 +204,16 @@ fn contains_either(left: &str, right: &str) -> bool {
         && (left == right || left.contains(right) || right.contains(left))
 }
 
-fn candidate_score(local: &LocalAddon, remote: &AddonSummary) -> usize {
-    let local_folder = normalize_identity(&local.folder_name);
-    let local_title = local.title.as_deref().map(normalize_identity);
-    let remote_name = remote.name.as_deref().map(normalize_identity);
-
-    let folder_score = remote
-        .directories
-        .iter()
-        .map(|directory| normalize_identity(directory))
-        .map(|directory| {
-            if directory == local_folder {
-                100
-            } else if contains_either(&directory, &local_folder) {
-                50
-            } else {
-                0
-            }
-        })
-        .max()
-        .unwrap_or(0);
-
-    let title_score = local_title
-        .as_deref()
-        .zip(remote_name.as_deref())
-        .map(|(local_title, remote_name)| {
-            if local_title == remote_name {
-                90
-            } else if contains_either(local_title, remote_name) {
-                40
-            } else {
-                0
-            }
-        })
-        .unwrap_or(0);
-
-    folder_score + title_score
-}
-
 fn version_status(local: &LocalAddon, remote: &AddonSummary) -> MatchStatus {
     let local_version = local.addon_version.as_deref().or(local.version.as_deref());
     let remote_version = remote.version.as_deref();
 
-    match (
-        local_version.and_then(parse_numeric_version),
-        remote_version.and_then(parse_numeric_version),
-    ) {
-        (Some(local), Some(remote)) if remote > local => MatchStatus::PossibleUpdate,
-        (Some(_), Some(_)) => MatchStatus::Matched,
-        _ => MatchStatus::UnknownUpdate,
+    match compare_versions(local_version, remote_version) {
+        VersionComparison::RemoteNewer => MatchStatus::PossibleUpdate,
+        VersionComparison::Same => MatchStatus::Matched,
+        VersionComparison::LocalNewer => MatchStatus::LocalNewer,
+        VersionComparison::Unknown => MatchStatus::UnknownUpdate,
     }
-}
-
-fn parse_numeric_version(value: &str) -> Option<u64> {
-    let value = value.trim();
-    if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-
-    value.parse().ok()
 }
 
 fn normalize_identity(value: &str) -> String {
@@ -275,17 +262,6 @@ fn strip_eso_color_codes(value: &str) -> String {
     }
 
     stripped
-}
-
-impl From<&AddonSummary> for RemoteCandidate {
-    fn from(addon: &AddonSummary) -> Self {
-        Self {
-            uid: addon.uid.clone(),
-            name: addon.name.clone(),
-            version: addon.version.clone(),
-            updated: addon.date,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -392,6 +368,79 @@ mod tests {
     }
 
     #[test]
+    fn exact_ui_name_beats_bundled_library_directory() {
+        let result = match_one(
+            &local("LibAddonMenu-2.0", Some("LibAddonMenu-2.0"), Some("43")),
+            &[
+                remote(
+                    "1135",
+                    "Provision's TeamFormation : Teammate Radar",
+                    "1",
+                    &["TeamFormation", "LibAddonMenu-2.0"],
+                ),
+                remote("7", "LibAddonMenu-2.0", "43", &["LibAddonMenu-2.0"]),
+            ],
+        );
+
+        assert_ne!(result.status, MatchStatus::Ambiguous);
+        assert_eq!(result.remote.unwrap().uid.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn exact_title_ui_name_beats_bundled_directory_match() {
+        let result = match_one(
+            &local("SomeFolder", Some("LibAddonMenu-2.0"), Some("43")),
+            &[
+                remote(
+                    "1135",
+                    "Provision's TeamFormation : Teammate Radar",
+                    "1",
+                    &["TeamFormation", "SomeFolder"],
+                ),
+                remote("7", "LibAddonMenu-2.0", "43", &["OtherFolder"]),
+            ],
+        );
+
+        assert_eq!(result.remote.unwrap().uid.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn exact_folder_ui_name_beats_bundled_directory_match() {
+        let result = match_one(
+            &local("LibAddonMenu-2.0", Some("Other Title"), Some("43")),
+            &[
+                remote(
+                    "1135",
+                    "Provision's TeamFormation : Teammate Radar",
+                    "1",
+                    &["TeamFormation", "LibAddonMenu-2.0"],
+                ),
+                remote("7", "LibAddonMenu-2.0", "43", &["OtherFolder"]),
+            ],
+        );
+
+        assert_eq!(result.remote.unwrap().uid.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn bundled_only_match_still_matches_as_lower_tier() {
+        let result = match_one(
+            &local("LibAddonMenu-2.0", Some("Other Title"), Some("43")),
+            &[remote(
+                "1135",
+                "Provision's TeamFormation : Teammate Radar",
+                "1",
+                &["TeamFormation", "LibAddonMenu-2.0"],
+            )],
+        );
+
+        let remote = result.remote.unwrap();
+        assert_eq!(remote.uid.as_deref(), Some("1135"));
+        assert_eq!(remote.tier, 3);
+        assert_eq!(remote.reason, "bundled-directory");
+    }
+
+    #[test]
     fn numeric_version_comparison() {
         let result = match_one(
             &local("Addon", Some("Addon"), Some("10")),
@@ -402,12 +451,37 @@ mod tests {
     }
 
     #[test]
-    fn non_numeric_version_unknown() {
+    fn dotted_version_comparison() {
         let result = match_one(
             &local("Addon", Some("Addon"), Some("1.0")),
             &[remote("1", "Addon", "1.1", &["Addon"])],
         );
 
-        assert_eq!(result.status, MatchStatus::UnknownUpdate);
+        assert_eq!(result.status, MatchStatus::PossibleUpdate);
+    }
+
+    #[test]
+    fn addon_version_matches_remote_release_marker() {
+        let result = match_one(
+            &local("LibAddonMenu-2.0", Some("LibAddonMenu-2.0"), Some("43")),
+            &[remote(
+                "7",
+                "LibAddonMenu-2.0",
+                "2.0 r43",
+                &["LibAddonMenu-2.0"],
+            )],
+        );
+
+        assert_eq!(result.status, MatchStatus::Matched);
+    }
+
+    #[test]
+    fn local_newer_version_status() {
+        let result = match_one(
+            &local("Addon", Some("Addon"), Some("44")),
+            &[remote("1", "Addon", "2.0 r43", &["Addon"])],
+        );
+
+        assert_eq!(result.status, MatchStatus::LocalNewer);
     }
 }

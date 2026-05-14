@@ -12,9 +12,10 @@ use crate::install::apply::{self, InstallResult};
 use crate::install::plan::{self, InstallPlan, InstallPlanAction};
 use crate::install::remote;
 use crate::install::update;
+use crate::install::update_all as update_all_core;
 use crate::install::zip_safety::{self, ExtractedZip, ZipInspection};
 use crate::local::match_remote::{self, MatchResult};
-use crate::local::update_plan::{self, PlannedActionKind, UpdatePlan};
+use crate::local::update_plan::{self, PlannedActionKind, PlannedAddonAction, UpdatePlan};
 use crate::local::{self, LocalAddon};
 
 #[derive(Debug, Parser)]
@@ -71,6 +72,9 @@ pub enum Commands {
 
         #[arg(long)]
         limit: Option<usize>,
+
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Print a read-only dry-run update plan.
@@ -157,6 +161,33 @@ pub enum Commands {
 
         #[arg(long)]
         force: bool,
+    },
+
+    /// Update all installed addons with reliable update candidates.
+    UpdateAll {
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        #[arg(long)]
+        refresh: bool,
+
+        #[arg(long)]
+        yes: bool,
+
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
+
+        #[arg(long)]
+        keep_download: bool,
+
+        #[arg(long)]
+        download_dir: Option<PathBuf>,
+
+        #[arg(long)]
+        include_unknown: bool,
+
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
@@ -284,6 +315,7 @@ pub async fn check(
     path: Option<&Path>,
     refresh: bool,
     limit: Option<usize>,
+    verbose: bool,
 ) -> Result<()> {
     if refresh {
         tracing::debug!("refresh requested; fetching live remote FileList");
@@ -308,7 +340,7 @@ pub async fn check(
     println!("AddOns directory: {}", path.display());
     println!("Remote addons loaded: {}", remote_addons.len());
     println!();
-    print_check_results(&results);
+    print_check_results(&results, verbose);
     Ok(())
 }
 
@@ -352,6 +384,137 @@ pub async fn plan_update(
     println!();
     print_update_plan(&plan);
     Ok(())
+}
+
+pub async fn update_all(
+    client: &ApiClient,
+    path: Option<&Path>,
+    refresh: bool,
+    yes: bool,
+    backup_dir: Option<&Path>,
+    keep_download: bool,
+    download_dir: Option<&Path>,
+    include_unknown: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    if refresh {
+        tracing::debug!("refresh requested; fetching live remote FileList");
+    }
+
+    let addons_dir = match path {
+        Some(path) => path.to_path_buf(),
+        None => local::detect_best_addons_dir()
+            .ok_or_else(|| anyhow!("could not auto-detect an ESO AddOns directory"))?,
+    };
+
+    let mut local_addons = local::scan_addons_dir(&addons_dir)
+        .with_context(|| format!("failed to scan AddOns directory {}", addons_dir.display()))?;
+    let remote_addons = client.eso_file_list().await?;
+    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
+
+    if let Some(limit) = limit {
+        matches.truncate(limit);
+    }
+
+    let plan = update_all_core::build_update_all_plan(&matches, include_unknown);
+
+    println!("AddOns directory: {}", addons_dir.display());
+    println!("Remote addons loaded: {}", remote_addons.len());
+    println!("Dry run by default: no files will be downloaded, extracted, modified, or deleted without --yes.");
+    println!();
+    print_update_all_plan(&plan);
+
+    if !yes {
+        println!();
+        println!("No changes made. Re-run with --yes to update all planned addons.");
+        return Ok(());
+    }
+
+    if plan.targets.is_empty() {
+        println!();
+        println!("No planned addons to update.");
+        return Ok(());
+    }
+
+    println!();
+    println!("Applying planned updates sequentially:");
+
+    for target in &plan.targets {
+        let remote_uid = target.remote_uid.as_deref().ok_or_else(|| {
+            anyhow!(
+                "planned addon {} has no clean remote UID",
+                target.local_folder
+            )
+        })?;
+
+        println!();
+        println!(
+            "Updating {} -> {} ({})",
+            target.local_folder,
+            target.remote_name.as_deref().unwrap_or("-"),
+            remote_uid
+        );
+
+        let result = match update_all_one(
+            client,
+            target,
+            remote_uid,
+            &addons_dir,
+            &local_addons,
+            backup_dir,
+            keep_download,
+            download_dir,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                println!("failed: {} ({})", target.local_folder, error);
+                return Err(error)
+                    .with_context(|| format!("failed to update {}", target.local_folder));
+            }
+        };
+
+        print_update_all_item_result(target, &result);
+        local_addons = local::scan_addons_dir(&addons_dir).with_context(|| {
+            format!(
+                "failed to rescan AddOns directory {} after updating {}",
+                addons_dir.display(),
+                target.local_folder
+            )
+        })?;
+    }
+
+    println!();
+    println!("Update-all complete: {} updated.", plan.targets.len());
+    Ok(())
+}
+
+async fn update_all_one(
+    client: &ApiClient,
+    target: &PlannedAddonAction,
+    remote_uid: &str,
+    addons_dir: &Path,
+    local_addons: &[LocalAddon],
+    backup_dir: Option<&Path>,
+    keep_download: bool,
+    download_dir: Option<&Path>,
+) -> Result<InstallResult> {
+    let details = client.eso_file_details(remote_uid).await?;
+    let install_plan = prepare_remote_install_plan(
+        client,
+        &details,
+        remote_uid,
+        addons_dir,
+        local_addons,
+        keep_download,
+        download_dir,
+    )
+    .await?;
+    validate_single_update_plan(&install_plan, &target.local_folder)?;
+
+    Ok(apply::apply_install_plan(&install_plan, backup_dir)?)
 }
 
 pub fn inspect_zip(zip_path: &Path) -> Result<()> {
@@ -510,8 +673,9 @@ pub async fn update_one(
     if !decision.should_install() {
         match decision {
             update::UpdateDecision::SkippedCurrent
+            | update::UpdateDecision::SkippedLocalNewer
             | update::UpdateDecision::SkippedUnknownUseForce => {
-                println!("Use --force to reinstall despite unknown/current version.");
+                println!("Use --force to reinstall despite unknown/current/local-newer version.");
             }
             update::UpdateDecision::SkippedNoMatch => {
                 println!("No remote match found; update cannot continue.");
@@ -859,7 +1023,7 @@ fn print_installed_addons(addons: &[LocalAddon]) {
     }
 }
 
-fn print_check_results(results: &[MatchResult]) {
+fn print_check_results(results: &[MatchResult], verbose: bool) {
     println!(
         "{:<26} {:<30} {:<14} {:<32} {:<8} {:<14} {:<12} Status",
         "Local folder",
@@ -932,6 +1096,21 @@ fn print_check_results(results: &[MatchResult]) {
                 "", "", "", "", "", "", "", candidates
             );
         }
+
+        if verbose && !result.debug_candidates.is_empty() {
+            println!("{:<26} match candidates:", "");
+            for candidate in &result.debug_candidates {
+                println!(
+                    "{:<26} tier={} score={} reason={} {} ({})",
+                    "",
+                    candidate.tier,
+                    candidate.score,
+                    candidate.reason,
+                    candidate.name.as_deref().unwrap_or("-"),
+                    candidate.uid.as_deref().unwrap_or("-")
+                );
+            }
+        }
     }
 }
 
@@ -972,14 +1151,124 @@ fn print_update_plan(plan: &UpdatePlan) {
     let summary = plan.summary();
     println!();
     println!(
-        "Summary: would update: {}, current/skipped: {}, unknown: {}, no match: {}, ambiguous: {}, libraries: {}",
+        "Summary: would update: {}, current/skipped: {}, local-newer: {}, unknown: {}, no match: {}, ambiguous: {}, libraries: {}",
         summary.would_update,
         summary.current_skipped,
+        summary.local_newer,
         summary.unknown,
         summary.no_match,
         summary.ambiguous,
         summary.libraries
     );
+}
+
+fn print_update_all_plan(plan: &update_all_core::UpdateAllPlan) {
+    println!(
+        "{:<26} {:<32} {:<8} {:<14} {:<14} Action",
+        "Local folder", "Remote name", "UID", "Local version", "Remote version"
+    );
+    println!("{}", "-".repeat(120));
+
+    for action in &plan.display_plan.actions {
+        println!(
+            "{:<26} {:<32} {:<8} {:<14} {:<14} {}",
+            truncate(&action.local_folder, 26),
+            truncate(action.remote_name.as_deref().unwrap_or("-"), 32),
+            truncate(action.remote_uid.as_deref().unwrap_or("-"), 8),
+            truncate(action.local_version.as_deref().unwrap_or("-"), 14),
+            truncate(action.remote_version.as_deref().unwrap_or("-"), 14),
+            update_all_action_label(action, &plan.targets)
+        );
+    }
+
+    let mut skipped_current = 0;
+    let mut skipped_local_newer = 0;
+    let mut skipped_unknown = 0;
+    let mut skipped_no_match = 0;
+    let mut skipped_ambiguous = 0;
+    let mut skipped_libraries = 0;
+
+    for action in &plan.display_plan.actions {
+        if update_all_targets_contain(&plan.targets, action) {
+            continue;
+        }
+
+        match action.kind {
+            PlannedActionKind::WouldUpdate => {}
+            PlannedActionKind::WouldSkipCurrent => skipped_current += 1,
+            PlannedActionKind::WouldSkipLocalNewer => skipped_local_newer += 1,
+            PlannedActionKind::WouldSkipUnknownVersion => skipped_unknown += 1,
+            PlannedActionKind::WouldSkipNoMatch => skipped_no_match += 1,
+            PlannedActionKind::WouldSkipAmbiguous => skipped_ambiguous += 1,
+            PlannedActionKind::WouldSkipLibrary => skipped_libraries += 1,
+        }
+    }
+
+    println!();
+    println!(
+        "Summary: planned updates: {}, skipped current: {}, skipped local-newer: {}, skipped unknown: {}, skipped no-match: {}, skipped ambiguous: {}, skipped libraries: {}",
+        plan.targets.len(),
+        skipped_current,
+        skipped_local_newer,
+        skipped_unknown,
+        skipped_no_match,
+        skipped_ambiguous,
+        skipped_libraries
+    );
+}
+
+fn update_all_action_label(
+    action: &PlannedAddonAction,
+    targets: &[PlannedAddonAction],
+) -> &'static str {
+    if update_all_targets_contain(targets, action) {
+        "would-update"
+    } else {
+        action.kind.as_str()
+    }
+}
+
+fn update_all_targets_contain(targets: &[PlannedAddonAction], action: &PlannedAddonAction) -> bool {
+    targets.iter().any(|target| {
+        target.local_folder == action.local_folder && target.remote_uid == action.remote_uid
+    })
+}
+
+fn print_update_all_item_result(target: &PlannedAddonAction, result: &InstallResult) {
+    let status = if result.replaced > 0 || result.installed_new > 0 {
+        "updated"
+    } else if result.skipped > 0 {
+        "skipped"
+    } else {
+        "updated"
+    };
+
+    println!(
+        "{}: {} ({})",
+        status,
+        target.local_folder,
+        target.remote_uid.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  backup path: {}",
+        result
+            .backup_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_owned())
+    );
+
+    for item in &result.items {
+        println!(
+            "  {} -> {}: {}",
+            item.source_folder.as_deref().unwrap_or("-"),
+            item.target_folder
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            item.action.as_str()
+        );
+    }
 }
 
 fn print_zip_inspection(inspection: &ZipInspection) {

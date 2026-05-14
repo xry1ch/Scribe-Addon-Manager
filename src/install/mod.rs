@@ -6,6 +6,7 @@ pub mod apply;
 pub mod plan;
 pub mod remote;
 pub mod update;
+pub mod update_all;
 pub mod zip_safety;
 
 #[allow(dead_code)]

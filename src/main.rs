@@ -33,7 +33,8 @@ async fn main() -> Result<()> {
             path,
             refresh,
             limit,
-        } => commands::check(&client, path.as_deref(), refresh, limit).await,
+            verbose,
+        } => commands::check(&client, path.as_deref(), refresh, limit, verbose).await,
         Commands::PlanUpdate {
             path,
             refresh,
@@ -88,6 +89,29 @@ async fn main() -> Result<()> {
                 keep_download,
                 download_dir.as_deref(),
                 force,
+            )
+            .await
+        }
+        Commands::UpdateAll {
+            path,
+            refresh,
+            yes,
+            backup_dir,
+            keep_download,
+            download_dir,
+            include_unknown,
+            limit,
+        } => {
+            commands::update_all(
+                &client,
+                path.as_deref(),
+                refresh,
+                yes,
+                backup_dir.as_deref(),
+                keep_download,
+                download_dir.as_deref(),
+                include_unknown,
+                limit,
             )
             .await
         }

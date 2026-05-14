@@ -6,6 +6,7 @@ use crate::local::match_remote::{MatchResult, MatchStatus};
 pub enum UpdateDecision {
     WouldUpdate,
     SkippedCurrent,
+    SkippedLocalNewer,
     SkippedUnknownUseForce,
     SkippedNoMatch,
     SkippedAmbiguous,
@@ -17,6 +18,7 @@ impl UpdateDecision {
         match self {
             Self::WouldUpdate => "would-update",
             Self::SkippedCurrent => "skipped-current",
+            Self::SkippedLocalNewer => "skipped-local-newer",
             Self::SkippedUnknownUseForce => "skipped-unknown-use-force",
             Self::SkippedNoMatch => "skipped-no-match",
             Self::SkippedAmbiguous => "skipped-ambiguous",
@@ -83,6 +85,8 @@ pub fn update_decision(result: &MatchResult, force: bool) -> UpdateDecision {
         MatchStatus::PossibleUpdate => UpdateDecision::WouldUpdate,
         MatchStatus::Matched if force => UpdateDecision::ForcedReinstall,
         MatchStatus::Matched => UpdateDecision::SkippedCurrent,
+        MatchStatus::LocalNewer if force => UpdateDecision::ForcedReinstall,
+        MatchStatus::LocalNewer => UpdateDecision::SkippedLocalNewer,
         MatchStatus::UnknownUpdate if force => UpdateDecision::ForcedReinstall,
         MatchStatus::UnknownUpdate => UpdateDecision::SkippedUnknownUseForce,
         MatchStatus::NoMatch | MatchStatus::Library => UpdateDecision::SkippedNoMatch,
@@ -130,8 +134,12 @@ mod tests {
                 name: Some(folder_name.to_owned()),
                 version: Some("2".to_owned()),
                 updated: None,
+                tier: 1,
+                score: 100,
+                reason: "test".to_owned(),
             }),
             candidates: Vec::new(),
+            debug_candidates: Vec::new(),
         }
     }
 
@@ -195,6 +203,20 @@ mod tests {
         assert_eq!(
             update_decision(&matched, false),
             UpdateDecision::SkippedUnknownUseForce
+        );
+        assert_eq!(
+            update_decision(&matched, true),
+            UpdateDecision::ForcedReinstall
+        );
+    }
+
+    #[test]
+    fn local_newer_skips_unless_force() {
+        let matched = result("Addon", Some("1"), MatchStatus::LocalNewer);
+
+        assert_eq!(
+            update_decision(&matched, false),
+            UpdateDecision::SkippedLocalNewer
         );
         assert_eq!(
             update_decision(&matched, true),

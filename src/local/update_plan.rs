@@ -5,6 +5,7 @@ use crate::local::match_remote::{MatchResult, MatchStatus};
 pub enum PlannedActionKind {
     WouldUpdate,
     WouldSkipCurrent,
+    WouldSkipLocalNewer,
     WouldSkipUnknownVersion,
     WouldSkipNoMatch,
     WouldSkipAmbiguous,
@@ -16,6 +17,7 @@ impl PlannedActionKind {
         match self {
             Self::WouldUpdate => "would-update",
             Self::WouldSkipCurrent => "would-skip-current",
+            Self::WouldSkipLocalNewer => "would-skip-local-newer",
             Self::WouldSkipUnknownVersion => "would-skip-unknown-version",
             Self::WouldSkipNoMatch => "would-skip-no-match",
             Self::WouldSkipAmbiguous => "would-skip-ambiguous",
@@ -51,6 +53,7 @@ pub struct UpdatePlan {
 pub struct UpdatePlanSummary {
     pub would_update: usize,
     pub current_skipped: usize,
+    pub local_newer: usize,
     pub unknown: usize,
     pub no_match: usize,
     pub ambiguous: usize,
@@ -77,6 +80,7 @@ impl UpdatePlan {
             match action.kind {
                 PlannedActionKind::WouldUpdate => summary.would_update += 1,
                 PlannedActionKind::WouldSkipCurrent => summary.current_skipped += 1,
+                PlannedActionKind::WouldSkipLocalNewer => summary.local_newer += 1,
                 PlannedActionKind::WouldSkipUnknownVersion => summary.unknown += 1,
                 PlannedActionKind::WouldSkipNoMatch => summary.no_match += 1,
                 PlannedActionKind::WouldSkipAmbiguous => summary.ambiguous += 1,
@@ -112,6 +116,7 @@ fn planned_action(result: &MatchResult) -> PlannedAddonAction {
     let kind = match result.status {
         MatchStatus::PossibleUpdate => PlannedActionKind::WouldUpdate,
         MatchStatus::Matched => PlannedActionKind::WouldSkipCurrent,
+        MatchStatus::LocalNewer => PlannedActionKind::WouldSkipLocalNewer,
         MatchStatus::UnknownUpdate => PlannedActionKind::WouldSkipUnknownVersion,
         MatchStatus::NoMatch => PlannedActionKind::WouldSkipNoMatch,
         MatchStatus::Ambiguous => PlannedActionKind::WouldSkipAmbiguous,
@@ -183,8 +188,12 @@ mod tests {
                 name: Some("Addon".to_owned()),
                 version: Some("2".to_owned()),
                 updated: None,
+                tier: 1,
+                score: 100,
+                reason: "test".to_owned(),
             }),
             candidates: Vec::new(),
+            debug_candidates: Vec::new(),
         }
     }
 
@@ -205,6 +214,14 @@ mod tests {
 
         assert_eq!(plan.actions[0].kind, PlannedActionKind::WouldSkipCurrent);
         assert!(detail_request_uids_for(&[matched(MatchStatus::Matched)], false).is_empty());
+    }
+
+    #[test]
+    fn local_newer_becomes_would_skip_local_newer() {
+        let plan = build_update_plan(&[matched(MatchStatus::LocalNewer)], false);
+
+        assert_eq!(plan.actions[0].kind, PlannedActionKind::WouldSkipLocalNewer);
+        assert!(detail_request_uids_for(&[matched(MatchStatus::LocalNewer)], true).is_empty());
     }
 
     #[test]
@@ -233,6 +250,7 @@ mod tests {
             status: MatchStatus::NoMatch,
             remote: None,
             candidates: Vec::new(),
+            debug_candidates: Vec::new(),
         };
 
         assert!(detail_request_uids_for(&[result], true).is_empty());
@@ -249,7 +267,11 @@ mod tests {
                 name: Some("Addon".to_owned()),
                 version: Some("2".to_owned()),
                 updated: None,
+                tier: 1,
+                score: 100,
+                reason: "test".to_owned(),
             }],
+            debug_candidates: Vec::new(),
         };
 
         assert!(detail_request_uids_for(&[result], true).is_empty());

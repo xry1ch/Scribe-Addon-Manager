@@ -5,6 +5,7 @@ use directories::UserDirs;
 
 pub mod match_remote;
 pub mod update_plan;
+pub mod version;
 
 #[derive(Debug, Clone)]
 pub struct AddonPathCandidate {
