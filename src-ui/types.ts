@@ -84,6 +84,32 @@ export interface PlanUpdatesResponse {
   };
 }
 
+export interface UpdateAllAction extends PlannedAction {
+  update_all_action: string;
+}
+
+export interface UpdateAllSummary {
+  planned_updates: number;
+  skipped_current: number;
+  skipped_local_newer: number;
+  skipped_unknown: number;
+  skipped_no_match: number;
+  skipped_ambiguous: number;
+  skipped_libraries: number;
+}
+
+export interface PlanUpdateAllResponse {
+  dry_run: boolean;
+  applied: boolean;
+  addons_dir: string;
+  remote_addons_loaded: number;
+  include_unknown: boolean;
+  limit: number | null;
+  actions: UpdateAllAction[];
+  targets: PlannedAction[];
+  summary: UpdateAllSummary;
+}
+
 export interface InstallPlanItem {
   source_folder: string | null;
   title: string | null;
@@ -165,6 +191,34 @@ export interface SingleUpdateApplyResponse {
   skipped: number;
   backup_dir: string | null;
   items: InstallResultItem[];
+}
+
+export interface UpdateAllResult {
+  target: PlannedAction;
+  remote_details: AddonDetails;
+  plan: {
+    addons_dir: string;
+    temp_dir: string;
+    items: InstallPlanItem[];
+  };
+  installed_new: number;
+  replaced: number;
+  skipped: number;
+  backup_dir: string | null;
+  items: InstallResultItem[];
+}
+
+export interface ApplyUpdateAllResponse {
+  dry_run: boolean;
+  applied: boolean;
+  addons_dir: string;
+  remote_addons_loaded: number;
+  include_unknown: boolean;
+  limit: number | null;
+  actions: UpdateAllAction[];
+  targets: PlannedAction[];
+  summary: UpdateAllSummary;
+  results: UpdateAllResult[];
 }
 
 export interface AppSettings {

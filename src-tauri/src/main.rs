@@ -11,6 +11,7 @@ use eso_addon_manager::install::apply::{
 use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanAction, InstallPlanItem};
 use eso_addon_manager::install::remote;
 use eso_addon_manager::install::update;
+use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
 use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
 use eso_addon_manager::local::update_plan::{self, PlannedAddonAction};
@@ -227,6 +228,67 @@ struct InstallPlanItemDto {
     action: String,
 }
 
+#[derive(Debug, Serialize)]
+struct PlanUpdateAllResponse {
+    dry_run: bool,
+    applied: bool,
+    addons_dir: String,
+    remote_addons_loaded: usize,
+    include_unknown: bool,
+    limit: Option<usize>,
+    actions: Vec<UpdateAllActionDto>,
+    targets: Vec<PlannedActionDto>,
+    summary: UpdateAllSummaryDto,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplyUpdateAllResponse {
+    dry_run: bool,
+    applied: bool,
+    addons_dir: String,
+    remote_addons_loaded: usize,
+    include_unknown: bool,
+    limit: Option<usize>,
+    actions: Vec<UpdateAllActionDto>,
+    targets: Vec<PlannedActionDto>,
+    summary: UpdateAllSummaryDto,
+    results: Vec<UpdateAllResultDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateAllActionDto {
+    local_folder: String,
+    remote_name: Option<String>,
+    remote_uid: Option<String>,
+    local_version: Option<String>,
+    remote_version: Option<String>,
+    action: String,
+    update_all_action: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateAllSummaryDto {
+    planned_updates: usize,
+    skipped_current: usize,
+    skipped_local_newer: usize,
+    skipped_unknown: usize,
+    skipped_no_match: usize,
+    skipped_ambiguous: usize,
+    skipped_libraries: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateAllResultDto {
+    target: PlannedActionDto,
+    remote_details: AddonDetailsDto,
+    plan: InstallPlanDto,
+    installed_new: usize,
+    replaced: usize,
+    skipped: usize,
+    backup_dir: Option<String>,
+    items: Vec<InstalledItemDto>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(default)]
 struct AppSettings {
@@ -380,6 +442,86 @@ async fn plan_updates(
 }
 
 #[tauri::command]
+async fn plan_update_all(
+    path: Option<String>,
+    include_unknown: Option<bool>,
+    limit: Option<usize>,
+) -> Result<PlanUpdateAllResponse, String> {
+    let include_unknown = include_unknown.unwrap_or(false);
+    let (addons_dir, remote_addons_loaded, plan) =
+        build_update_all_plan_for_ui(path.as_deref(), include_unknown, limit).await?;
+
+    Ok(plan_update_all_response(
+        &addons_dir,
+        remote_addons_loaded,
+        include_unknown,
+        limit,
+        &plan,
+    ))
+}
+
+#[tauri::command]
+async fn apply_update_all(
+    path: Option<String>,
+    backup_dir: Option<String>,
+    keep_download: Option<bool>,
+    download_dir: Option<String>,
+    include_unknown: Option<bool>,
+    limit: Option<usize>,
+) -> Result<ApplyUpdateAllResponse, String> {
+    let include_unknown = include_unknown.unwrap_or(false);
+    let backup_dir = optional_path(backup_dir);
+    let download_dir = optional_path(download_dir);
+    let (addons_dir, remote_addons_loaded, plan) =
+        build_update_all_plan_for_ui(path.as_deref(), include_unknown, limit).await?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let mut results = Vec::new();
+
+    for target in &plan.targets {
+        let remote_uid = target
+            .remote_uid
+            .as_deref()
+            .ok_or_else(|| format!("planned addon {} has no clean remote UID", target.local_folder))?;
+        let prepared = prepare_remote_install_plan(&client, remote_uid, &addons_dir).await?;
+        validate_single_update_plan(&prepared.plan, &target.local_folder)
+            .map_err(to_string_error)?;
+
+        if keep_download.unwrap_or(false) {
+            keep_remote_download(
+                &client,
+                remote_uid,
+                &prepared.details,
+                download_dir.as_deref(),
+            )
+            .await?;
+        }
+
+        let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
+            .map_err(|error| format!("failed to update {}: {}", target.local_folder, error))?;
+
+        results.push(UpdateAllResultDto {
+            target: planned_action_dto(target),
+            remote_details: addon_details_dto(&prepared.details),
+            plan: install_plan_dto(&prepared.plan),
+            installed_new: result.installed_new,
+            replaced: result.replaced,
+            skipped: result.skipped,
+            backup_dir: result.backup_dir.as_ref().map(|path| path_string(path)),
+            items: result.items.iter().map(installed_item_dto).collect(),
+        });
+    }
+
+    Ok(apply_update_all_response(
+        &addons_dir,
+        remote_addons_loaded,
+        include_unknown,
+        limit,
+        &plan,
+        results,
+    ))
+}
+
+#[tauri::command]
 async fn plan_remote_install(
     addon_id: String,
     path: Option<String>,
@@ -406,16 +548,8 @@ async fn install_remote_addon(
     download_dir: Option<String>,
 ) -> Result<InstallRemoteAddonResponse, String> {
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
-    let backup_dir = backup_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
-    let download_dir = download_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
+    let backup_dir = optional_path(backup_dir);
+    let download_dir = optional_path(download_dir);
     let client = ApiClient::new().map_err(to_string_error)?;
     let prepared = prepare_remote_install_plan(&client, &addon_id, &addons_dir).await?;
 
@@ -505,16 +639,8 @@ async fn apply_single_update(
 ) -> Result<SingleUpdateApplyResponse, String> {
     let force = force.unwrap_or(false);
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
-    let backup_dir = backup_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
-    let download_dir = download_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
+    let backup_dir = optional_path(backup_dir);
+    let download_dir = optional_path(download_dir);
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
@@ -585,6 +711,8 @@ fn main() {
             get_remote_addon_details,
             check_addons,
             plan_updates,
+            plan_update_all,
+            apply_update_all,
             plan_remote_install,
             install_remote_addon,
             plan_single_update,
@@ -656,6 +784,10 @@ fn normalize_optional_path(value: Option<String>) -> Option<String> {
             Some(trimmed.to_owned())
         }
     })
+}
+
+fn optional_path(value: Option<String>) -> Option<PathBuf> {
+    normalize_optional_path(value).map(PathBuf::from)
 }
 
 fn resolve_addons_dir(path: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -765,6 +897,126 @@ fn planned_action_dto(action: &PlannedAddonAction) -> PlannedActionDto {
     }
 }
 
+fn update_all_action_dto(
+    action: &PlannedAddonAction,
+    targets: &[PlannedAddonAction],
+) -> UpdateAllActionDto {
+    UpdateAllActionDto {
+        local_folder: action.local_folder.clone(),
+        remote_name: action.remote_name.clone(),
+        remote_uid: action.remote_uid.clone(),
+        local_version: action.local_version.clone(),
+        remote_version: action.remote_version.clone(),
+        action: action.kind.as_str().to_owned(),
+        update_all_action: update_all_action_label(action, targets).to_owned(),
+    }
+}
+
+fn update_all_action_label(
+    action: &PlannedAddonAction,
+    targets: &[PlannedAddonAction],
+) -> &'static str {
+    if targets
+        .iter()
+        .any(|target| target.local_folder == action.local_folder)
+    {
+        "would-update"
+    } else {
+        "would-skip"
+    }
+}
+
+fn update_all_summary_dto(plan: &update_all::UpdateAllPlan) -> UpdateAllSummaryDto {
+    let mut skipped_current = 0;
+    let mut skipped_local_newer = 0;
+    let mut skipped_unknown = 0;
+    let mut skipped_no_match = 0;
+    let mut skipped_ambiguous = 0;
+    let mut skipped_libraries = 0;
+
+    for action in &plan.display_plan.actions {
+        if plan
+            .targets
+            .iter()
+            .any(|target| target.local_folder == action.local_folder)
+        {
+            continue;
+        }
+
+        match action.kind {
+            update_plan::PlannedActionKind::WouldUpdate => {}
+            update_plan::PlannedActionKind::WouldSkipCurrent => skipped_current += 1,
+            update_plan::PlannedActionKind::WouldSkipLocalNewer => skipped_local_newer += 1,
+            update_plan::PlannedActionKind::WouldSkipUnknownVersion => skipped_unknown += 1,
+            update_plan::PlannedActionKind::WouldSkipNoMatch => skipped_no_match += 1,
+            update_plan::PlannedActionKind::WouldSkipAmbiguous => skipped_ambiguous += 1,
+            update_plan::PlannedActionKind::WouldSkipLibrary => skipped_libraries += 1,
+        }
+    }
+
+    UpdateAllSummaryDto {
+        planned_updates: plan.targets.len(),
+        skipped_current,
+        skipped_local_newer,
+        skipped_unknown,
+        skipped_no_match,
+        skipped_ambiguous,
+        skipped_libraries,
+    }
+}
+
+fn plan_update_all_response(
+    addons_dir: &std::path::Path,
+    remote_addons_loaded: usize,
+    include_unknown: bool,
+    limit: Option<usize>,
+    plan: &update_all::UpdateAllPlan,
+) -> PlanUpdateAllResponse {
+    PlanUpdateAllResponse {
+        dry_run: true,
+        applied: false,
+        addons_dir: path_string(addons_dir),
+        remote_addons_loaded,
+        include_unknown,
+        limit,
+        actions: plan
+            .display_plan
+            .actions
+            .iter()
+            .map(|action| update_all_action_dto(action, &plan.targets))
+            .collect(),
+        targets: plan.targets.iter().map(planned_action_dto).collect(),
+        summary: update_all_summary_dto(plan),
+    }
+}
+
+fn apply_update_all_response(
+    addons_dir: &std::path::Path,
+    remote_addons_loaded: usize,
+    include_unknown: bool,
+    limit: Option<usize>,
+    plan: &update_all::UpdateAllPlan,
+    results: Vec<UpdateAllResultDto>,
+) -> ApplyUpdateAllResponse {
+    ApplyUpdateAllResponse {
+        dry_run: false,
+        applied: !results.is_empty(),
+        addons_dir: path_string(addons_dir),
+        remote_addons_loaded,
+        include_unknown,
+        limit,
+        actions: plan
+            .display_plan
+            .actions
+            .iter()
+            .map(|action| update_all_action_dto(action, &plan.targets))
+            .collect(),
+        targets: plan.targets.iter().map(planned_action_dto).collect(),
+        summary: update_all_summary_dto(plan),
+        results,
+    }
+}
+
 fn install_plan_dto(plan: &InstallPlan) -> InstallPlanDto {
     InstallPlanDto {
         addons_dir: path_string(&plan.addons_dir),
@@ -815,6 +1067,26 @@ async fn prepare_remote_install_plan(
         details,
         plan: install_plan,
     })
+}
+
+async fn build_update_all_plan_for_ui(
+    path: Option<&str>,
+    include_unknown: bool,
+    limit: Option<usize>,
+) -> Result<(PathBuf, usize, update_all::UpdateAllPlan), String> {
+    let addons_dir = resolve_addons_dir(path).map_err(to_string_error)?;
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
+
+    if let Some(limit) = limit {
+        matches.truncate(limit);
+    }
+
+    let plan = update_all::build_update_all_plan(&matches, include_unknown);
+    Ok((addons_dir, remote_addons.len(), plan))
 }
 
 fn install_remote_addon_response(

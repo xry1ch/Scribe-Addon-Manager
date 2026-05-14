@@ -5,10 +5,12 @@ import type {
   AddonSummary,
   AppSettings,
   AppSettingsInput,
+  ApplyUpdateAllResponse,
   CheckAddonsResponse,
   InstallRemoteAddonResponse,
   InstalledAddonsResponse,
   PlanRemoteInstallResponse,
+  PlanUpdateAllResponse,
   PlanUpdatesResponse,
   SearchResponse,
   SingleUpdateApplyResponse,
@@ -35,6 +37,8 @@ interface AppState {
   forceUpdate: boolean;
   singleUpdatePlan: SingleUpdatePlanResponse | null;
   singleUpdateResult: SingleUpdateApplyResponse | null;
+  updateAllPlan: PlanUpdateAllResponse | null;
+  updateAllResult: ApplyUpdateAllResponse | null;
   settings: AppSettings | null;
   addonsPathExists: boolean | null;
 }
@@ -57,6 +61,8 @@ const state: AppState = {
   forceUpdate: false,
   singleUpdatePlan: null,
   singleUpdateResult: null,
+  updateAllPlan: null,
+  updateAllResult: null,
   settings: null,
   addonsPathExists: null,
 };
@@ -385,7 +391,10 @@ function renderUpdates() {
         <h2>Updates</h2>
         <p>${escapeHtml(state.updates?.addons_dir ?? "No update check loaded")}</p>
       </div>
-      <button class="primary" id="refresh-updates">Refresh</button>
+      <div class="toolbar-actions">
+        <button class="secondary" id="plan-update-all">Plan All Updates</button>
+        <button class="primary" id="refresh-updates">Refresh</button>
+      </div>
     </header>
     <label class="checkbox-line">
       <input type="checkbox" id="include-unknown" ${state.includeUnknown ? "checked" : ""} />
@@ -434,8 +443,112 @@ function renderUpdates() {
         </tbody>
       </table>
     </div>
+    ${renderUpdateAllPlan()}
+    ${renderUpdateAllResult()}
     ${renderSingleUpdatePlan()}
     ${renderSingleUpdateResult()}
+  `;
+}
+
+function renderUpdateAllPlan() {
+  const plan = state.updateAllPlan;
+  if (!plan) return "";
+
+  return `
+    <section class="plan-panel">
+      <div class="notice">Dry run only. This plan did not download, extract, modify, or delete addon files.</div>
+      <div class="toolbar compact">
+        <div>
+          <h3>All Updates Preview</h3>
+          <p>${plan.summary.planned_updates} planned update${plan.summary.planned_updates === 1 ? "" : "s"} in ${escapeHtml(plan.addons_dir)}</p>
+        </div>
+        ${plan.summary.planned_updates > 0 ? `<button class="danger" id="apply-update-all">Apply All Updates</button>` : ""}
+      </div>
+      <div class="summary">
+        ${summaryItem("Planned", plan.summary.planned_updates)}
+        ${summaryItem("Current", plan.summary.skipped_current)}
+        ${summaryItem("Unknown", plan.summary.skipped_unknown)}
+        ${summaryItem("No match", plan.summary.skipped_no_match)}
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Local folder</th>
+              <th>Local version</th>
+              <th>Remote name</th>
+              <th>Remote version</th>
+              <th>Plan action</th>
+              <th>Update-all</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${plan.actions
+              .map(
+                (action) => `
+                  <tr>
+                    <td>${escapeHtml(action.local_folder)}</td>
+                    <td>${escapeHtml(action.local_version ?? "-")}</td>
+                    <td>${escapeHtml(action.remote_name ?? "-")}</td>
+                    <td>${escapeHtml(action.remote_version ?? "-")}</td>
+                    <td><span class="pill">${escapeHtml(action.action)}</span></td>
+                    <td><span class="pill ${action.update_all_action === "would-update" ? "ok" : ""}">${escapeHtml(action.update_all_action)}</span></td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderUpdateAllResult() {
+  const result = state.updateAllResult;
+  if (!result) return "";
+
+  return `
+    <section class="plan-panel">
+      <div class="notice ${result.applied ? "" : "error"}">
+        Update-all ${result.applied ? "completed" : "finished without file changes"}.
+      </div>
+      <div class="summary">
+        ${summaryItem("Updated", result.results.length)}
+        ${summaryItem("Planned", result.summary.planned_updates)}
+        ${summaryItem("Applied", result.applied ? 1 : 0)}
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Local folder</th>
+              <th>Remote</th>
+              <th>Installed</th>
+              <th>Replaced</th>
+              <th>Skipped</th>
+              <th>Backup</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${result.results
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${escapeHtml(item.target.local_folder)}</td>
+                    <td>${escapeHtml(item.remote_details.name ?? item.target.remote_name ?? "-")}</td>
+                    <td>${item.installed_new}</td>
+                    <td>${item.replaced}</td>
+                    <td>${item.skipped}</td>
+                    <td>${escapeHtml(item.backup_dir ?? "-")}</td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -596,8 +709,12 @@ function bindTabEvents() {
     row.addEventListener("click", () => loadDetails(row.dataset.addonId ?? ""));
   });
   document.querySelector<HTMLButtonElement>("#refresh-updates")?.addEventListener("click", loadUpdates);
+  document.querySelector<HTMLButtonElement>("#plan-update-all")?.addEventListener("click", planUpdateAll);
+  document.querySelector<HTMLButtonElement>("#apply-update-all")?.addEventListener("click", applyUpdateAll);
   document.querySelector<HTMLInputElement>("#include-unknown")?.addEventListener("change", (event) => {
     state.includeUnknown = (event.currentTarget as HTMLInputElement).checked;
+    state.updateAllPlan = null;
+    state.updateAllResult = null;
     loadUpdates();
   });
   document.querySelector<HTMLInputElement>("#force-update")?.addEventListener("change", (event) => {
@@ -723,6 +840,8 @@ function planSingleUpdate(target: string) {
       force: state.forceUpdate,
     });
     state.singleUpdateResult = null;
+    state.updateAllPlan = null;
+    state.updateAllResult = null;
     state.path = state.singleUpdatePlan.addons_dir;
   });
 }
@@ -749,6 +868,8 @@ function confirmUpdate() {
       force: state.forceUpdate,
     });
     state.path = state.singleUpdateResult.addons_dir;
+    state.updateAllPlan = null;
+    state.updateAllResult = null;
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
       path: state.path || null,
     });
@@ -757,7 +878,54 @@ function confirmUpdate() {
     });
     state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
       path: effectiveAddonsPath(),
-      includeUnknown: state.settings?.include_unknown_updates_default ?? state.includeUnknown,
+      includeUnknown: updateIncludeUnknownDefault(),
+    });
+  });
+}
+
+function planUpdateAll() {
+  return withLoading(async () => {
+    state.updateAllPlan = await invoke<PlanUpdateAllResponse>("plan_update_all", {
+      path: effectiveAddonsPath(),
+      includeUnknown: updateIncludeUnknownDefault(),
+      limit: null,
+    });
+    state.path = state.updateAllPlan.addons_dir;
+    state.updateAllResult = null;
+    state.singleUpdatePlan = null;
+    state.singleUpdateResult = null;
+  });
+}
+
+function applyUpdateAll() {
+  const plan = state.updateAllPlan;
+  if (!plan || plan.summary.planned_updates === 0) return;
+
+  const confirmed = window.confirm(
+    `Apply ${plan.summary.planned_updates} planned update${plan.summary.planned_updates === 1 ? "" : "s"}?\n\nFiles may be written to your AddOns directory:\n${plan.addons_dir}\n\nThe app will process updates sequentially, fetch fresh metadata for each addon, download and verify each ZIP, validate each package, and back up replacements before applying. It will stop on the first error.`,
+  );
+  if (!confirmed) return;
+
+  return withLoading(async () => {
+    state.updateAllResult = await invoke<ApplyUpdateAllResponse>("apply_update_all", {
+      path: effectiveAddonsPath(),
+      backupDir: state.settings?.backup_dir_override || null,
+      keepDownload: state.settings?.keep_downloads_default ?? false,
+      downloadDir: state.settings?.download_dir || null,
+      includeUnknown: plan.include_unknown,
+      limit: plan.limit,
+    });
+    state.path = state.updateAllResult.addons_dir;
+    state.updateAllPlan = null;
+    state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
+      path: state.path || null,
+    });
+    state.updates = await invoke<CheckAddonsResponse>("check_addons", {
+      path: effectiveAddonsPath(),
+    });
+    state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
+      path: effectiveAddonsPath(),
+      includeUnknown: updateIncludeUnknownDefault(),
     });
   });
 }
@@ -769,11 +937,13 @@ function loadUpdates() {
     });
     state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
       path: effectiveAddonsPath(),
-      includeUnknown: state.settings?.include_unknown_updates_default ?? state.includeUnknown,
+      includeUnknown: updateIncludeUnknownDefault(),
     });
     state.path = state.updates.addons_dir;
     state.singleUpdatePlan = null;
     state.singleUpdateResult = null;
+    state.updateAllPlan = null;
+    state.updateAllResult = null;
   });
 }
 
@@ -847,6 +1017,10 @@ function applySettingsToState(settings: AppSettings) {
 function effectiveAddonsPath() {
   const value = state.path.trim();
   return value.length > 0 ? value : null;
+}
+
+function updateIncludeUnknownDefault() {
+  return state.includeUnknown;
 }
 
 function syncSettingsDraft() {
