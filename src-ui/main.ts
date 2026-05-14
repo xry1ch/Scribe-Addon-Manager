@@ -9,6 +9,8 @@ import type {
   PlanRemoteInstallResponse,
   PlanUpdatesResponse,
   SearchResponse,
+  SingleUpdateApplyResponse,
+  SingleUpdatePlanResponse,
 } from "./types";
 
 type Tab = "installed" | "search" | "details" | "updates";
@@ -28,6 +30,9 @@ interface AppState {
   includeUnknown: boolean;
   installPlan: PlanRemoteInstallResponse | null;
   installResult: InstallRemoteAddonResponse | null;
+  forceUpdate: boolean;
+  singleUpdatePlan: SingleUpdatePlanResponse | null;
+  singleUpdateResult: SingleUpdateApplyResponse | null;
 }
 
 const state: AppState = {
@@ -45,6 +50,9 @@ const state: AppState = {
   includeUnknown: false,
   installPlan: null,
   installResult: null,
+  forceUpdate: false,
+  singleUpdatePlan: null,
+  singleUpdateResult: null,
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -350,6 +358,10 @@ function renderUpdates() {
       <input type="checkbox" id="include-unknown" ${state.includeUnknown ? "checked" : ""} />
       Include unknown version matches in the read-only plan
     </label>
+    <label class="checkbox-line">
+      <input type="checkbox" id="force-update" ${state.forceUpdate ? "checked" : ""} />
+      Allow reinstall planning for current, local-newer, or unknown-version matches
+    </label>
     <div class="summary">
       ${summaryItem("Updates", state.updatePlan?.summary.would_update ?? 0)}
       ${summaryItem("Current", state.updatePlan?.summary.current_skipped ?? 0)}
@@ -366,6 +378,7 @@ function renderUpdates() {
             <th>Remote version</th>
             <th>Status</th>
             <th>Action</th>
+            <th>Plan</th>
           </tr>
         </thead>
         <tbody>
@@ -380,6 +393,7 @@ function renderUpdates() {
                   <td>${escapeHtml(match.remote?.version ?? "-")}</td>
                   <td><span class="pill">${escapeHtml(match.status)}</span></td>
                   <td>${escapeHtml(action?.action ?? "-")}</td>
+                  <td>${renderUpdatePlanButton(match.status, match.local.folder_name)}</td>
                 </tr>
               `;
             })
@@ -387,6 +401,131 @@ function renderUpdates() {
         </tbody>
       </table>
     </div>
+    ${renderSingleUpdatePlan()}
+    ${renderSingleUpdateResult()}
+  `;
+}
+
+function renderUpdatePlanButton(status: string, target: string) {
+  if (status === "possible-update") {
+    return `<button class="primary small" data-plan-update-target="${escapeAttr(target)}">Plan Update</button>`;
+  }
+
+  if (state.forceUpdate && ["matched", "unknown-update", "local-newer"].includes(status)) {
+    return `<button class="secondary small" data-plan-update-target="${escapeAttr(target)}">Plan Reinstall</button>`;
+  }
+
+  return "-";
+}
+
+function renderSingleUpdatePlan() {
+  const plan = state.singleUpdatePlan;
+  if (!plan) return "";
+
+  if (!plan.should_install || !plan.plan) {
+    return `
+      <section class="plan-panel">
+        <div class="notice error">
+          ${escapeHtml(plan.local.folder_name)} skipped: ${escapeHtml(plan.reason ?? plan.decision)}
+        </div>
+      </section>
+    `;
+  }
+
+  return `
+    <section class="plan-panel">
+      <div class="notice">Dry run only. This update preview downloaded and validated the ZIP, but did not modify your AddOns directory.</div>
+      <div class="toolbar compact">
+        <div>
+          <h3>Update Preview</h3>
+          <p>${escapeHtml(plan.local.folder_name)} -> ${escapeHtml(plan.remote?.name ?? "-")}</p>
+        </div>
+        <button class="danger" id="confirm-update">Update</button>
+      </div>
+      <section class="details-grid">
+        ${detailItem("Decision", plan.decision)}
+        ${detailItem("Remote UID", plan.remote?.uid ?? null)}
+        ${detailItem("Remote version", plan.remote?.version ?? null)}
+        ${detailItem("Target AddOns directory", plan.addons_dir)}
+      </section>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source folder</th>
+              <th>Title</th>
+              <th>Version</th>
+              <th>Target folder</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${plan.plan.items
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${escapeHtml(item.source_folder ?? "-")}</td>
+                    <td>${escapeHtml(item.title ?? "-")}</td>
+                    <td>${escapeHtml(item.version ?? "-")}</td>
+                    <td>${escapeHtml(item.target_folder ?? "-")}</td>
+                    <td><span class="pill">${escapeHtml(item.action)}</span></td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderSingleUpdateResult() {
+  const result = state.singleUpdateResult;
+  if (!result) return "";
+
+  return `
+    <section class="plan-panel">
+      <div class="notice ${result.applied ? "" : "error"}">
+        Update ${result.applied ? "completed" : `skipped: ${escapeHtml(result.reason ?? result.decision)}`}.
+      </div>
+      <div class="summary">
+        ${summaryItem("Installed", result.installed_new)}
+        ${summaryItem("Replaced", result.replaced)}
+        ${summaryItem("Skipped", result.skipped)}
+        ${summaryItem("Applied", result.applied ? 1 : 0)}
+      </div>
+      <section class="details-grid">
+        ${detailItem("Backup location", result.backup_dir)}
+        ${detailItem("AddOns directory", result.addons_dir)}
+      </section>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source folder</th>
+              <th>Target folder</th>
+              <th>Backup folder</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${result.items
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${escapeHtml(item.source_folder ?? "-")}</td>
+                    <td>${escapeHtml(item.target_folder ?? "-")}</td>
+                    <td>${escapeHtml(item.backup_folder ?? "-")}</td>
+                    <td><span class="pill">${escapeHtml(item.action)}</span></td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -428,6 +567,16 @@ function bindTabEvents() {
     state.includeUnknown = (event.currentTarget as HTMLInputElement).checked;
     loadUpdates();
   });
+  document.querySelector<HTMLInputElement>("#force-update")?.addEventListener("change", (event) => {
+    state.forceUpdate = (event.currentTarget as HTMLInputElement).checked;
+    state.singleUpdatePlan = null;
+    state.singleUpdateResult = null;
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-plan-update-target]").forEach((button) => {
+    button.addEventListener("click", () => planSingleUpdate(button.dataset.planUpdateTarget ?? ""));
+  });
+  document.querySelector<HTMLButtonElement>("#confirm-update")?.addEventListener("click", confirmUpdate);
 }
 
 async function withLoading(task: () => Promise<void>) {
@@ -517,6 +666,55 @@ function confirmInstall() {
   });
 }
 
+function planSingleUpdate(target: string) {
+  if (!target) return;
+
+  return withLoading(async () => {
+    state.singleUpdatePlan = await invoke<SingleUpdatePlanResponse>("plan_single_update", {
+      target,
+      path: state.path || null,
+      force: state.forceUpdate,
+    });
+    state.singleUpdateResult = null;
+    state.path = state.singleUpdatePlan.addons_dir;
+  });
+}
+
+function confirmUpdate() {
+  const plan = state.singleUpdatePlan;
+  if (!plan || !plan.should_install || !plan.plan) return;
+
+  const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
+    ? "Existing folders may be backed up and replaced. A default timestamped backup folder will be created inside the AddOns directory unless the app is configured otherwise."
+    : "No replacement is currently planned, so no backup folder is expected unless the fresh update plan changes.";
+  const confirmed = window.confirm(
+    `Update ${plan.local.folder_name}?\n\nFiles may be written to your AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n\nThe app will match the addon again, fetch fresh metadata, download and verify the ZIP, validate it, build a fresh plan, and back up replacements before applying.`,
+  );
+  if (!confirmed) return;
+
+  return withLoading(async () => {
+    state.singleUpdateResult = await invoke<SingleUpdateApplyResponse>("apply_single_update", {
+      target: plan.target,
+      path: state.path || null,
+      backupDir: null,
+      keepDownload: false,
+      downloadDir: null,
+      force: state.forceUpdate,
+    });
+    state.path = state.singleUpdateResult.addons_dir;
+    state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
+      path: state.path || null,
+    });
+    state.updates = await invoke<CheckAddonsResponse>("check_addons", {
+      path: state.path || null,
+    });
+    state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
+      path: state.path || null,
+      includeUnknown: state.includeUnknown,
+    });
+  });
+}
+
 function loadUpdates() {
   return withLoading(async () => {
     state.updates = await invoke<CheckAddonsResponse>("check_addons", {
@@ -527,6 +725,8 @@ function loadUpdates() {
       includeUnknown: state.includeUnknown,
     });
     state.path = state.updates.addons_dir;
+    state.singleUpdatePlan = null;
+    state.singleUpdateResult = null;
   });
 }
 

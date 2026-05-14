@@ -127,3 +127,42 @@ export interface InstallRemoteAddonResponse {
   };
   items: InstallResultItem[];
 }
+
+export interface SingleUpdatePlanResponse {
+  dry_run: boolean;
+  applied: boolean;
+  target: string;
+  local: LocalAddon;
+  remote: RemoteCandidate | null;
+  decision: string;
+  should_install: boolean;
+  reason: string | null;
+  remote_details: AddonDetails | null;
+  addons_dir: string;
+  plan: {
+    addons_dir: string;
+    temp_dir: string;
+    items: InstallPlanItem[];
+  } | null;
+}
+
+export interface SingleUpdateApplyResponse {
+  applied: boolean;
+  target: string;
+  local: LocalAddon;
+  remote: RemoteCandidate | null;
+  decision: string;
+  reason: string | null;
+  remote_details: AddonDetails | null;
+  addons_dir: string;
+  plan: {
+    addons_dir: string;
+    temp_dir: string;
+    items: InstallPlanItem[];
+  } | null;
+  installed_new: number;
+  replaced: number;
+  skipped: number;
+  backup_dir: string | null;
+  items: InstallResultItem[];
+}

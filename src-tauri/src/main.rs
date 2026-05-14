@@ -8,8 +8,9 @@ use eso_addon_manager::api::ApiClient;
 use eso_addon_manager::install::apply::{
     self, InstallActionPerformed, InstallResult, InstalledItem,
 };
-use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanItem};
+use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanAction, InstallPlanItem};
 use eso_addon_manager::install::remote;
+use eso_addon_manager::install::update;
 use eso_addon_manager::install::zip_safety;
 use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
 use eso_addon_manager::local::update_plan::{self, PlannedAddonAction};
@@ -161,6 +162,39 @@ struct InstallRemoteAddonResponse {
     remote: AddonDetailsDto,
     addons_dir: String,
     plan: InstallPlanDto,
+    items: Vec<InstalledItemDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct SingleUpdatePlanResponse {
+    dry_run: bool,
+    applied: bool,
+    target: String,
+    local: LocalAddonDto,
+    remote: Option<RemoteCandidateDto>,
+    decision: String,
+    should_install: bool,
+    reason: Option<String>,
+    remote_details: Option<AddonDetailsDto>,
+    addons_dir: String,
+    plan: Option<InstallPlanDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct SingleUpdateApplyResponse {
+    applied: bool,
+    target: String,
+    local: LocalAddonDto,
+    remote: Option<RemoteCandidateDto>,
+    decision: String,
+    reason: Option<String>,
+    remote_details: Option<AddonDetailsDto>,
+    addons_dir: String,
+    plan: Option<InstallPlanDto>,
+    installed_new: usize,
+    replaced: usize,
+    skipped: usize,
+    backup_dir: Option<String>,
     items: Vec<InstalledItemDto>,
 }
 
@@ -332,23 +366,152 @@ async fn install_remote_addon(
     let prepared = prepare_remote_install_plan(&client, &addon_id, &addons_dir).await?;
 
     if keep_download.unwrap_or(false) {
-        let download_url = remote::download_url(&prepared.details).map_err(to_string_error)?;
-        let file_name = remote::download_file_name(&prepared.details, &addon_id);
-        let path = remote::keep_download_path(download_dir.as_deref(), &file_name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(to_string_error)?;
-        }
-        let bytes = client
-            .download_bytes(download_url)
-            .await
-            .map_err(to_string_error)?;
-        remote::verify_md5(&bytes, prepared.details.md5.as_deref()).map_err(to_string_error)?;
-        std::fs::write(path, bytes).map_err(to_string_error)?;
+        keep_remote_download(
+            &client,
+            &addon_id,
+            &prepared.details,
+            download_dir.as_deref(),
+        )
+        .await?;
     }
 
     let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
         .map_err(to_string_error)?;
     Ok(install_remote_addon_response(
+        &prepared.details,
+        &addons_dir,
+        &prepared.plan,
+        &result,
+    ))
+}
+
+#[tauri::command]
+async fn plan_single_update(
+    target: String,
+    path: Option<String>,
+    force: Option<bool>,
+) -> Result<SingleUpdatePlanResponse, String> {
+    let force = force.unwrap_or(false);
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let selected = update::resolve_update_request(&matches, &target).map_err(to_string_error)?;
+    let decision = update::update_decision(selected, force);
+
+    if !decision.should_install() {
+        return Ok(SingleUpdatePlanResponse {
+            dry_run: true,
+            applied: false,
+            target,
+            local: local_addon_dto(&selected.local),
+            remote: selected.remote.as_ref().map(remote_candidate_dto),
+            decision: decision.as_str().to_owned(),
+            should_install: false,
+            reason: Some(update_skip_reason(&decision).to_owned()),
+            remote_details: None,
+            addons_dir: path_string(&addons_dir),
+            plan: None,
+        });
+    }
+
+    let remote_uid = selected
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.uid.as_deref())
+        .ok_or_else(|| "selected addon has no clean remote UID".to_owned())?;
+    let prepared = prepare_remote_install_plan(&client, remote_uid, &addons_dir).await?;
+    validate_single_update_plan(&prepared.plan, &selected.local.folder_name)
+        .map_err(to_string_error)?;
+
+    Ok(SingleUpdatePlanResponse {
+        dry_run: true,
+        applied: false,
+        target,
+        local: local_addon_dto(&selected.local),
+        remote: selected.remote.as_ref().map(remote_candidate_dto),
+        decision: decision.as_str().to_owned(),
+        should_install: true,
+        reason: None,
+        remote_details: Some(addon_details_dto(&prepared.details)),
+        addons_dir: path_string(&addons_dir),
+        plan: Some(install_plan_dto(&prepared.plan)),
+    })
+}
+
+#[tauri::command]
+async fn apply_single_update(
+    target: String,
+    path: Option<String>,
+    backup_dir: Option<String>,
+    keep_download: Option<bool>,
+    download_dir: Option<String>,
+    force: Option<bool>,
+) -> Result<SingleUpdateApplyResponse, String> {
+    let force = force.unwrap_or(false);
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let backup_dir = backup_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let download_dir = download_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let selected = update::resolve_update_request(&matches, &target).map_err(to_string_error)?;
+    let decision = update::update_decision(selected, force);
+
+    if !decision.should_install() {
+        return Ok(SingleUpdateApplyResponse {
+            applied: false,
+            target,
+            local: local_addon_dto(&selected.local),
+            remote: selected.remote.as_ref().map(remote_candidate_dto),
+            decision: decision.as_str().to_owned(),
+            reason: Some(update_skip_reason(&decision).to_owned()),
+            remote_details: None,
+            addons_dir: path_string(&addons_dir),
+            plan: None,
+            installed_new: 0,
+            replaced: 0,
+            skipped: 0,
+            backup_dir: None,
+            items: Vec::new(),
+        });
+    }
+
+    let remote_uid = selected
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.uid.as_deref())
+        .ok_or_else(|| "selected addon has no clean remote UID".to_owned())?;
+    let prepared = prepare_remote_install_plan(&client, remote_uid, &addons_dir).await?;
+    validate_single_update_plan(&prepared.plan, &selected.local.folder_name)
+        .map_err(to_string_error)?;
+
+    if keep_download.unwrap_or(false) {
+        keep_remote_download(
+            &client,
+            remote_uid,
+            &prepared.details,
+            download_dir.as_deref(),
+        )
+        .await?;
+    }
+
+    let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
+        .map_err(to_string_error)?;
+    Ok(single_update_apply_response(
+        &target,
+        selected,
+        &decision,
         &prepared.details,
         &addons_dir,
         &prepared.plan,
@@ -365,7 +528,9 @@ fn main() {
             check_addons,
             plan_updates,
             plan_remote_install,
-            install_remote_addon
+            install_remote_addon,
+            plan_single_update,
+            apply_single_update
         ])
         .run(tauri::generate_context!())
         .expect("error while running Scribe Addon Manager");
@@ -549,6 +714,33 @@ fn install_remote_addon_response(
     }
 }
 
+fn single_update_apply_response(
+    target: &str,
+    selected: &MatchResult,
+    decision: &update::UpdateDecision,
+    details: &AddonDetails,
+    addons_dir: &std::path::Path,
+    plan: &InstallPlan,
+    result: &InstallResult,
+) -> SingleUpdateApplyResponse {
+    SingleUpdateApplyResponse {
+        applied: install_result_applied(result),
+        target: target.to_owned(),
+        local: local_addon_dto(&selected.local),
+        remote: selected.remote.as_ref().map(remote_candidate_dto),
+        decision: decision.as_str().to_owned(),
+        reason: None,
+        remote_details: Some(addon_details_dto(details)),
+        addons_dir: path_string(addons_dir),
+        plan: Some(install_plan_dto(plan)),
+        installed_new: result.installed_new,
+        replaced: result.replaced,
+        skipped: result.skipped,
+        backup_dir: result.backup_dir.as_ref().map(|path| path_string(path)),
+        items: result.items.iter().map(installed_item_dto).collect(),
+    }
+}
+
 fn installed_item_dto(item: &InstalledItem) -> InstalledItemDto {
     InstalledItemDto {
         source_folder: item.source_folder.clone(),
@@ -557,6 +749,27 @@ fn installed_item_dto(item: &InstalledItem) -> InstalledItemDto {
         action: install_action_as_str(&item.action).to_owned(),
         message: item.message.clone(),
     }
+}
+
+async fn keep_remote_download(
+    client: &ApiClient,
+    addon_id: &str,
+    details: &AddonDetails,
+    download_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let download_url = remote::download_url(details).map_err(to_string_error)?;
+    let file_name = remote::download_file_name(details, addon_id);
+    let path = remote::keep_download_path(download_dir, &file_name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(to_string_error)?;
+    }
+    let bytes = client
+        .download_bytes(download_url)
+        .await
+        .map_err(to_string_error)?;
+    remote::verify_md5(&bytes, details.md5.as_deref()).map_err(to_string_error)?;
+    std::fs::write(path, bytes).map_err(to_string_error)?;
+    Ok(())
 }
 
 fn install_result_applied(result: &InstallResult) -> bool {
@@ -568,6 +781,55 @@ fn install_action_as_str(action: &InstallActionPerformed) -> &'static str {
         InstallActionPerformed::InstalledNew => "installed-new",
         InstallActionPerformed::ReplacedExisting => "replaced-existing",
         InstallActionPerformed::Skipped => "skipped",
+    }
+}
+
+fn validate_single_update_plan(plan: &InstallPlan, local_folder: &str) -> anyhow::Result<()> {
+    let actionable = plan
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.action,
+                InstallPlanAction::WouldInstallNew | InstallPlanAction::WouldReplaceExisting
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if actionable.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "update would affect {} addon folders; refusing to update more than one addon",
+            actionable.len()
+        ));
+    }
+
+    let target_name = actionable[0]
+        .target_folder
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if !target_name.eq_ignore_ascii_case(local_folder) {
+        return Err(anyhow::anyhow!(
+            "remote package would target folder {target_name}, not selected local folder {local_folder}; refusing conservative update"
+        ));
+    }
+
+    Ok(())
+}
+
+fn update_skip_reason(decision: &update::UpdateDecision) -> &'static str {
+    match decision {
+        update::UpdateDecision::SkippedCurrent => "selected addon is current",
+        update::UpdateDecision::SkippedLocalNewer => "local addon version is newer",
+        update::UpdateDecision::SkippedUnknownUseForce => {
+            "version comparison is unknown; enable force to reinstall"
+        }
+        update::UpdateDecision::SkippedNoMatch => "no clean remote match is available",
+        update::UpdateDecision::SkippedAmbiguous => "remote match is ambiguous",
+        update::UpdateDecision::WouldUpdate | update::UpdateDecision::ForcedReinstall => {
+            "update can proceed"
+        }
     }
 }
 
