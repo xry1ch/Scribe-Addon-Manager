@@ -1,0 +1,291 @@
+:root {
+  color: #1f2933;
+  background: #f6f7f8;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 860px;
+  min-height: 600px;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #15202b;
+  color: #f8fafc;
+  padding: 24px 16px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.mark {
+  width: 34px;
+  height: 34px;
+  background: #8fc7b5;
+  border: 2px solid #d8b35f;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.brand p {
+  margin: 2px 0 0;
+  color: #b6c2cf;
+  font-size: 12px;
+}
+
+nav {
+  display: grid;
+  gap: 6px;
+}
+
+.nav-button {
+  border: 0;
+  background: transparent;
+  color: #cdd7e1;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nav-button:hover,
+.nav-button.active {
+  background: #223142;
+  color: #ffffff;
+}
+
+.content {
+  padding: 24px;
+  min-width: 0;
+}
+
+.toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.toolbar h2 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.toolbar p {
+  margin: 4px 0 0;
+  color: #637083;
+  word-break: break-word;
+}
+
+.primary {
+  border: 1px solid #0f766e;
+  background: #0f766e;
+  color: white;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+.primary:hover {
+  background: #115e59;
+}
+
+.notice {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid #b7c3d0;
+  background: #ffffff;
+}
+
+.notice.error {
+  border-color: #c0564a;
+  color: #8f2d23;
+}
+
+.path-row,
+.search-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.search-row {
+  grid-template-columns: minmax(0, 1fr) 120px;
+}
+
+label {
+  color: #4a5565;
+}
+
+input,
+select {
+  width: 100%;
+  border: 1px solid #c8d1dc;
+  background: white;
+  color: #1f2933;
+  padding: 8px 10px;
+}
+
+.checkbox-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.checkbox-line input {
+  width: auto;
+}
+
+.table-wrap {
+  overflow: auto;
+  border: 1px solid #d7dee6;
+  background: white;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+th,
+td {
+  border-bottom: 1px solid #e5e9ef;
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+th {
+  color: #4a5565;
+  background: #eef2f5;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.click-row {
+  cursor: pointer;
+}
+
+.click-row:hover {
+  background: #f4faf8;
+}
+
+.pill {
+  display: inline-block;
+  border: 1px solid #c8d1dc;
+  padding: 2px 7px;
+  color: #3f4b5b;
+  background: #f7f9fb;
+  font-size: 12px;
+}
+
+.pill.ok {
+  border-color: #7bb69f;
+  color: #0f5f4a;
+}
+
+.pill.bad {
+  border-color: #d98b83;
+  color: #8f2d23;
+}
+
+.details-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.detail-item {
+  border: 1px solid #d7dee6;
+  background: white;
+  padding: 10px 12px;
+}
+
+.detail-item span {
+  display: block;
+  color: #637083;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.detail-item strong {
+  display: block;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.text-block {
+  border: 1px solid #d7dee6;
+  background: white;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.text-block h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
+.text-block p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #334155;
+  line-height: 1.45;
+}
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.summary-item {
+  border: 1px solid #d7dee6;
+  background: white;
+  padding: 10px 12px;
+}
+
+.summary-item span {
+  display: block;
+  color: #637083;
+  font-size: 12px;
+}
+
+.summary-item strong {
+  font-size: 22px;
+}

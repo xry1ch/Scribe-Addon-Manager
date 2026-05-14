@@ -1,13 +1,7 @@
-mod api;
-mod commands;
-mod config;
-mod error;
-mod install;
-mod local;
-
 use anyhow::Result;
 use clap::Parser;
-use commands::{Cli, Commands};
+use eso_addon_manager::api;
+use eso_addon_manager::commands::{self, Cli, Commands};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
