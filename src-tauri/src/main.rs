@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use tauri::Manager;
 
 #[derive(Debug, Serialize)]
 struct InstalledAddonsResponse {
