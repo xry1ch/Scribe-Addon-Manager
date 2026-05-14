@@ -3,6 +3,8 @@ import "./styles.css";
 import type {
   AddonDetails,
   AddonSummary,
+  AppSettings,
+  AppSettingsInput,
   CheckAddonsResponse,
   InstallRemoteAddonResponse,
   InstalledAddonsResponse,
@@ -13,7 +15,7 @@ import type {
   SingleUpdatePlanResponse,
 } from "./types";
 
-type Tab = "installed" | "search" | "details" | "updates";
+type Tab = "installed" | "search" | "details" | "updates" | "settings";
 
 interface AppState {
   tab: Tab;
@@ -33,6 +35,8 @@ interface AppState {
   forceUpdate: boolean;
   singleUpdatePlan: SingleUpdatePlanResponse | null;
   singleUpdateResult: SingleUpdateApplyResponse | null;
+  settings: AppSettings | null;
+  addonsPathExists: boolean | null;
 }
 
 const state: AppState = {
@@ -53,6 +57,8 @@ const state: AppState = {
   forceUpdate: false,
   singleUpdatePlan: null,
   singleUpdateResult: null,
+  settings: null,
+  addonsPathExists: null,
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -79,6 +85,7 @@ function render() {
           ${tabButton("search", "Search")}
           ${tabButton("details", "Details")}
           ${tabButton("updates", "Updates")}
+          ${tabButton("settings", "Settings")}
         </nav>
       </aside>
       <section class="content">
@@ -101,7 +108,33 @@ function renderCurrentTab() {
   if (state.tab === "installed") return renderInstalled();
   if (state.tab === "search") return renderSearch();
   if (state.tab === "details") return renderDetails();
+  if (state.tab === "settings") return renderSettings();
   return renderUpdates();
+}
+
+function renderSettings() {
+  const settings = state.settings;
+  const addonsMissing = Boolean(settings?.addons_dir_override) && state.addonsPathExists === false;
+  return `
+    <header class="toolbar">
+      <div>
+        <h2>Settings</h2>
+        <p>Persist desktop-only defaults for install and update flows.</p>
+      </div>
+      <div class="toolbar-actions">
+        <button class="secondary" id="reset-settings">Reset</button>
+        <button class="primary" id="save-settings">Save</button>
+      </div>
+    </header>
+    ${addonsMissing ? `<div class="notice error">Configured AddOns path does not exist: ${escapeHtml(settings?.addons_dir_override ?? "")}</div>` : ""}
+    <section class="details-grid">
+      ${settingField("AddOns path override", "settings-addons-dir", settings?.addons_dir_override ?? "")}
+      ${settingField("Backup directory override", "settings-backup-dir", settings?.backup_dir_override ?? "")}
+      ${settingField("Download directory", "settings-download-dir", settings?.download_dir ?? "")}
+      ${settingCheckbox("Keep downloads default", "settings-keep-downloads", settings?.keep_downloads_default ?? false)}
+      ${settingCheckbox("Include unknown updates default", "settings-include-unknown", settings?.include_unknown_updates_default ?? false)}
+    </section>
+  `;
 }
 
 function renderInstalled() {
@@ -577,6 +610,13 @@ function bindTabEvents() {
     button.addEventListener("click", () => planSingleUpdate(button.dataset.planUpdateTarget ?? ""));
   });
   document.querySelector<HTMLButtonElement>("#confirm-update")?.addEventListener("click", confirmUpdate);
+  document.querySelector<HTMLButtonElement>("#save-settings")?.addEventListener("click", saveSettings);
+  document.querySelector<HTMLButtonElement>("#reset-settings")?.addEventListener("click", resetSettings);
+  document.querySelector<HTMLInputElement>("#settings-addons-dir")?.addEventListener("input", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-backup-dir")?.addEventListener("input", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-download-dir")?.addEventListener("input", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-keep-downloads")?.addEventListener("change", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-include-unknown")?.addEventListener("change", syncSettingsDraft);
 }
 
 async function withLoading(task: () => Promise<void>) {
@@ -595,8 +635,15 @@ async function withLoading(task: () => Promise<void>) {
 
 function loadInstalled() {
   return withLoading(async () => {
+    if (!state.settings) {
+      state.settings = await invoke<AppSettings>("get_app_settings");
+      applySettingsToState(state.settings);
+    }
+    state.addonsPathExists = await invoke<boolean>("path_exists", {
+      path: effectiveAddonsPath(),
+    });
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
-      path: state.path || null,
+      path: effectiveAddonsPath(),
     });
     state.path = state.installed.addons_dir;
   });
@@ -631,7 +678,7 @@ function planInstall() {
   return withLoading(async () => {
     state.installPlan = await invoke<PlanRemoteInstallResponse>("plan_remote_install", {
       addonId,
-      path: state.path || null,
+      path: effectiveAddonsPath(),
     });
     state.path = state.installPlan.addons_dir;
     state.installResult = null;
@@ -654,10 +701,10 @@ function confirmInstall() {
   return withLoading(async () => {
     state.installResult = await invoke<InstallRemoteAddonResponse>("install_remote_addon", {
       addonId,
-      path: state.path || null,
-      backupDir: null,
-      keepDownload: false,
-      downloadDir: null,
+      path: effectiveAddonsPath(),
+      backupDir: state.settings?.backup_dir_override || null,
+      keepDownload: state.settings?.keep_downloads_default ?? false,
+      downloadDir: state.settings?.download_dir || null,
     });
     state.path = state.installResult.addons_dir;
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
@@ -672,7 +719,7 @@ function planSingleUpdate(target: string) {
   return withLoading(async () => {
     state.singleUpdatePlan = await invoke<SingleUpdatePlanResponse>("plan_single_update", {
       target,
-      path: state.path || null,
+      path: effectiveAddonsPath(),
       force: state.forceUpdate,
     });
     state.singleUpdateResult = null;
@@ -695,10 +742,10 @@ function confirmUpdate() {
   return withLoading(async () => {
     state.singleUpdateResult = await invoke<SingleUpdateApplyResponse>("apply_single_update", {
       target: plan.target,
-      path: state.path || null,
-      backupDir: null,
-      keepDownload: false,
-      downloadDir: null,
+      path: effectiveAddonsPath(),
+      backupDir: state.settings?.backup_dir_override || null,
+      keepDownload: state.settings?.keep_downloads_default ?? false,
+      downloadDir: state.settings?.download_dir || null,
       force: state.forceUpdate,
     });
     state.path = state.singleUpdateResult.addons_dir;
@@ -706,11 +753,11 @@ function confirmUpdate() {
       path: state.path || null,
     });
     state.updates = await invoke<CheckAddonsResponse>("check_addons", {
-      path: state.path || null,
+      path: effectiveAddonsPath(),
     });
     state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
-      path: state.path || null,
-      includeUnknown: state.includeUnknown,
+      path: effectiveAddonsPath(),
+      includeUnknown: state.settings?.include_unknown_updates_default ?? state.includeUnknown,
     });
   });
 }
@@ -718,11 +765,11 @@ function confirmUpdate() {
 function loadUpdates() {
   return withLoading(async () => {
     state.updates = await invoke<CheckAddonsResponse>("check_addons", {
-      path: state.path || null,
+      path: effectiveAddonsPath(),
     });
     state.updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
-      path: state.path || null,
-      includeUnknown: state.includeUnknown,
+      path: effectiveAddonsPath(),
+      includeUnknown: state.settings?.include_unknown_updates_default ?? state.includeUnknown,
     });
     state.path = state.updates.addons_dir;
     state.singleUpdatePlan = null;
@@ -780,4 +827,96 @@ function escapeAttr(value: string) {
 }
 
 render();
-loadInstalled();
+loadSettings().then(loadInstalled);
+
+function loadSettings() {
+  return withLoading(async () => {
+    state.settings = await invoke<AppSettings>("get_app_settings");
+    applySettingsToState(state.settings);
+    state.addonsPathExists = await invoke<boolean>("path_exists", {
+      path: effectiveAddonsPath(),
+    });
+  });
+}
+
+function applySettingsToState(settings: AppSettings) {
+  state.path = settings.addons_dir_override ?? "";
+  state.includeUnknown = settings.include_unknown_updates_default;
+}
+
+function effectiveAddonsPath() {
+  const value = state.path.trim();
+  return value.length > 0 ? value : null;
+}
+
+function syncSettingsDraft() {
+  const next = readSettingsDraft();
+  state.settings = next;
+  state.addonsPathExists = null;
+}
+
+function readSettingsDraft(): AppSettings {
+  const addonsDir = valueOrNull("#settings-addons-dir");
+  const backupDir = valueOrNull("#settings-backup-dir");
+  const downloadDir = valueOrNull("#settings-download-dir");
+  const keepDownloads = checkedOrFalse("#settings-keep-downloads");
+  const includeUnknown = checkedOrFalse("#settings-include-unknown");
+  return {
+    addons_dir_override: addonsDir,
+    backup_dir_override: backupDir,
+    download_dir: downloadDir,
+    keep_downloads_default: keepDownloads,
+    include_unknown_updates_default: includeUnknown,
+  };
+}
+
+function saveSettings() {
+  return withLoading(async () => {
+    const saved = await invoke<AppSettings>("save_app_settings", {
+      settings: readSettingsDraft() as AppSettingsInput,
+    });
+    state.settings = saved;
+    applySettingsToState(saved);
+    state.addonsPathExists = await invoke<boolean>("path_exists", {
+      path: effectiveAddonsPath(),
+    });
+  });
+}
+
+function resetSettings() {
+  return withLoading(async () => {
+    const reset = await invoke<AppSettings>("reset_app_settings");
+    state.settings = reset;
+    applySettingsToState(reset);
+    state.addonsPathExists = await invoke<boolean>("path_exists", {
+      path: effectiveAddonsPath(),
+    });
+    render();
+  });
+}
+
+function settingField(label: string, id: string, value: string) {
+  return `
+    <label class="setting-item" for="${escapeAttr(id)}">
+      <span>${escapeHtml(label)}</span>
+      <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="Leave blank for default" />
+    </label>
+  `;
+}
+
+function settingCheckbox(label: string, id: string, value: boolean) {
+  return `
+    <label class="setting-item checkbox" for="${escapeAttr(id)}">
+      <input type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} />
+      <span>${escapeHtml(label)}</span>
+    </label>
+  `;
+}
+
+function valueOrNull(selector: string) {
+  return document.querySelector<HTMLInputElement>(selector)?.value.trim() || null;
+}
+
+function checkedOrFalse(selector: string) {
+  return Boolean(document.querySelector<HTMLInputElement>(selector)?.checked);
+}

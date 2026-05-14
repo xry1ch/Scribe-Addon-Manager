@@ -166,3 +166,19 @@ export interface SingleUpdateApplyResponse {
   backup_dir: string | null;
   items: InstallResultItem[];
 }
+
+export interface AppSettings {
+  addons_dir_override: string | null;
+  backup_dir_override: string | null;
+  download_dir: string | null;
+  keep_downloads_default: boolean;
+  include_unknown_updates_default: boolean;
+}
+
+export interface AppSettingsInput {
+  addons_dir_override: string | null;
+  backup_dir_override: string | null;
+  download_dir: string | null;
+  keep_downloads_default: boolean;
+  include_unknown_updates_default: boolean;
+}

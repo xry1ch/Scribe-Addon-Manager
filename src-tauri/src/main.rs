@@ -15,7 +15,10 @@ use eso_addon_manager::install::zip_safety;
 use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
 use eso_addon_manager::local::update_plan::{self, PlannedAddonAction};
 use eso_addon_manager::local::{self, AddonPathCandidate, LocalAddon};
+use serde::Deserialize;
 use serde::Serialize;
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Serialize)]
 struct InstalledAddonsResponse {
@@ -223,9 +226,28 @@ struct InstallPlanItemDto {
     action: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+struct AppSettings {
+    addons_dir_override: Option<String>,
+    backup_dir_override: Option<String>,
+    download_dir: Option<String>,
+    keep_downloads_default: bool,
+    include_unknown_updates_default: bool,
+}
+
 struct PreparedRemoteInstall {
     details: AddonDetails,
     plan: InstallPlan,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppSettingsInput {
+    addons_dir_override: Option<String>,
+    backup_dir_override: Option<String>,
+    download_dir: Option<String>,
+    keep_downloads_default: Option<bool>,
+    include_unknown_updates_default: Option<bool>,
 }
 
 #[tauri::command]
@@ -242,6 +264,37 @@ async fn get_installed_addons(path: Option<String>) -> Result<InstalledAddonsRes
         candidates,
         addons: addons.iter().map(local_addon_dto).collect(),
     })
+}
+
+#[tauri::command]
+async fn get_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    load_app_settings(&app).map_err(to_string_error)
+}
+
+#[tauri::command]
+async fn save_app_settings(
+    app: tauri::AppHandle,
+    settings: AppSettingsInput,
+) -> Result<AppSettings, String> {
+    let saved = app_settings_from_input(settings);
+    save_app_settings_to_disk(&app, &saved).map_err(to_string_error)?;
+    Ok(saved)
+}
+
+#[tauri::command]
+async fn reset_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    let path = settings_path(&app).map_err(to_string_error)?;
+    reset_app_settings_at_path(&path).map_err(to_string_error)
+}
+
+#[tauri::command]
+async fn path_exists(path: Option<String>) -> Result<bool, String> {
+    Ok(path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(Path::new)
+        .is_some_and(Path::exists))
 }
 
 #[tauri::command]
@@ -522,6 +575,10 @@ async fn apply_single_update(
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
+            get_app_settings,
+            save_app_settings,
+            reset_app_settings,
+            path_exists,
             get_installed_addons,
             search_remote_addons,
             get_remote_addon_details,
@@ -534,6 +591,70 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Scribe Addon Manager");
+}
+
+fn settings_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+    let config_dir = app.path().app_config_dir()?;
+    Ok(app_settings_path(&config_dir))
+}
+
+fn load_app_settings(app: &tauri::AppHandle) -> anyhow::Result<AppSettings> {
+    let path = settings_path(app)?;
+    load_app_settings_from_path(&path)
+}
+
+fn save_app_settings_to_disk(app: &tauri::AppHandle, settings: &AppSettings) -> anyhow::Result<()> {
+    let path = settings_path(app)?;
+    save_app_settings_to_path(&path, settings)
+}
+
+fn app_settings_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("settings.json")
+}
+
+fn load_app_settings_from_path(path: &Path) -> anyhow::Result<AppSettings> {
+    if !path.exists() {
+        return Ok(AppSettings::default());
+    }
+    let content = fs::read_to_string(path)?;
+    let settings = serde_json::from_str::<AppSettings>(&content)?;
+    Ok(settings)
+}
+
+fn save_app_settings_to_path(path: &Path, settings: &AppSettings) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(settings)?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn reset_app_settings_at_path(path: &Path) -> anyhow::Result<AppSettings> {
+    let settings = AppSettings::default();
+    save_app_settings_to_path(path, &settings)?;
+    Ok(settings)
+}
+
+fn app_settings_from_input(settings: AppSettingsInput) -> AppSettings {
+    AppSettings {
+        addons_dir_override: normalize_optional_path(settings.addons_dir_override),
+        backup_dir_override: normalize_optional_path(settings.backup_dir_override),
+        download_dir: normalize_optional_path(settings.download_dir),
+        keep_downloads_default: settings.keep_downloads_default.unwrap_or(false),
+        include_unknown_updates_default: settings.include_unknown_updates_default.unwrap_or(false),
+    }
+}
+
+fn normalize_optional_path(value: Option<String>) -> Option<String> {
+    value.and_then(|path| {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
 }
 
 fn resolve_addons_dir(path: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -861,4 +982,96 @@ fn format_mmoui_date(timestamp: i64) -> String {
 
 fn to_string_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_settings_loads_defaults_when_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = app_settings_path(dir.path());
+
+        let settings = load_app_settings_from_path(&path).unwrap();
+
+        assert_eq!(settings, AppSettings::default());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn app_settings_saves_then_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = app_settings_path(dir.path());
+        let settings = AppSettings {
+            addons_dir_override: Some("D:\\ESO\\AddOns".to_owned()),
+            backup_dir_override: Some("D:\\ESO\\Backups".to_owned()),
+            download_dir: Some("D:\\ESO\\Downloads".to_owned()),
+            keep_downloads_default: true,
+            include_unknown_updates_default: true,
+        };
+
+        save_app_settings_to_path(&path, &settings).unwrap();
+        let loaded = load_app_settings_from_path(&path).unwrap();
+
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn app_settings_reset_persists_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = app_settings_path(dir.path());
+        let settings = AppSettings {
+            addons_dir_override: Some("D:\\ESO\\AddOns".to_owned()),
+            backup_dir_override: Some("D:\\ESO\\Backups".to_owned()),
+            download_dir: Some("D:\\ESO\\Downloads".to_owned()),
+            keep_downloads_default: true,
+            include_unknown_updates_default: true,
+        };
+        save_app_settings_to_path(&path, &settings).unwrap();
+
+        let reset = reset_app_settings_at_path(&path).unwrap();
+        let loaded = load_app_settings_from_path(&path).unwrap();
+
+        assert_eq!(reset, AppSettings::default());
+        assert_eq!(loaded, AppSettings::default());
+    }
+
+    #[test]
+    fn app_settings_empty_strings_are_saved_as_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = app_settings_path(dir.path());
+        let settings = app_settings_from_input(AppSettingsInput {
+            addons_dir_override: Some("".to_owned()),
+            backup_dir_override: Some("   ".to_owned()),
+            download_dir: Some("\t".to_owned()),
+            keep_downloads_default: None,
+            include_unknown_updates_default: None,
+        });
+
+        save_app_settings_to_path(&path, &settings).unwrap();
+        let loaded = load_app_settings_from_path(&path).unwrap();
+
+        assert_eq!(settings, AppSettings::default());
+        assert_eq!(loaded, AppSettings::default());
+    }
+
+    #[test]
+    fn app_settings_do_not_persist_force_or_reinstall_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = app_settings_path(dir.path());
+        let settings = AppSettings {
+            addons_dir_override: Some("D:\\ESO\\AddOns".to_owned()),
+            backup_dir_override: None,
+            download_dir: None,
+            keep_downloads_default: true,
+            include_unknown_updates_default: true,
+        };
+
+        save_app_settings_to_path(&path, &settings).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+
+        assert!(!content.contains("force"));
+        assert!(!content.contains("reinstall"));
+    }
 }
