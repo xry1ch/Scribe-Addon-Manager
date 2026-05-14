@@ -103,3 +103,27 @@ export interface PlanRemoteInstallResponse {
     items: InstallPlanItem[];
   };
 }
+
+export interface InstallResultItem {
+  source_folder: string | null;
+  target_folder: string | null;
+  backup_folder: string | null;
+  action: string;
+  message: string | null;
+}
+
+export interface InstallRemoteAddonResponse {
+  applied: boolean;
+  installed_new: number;
+  replaced: number;
+  skipped: number;
+  backup_dir: string | null;
+  remote: AddonDetails;
+  addons_dir: string;
+  plan: {
+    addons_dir: string;
+    temp_dir: string;
+    items: InstallPlanItem[];
+  };
+  items: InstallResultItem[];
+}

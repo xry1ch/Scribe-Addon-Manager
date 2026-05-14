@@ -4,6 +4,7 @@ import type {
   AddonDetails,
   AddonSummary,
   CheckAddonsResponse,
+  InstallRemoteAddonResponse,
   InstalledAddonsResponse,
   PlanRemoteInstallResponse,
   PlanUpdatesResponse,
@@ -26,6 +27,7 @@ interface AppState {
   updatePlan: PlanUpdatesResponse | null;
   includeUnknown: boolean;
   installPlan: PlanRemoteInstallResponse | null;
+  installResult: InstallRemoteAddonResponse | null;
 }
 
 const state: AppState = {
@@ -42,6 +44,7 @@ const state: AppState = {
   updatePlan: null,
   includeUnknown: false,
   installPlan: null,
+  installResult: null,
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -222,6 +225,7 @@ function renderDetails() {
       ${detailItem("Download URL", details.download_url)}
     </section>
     ${renderInstallPlan()}
+    ${renderInstallResult()}
     ${textBlock("Description", details.description)}
     ${textBlock("Changelog", details.changelog)}
   `;
@@ -234,6 +238,13 @@ function renderInstallPlan() {
   return `
     <section class="plan-panel">
       <div class="notice">Dry run only. This preview downloaded and validated the ZIP, but did not install, update, delete, back up, or extract anything into the real AddOns directory.</div>
+      <div class="toolbar compact">
+        <div>
+          <h3>Install Preview</h3>
+          <p>Review this plan before continuing.</p>
+        </div>
+        <button class="danger" id="confirm-install">Install</button>
+      </div>
       <section class="details-grid">
         ${detailItem("Remote name", plan.remote.name)}
         ${detailItem("UID", plan.remote.uid)}
@@ -270,6 +281,56 @@ function renderInstallPlan() {
           </tbody>
         </table>
       </div>
+    </section>
+  `;
+}
+
+function renderInstallResult() {
+  const result = state.installResult;
+  if (!result) return "";
+
+  return `
+    <section class="plan-panel">
+      <div class="notice ${result.applied ? "" : "error"}">
+        Install ${result.applied ? "completed" : "finished without file changes"}.
+      </div>
+      <div class="summary">
+        ${summaryItem("Installed", result.installed_new)}
+        ${summaryItem("Replaced", result.replaced)}
+        ${summaryItem("Skipped", result.skipped)}
+        ${summaryItem("Applied", result.applied ? 1 : 0)}
+      </div>
+      <section class="details-grid">
+        ${detailItem("Backup location", result.backup_dir)}
+        ${detailItem("AddOns directory", result.addons_dir)}
+      </section>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source folder</th>
+              <th>Target folder</th>
+              <th>Backup folder</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${result.items
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${escapeHtml(item.source_folder ?? "-")}</td>
+                    <td>${escapeHtml(item.target_folder ?? "-")}</td>
+                    <td>${escapeHtml(item.backup_folder ?? "-")}</td>
+                    <td><span class="pill">${escapeHtml(item.action)}</span></td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+      <button class="primary" id="refresh-installed-after-install">Refresh Installed</button>
     </section>
   `;
 }
@@ -346,6 +407,10 @@ function bindTabEvents() {
   });
   document.querySelector<HTMLButtonElement>("#run-search")?.addEventListener("click", runSearch);
   document.querySelector<HTMLButtonElement>("#plan-install")?.addEventListener("click", planInstall);
+  document.querySelector<HTMLButtonElement>("#confirm-install")?.addEventListener("click", confirmInstall);
+  document
+    .querySelector<HTMLButtonElement>("#refresh-installed-after-install")
+    ?.addEventListener("click", loadInstalled);
   document.querySelector<HTMLInputElement>("#details-path-input")?.addEventListener("input", (event) => {
     state.path = (event.currentTarget as HTMLInputElement).value;
   });
@@ -406,6 +471,7 @@ function loadDetails(addonId: string) {
       addonId,
     });
     state.installPlan = null;
+    state.installResult = null;
   });
 }
 
@@ -419,6 +485,35 @@ function planInstall() {
       path: state.path || null,
     });
     state.path = state.installPlan.addons_dir;
+    state.installResult = null;
+  });
+}
+
+function confirmInstall() {
+  const addonId = state.selectedDetails?.uid;
+  const plan = state.installPlan;
+  if (!addonId || !plan) return;
+
+  const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
+    ? "Existing folders may be backed up and replaced. A default timestamped backup folder will be created inside the AddOns directory unless the app is configured otherwise."
+    : "No replacement is currently planned, so no backup folder is expected unless the fresh install plan changes.";
+  const confirmed = window.confirm(
+    `Install ${plan.remote.name ?? addonId}?\n\nFiles may be written to your AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n\nThe app will fetch fresh metadata, download and verify the ZIP, validate it, build a fresh plan, and back up replacements before applying.`,
+  );
+  if (!confirmed) return;
+
+  return withLoading(async () => {
+    state.installResult = await invoke<InstallRemoteAddonResponse>("install_remote_addon", {
+      addonId,
+      path: state.path || null,
+      backupDir: null,
+      keepDownload: false,
+      downloadDir: null,
+    });
+    state.path = state.installResult.addons_dir;
+    state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", {
+      path: state.path || null,
+    });
   });
 }
 

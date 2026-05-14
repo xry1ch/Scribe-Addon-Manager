@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use eso_addon_manager::api::models::{AddonDetails, AddonSummary};
 use eso_addon_manager::api::ApiClient;
+use eso_addon_manager::install::apply::{
+    self, InstallActionPerformed, InstallResult, InstalledItem,
+};
 use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanItem};
 use eso_addon_manager::install::remote;
 use eso_addon_manager::install::zip_safety;
@@ -149,6 +152,28 @@ struct PlanRemoteInstallResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct InstallRemoteAddonResponse {
+    applied: bool,
+    installed_new: usize,
+    replaced: usize,
+    skipped: usize,
+    backup_dir: Option<String>,
+    remote: AddonDetailsDto,
+    addons_dir: String,
+    plan: InstallPlanDto,
+    items: Vec<InstalledItemDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledItemDto {
+    source_folder: Option<String>,
+    target_folder: Option<String>,
+    backup_folder: Option<String>,
+    action: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct InstallPlanDto {
     addons_dir: String,
     temp_dir: String,
@@ -162,6 +187,11 @@ struct InstallPlanItemDto {
     version: Option<String>,
     target_folder: Option<String>,
     action: String,
+}
+
+struct PreparedRemoteInstall {
+    details: AddonDetails,
+    plan: InstallPlan,
 }
 
 #[tauri::command]
@@ -267,37 +297,63 @@ async fn plan_remote_install(
     path: Option<String>,
 ) -> Result<PlanRemoteInstallResponse, String> {
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
-    let installed_addons =
-        scan_installed_addons_for_install(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
-    let details = client
-        .eso_file_details(&addon_id)
-        .await
-        .map_err(to_string_error)?;
-    let download_url = remote::download_url(&details).map_err(to_string_error)?;
-    let bytes = client
-        .download_bytes(download_url)
-        .await
-        .map_err(to_string_error)?;
-    remote::verify_md5(&bytes, details.md5.as_deref()).map_err(to_string_error)?;
-
-    let temp_file = tempfile::Builder::new()
-        .prefix("eso-addon-manager-ui-plan-")
-        .suffix(".zip")
-        .tempfile()
-        .map_err(to_string_error)?;
-    std::fs::write(temp_file.path(), &bytes).map_err(to_string_error)?;
-    let extracted = zip_safety::extract_zip_to_temp(temp_file.path()).map_err(to_string_error)?;
-    let install_plan =
-        plan::plan_install(&extracted, &addons_dir, &installed_addons).map_err(to_string_error)?;
+    let prepared = prepare_remote_install_plan(&client, &addon_id, &addons_dir).await?;
 
     Ok(PlanRemoteInstallResponse {
         dry_run: true,
         applied: false,
-        remote: addon_details_dto(&details),
+        remote: addon_details_dto(&prepared.details),
         addons_dir: path_string(&addons_dir),
-        plan: install_plan_dto(&install_plan),
+        plan: install_plan_dto(&prepared.plan),
     })
+}
+
+#[tauri::command]
+async fn install_remote_addon(
+    addon_id: String,
+    path: Option<String>,
+    backup_dir: Option<String>,
+    keep_download: Option<bool>,
+    download_dir: Option<String>,
+) -> Result<InstallRemoteAddonResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let backup_dir = backup_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let download_dir = download_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let prepared = prepare_remote_install_plan(&client, &addon_id, &addons_dir).await?;
+
+    if keep_download.unwrap_or(false) {
+        let download_url = remote::download_url(&prepared.details).map_err(to_string_error)?;
+        let file_name = remote::download_file_name(&prepared.details, &addon_id);
+        let path = remote::keep_download_path(download_dir.as_deref(), &file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(to_string_error)?;
+        }
+        let bytes = client
+            .download_bytes(download_url)
+            .await
+            .map_err(to_string_error)?;
+        remote::verify_md5(&bytes, prepared.details.md5.as_deref()).map_err(to_string_error)?;
+        std::fs::write(path, bytes).map_err(to_string_error)?;
+    }
+
+    let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
+        .map_err(to_string_error)?;
+    Ok(install_remote_addon_response(
+        &prepared.details,
+        &addons_dir,
+        &prepared.plan,
+        &result,
+    ))
 }
 
 fn main() {
@@ -308,7 +364,8 @@ fn main() {
             get_remote_addon_details,
             check_addons,
             plan_updates,
-            plan_remote_install
+            plan_remote_install,
+            install_remote_addon
         ])
         .run(tauri::generate_context!())
         .expect("error while running Scribe Addon Manager");
@@ -436,6 +493,81 @@ fn install_plan_item_dto(item: &InstallPlanItem) -> InstallPlanItemDto {
         version: item.version.clone(),
         target_folder: item.target_folder.as_ref().map(|path| path_string(path)),
         action: item.action.as_str().to_owned(),
+    }
+}
+
+async fn prepare_remote_install_plan(
+    client: &ApiClient,
+    addon_id: &str,
+    addons_dir: &std::path::Path,
+) -> Result<PreparedRemoteInstall, String> {
+    let installed_addons =
+        scan_installed_addons_for_install(addons_dir).map_err(to_string_error)?;
+    let details = client
+        .eso_file_details(addon_id)
+        .await
+        .map_err(to_string_error)?;
+    let download_url = remote::download_url(&details).map_err(to_string_error)?;
+    let bytes = client
+        .download_bytes(download_url)
+        .await
+        .map_err(to_string_error)?;
+    remote::verify_md5(&bytes, details.md5.as_deref()).map_err(to_string_error)?;
+
+    let temp_file = tempfile::Builder::new()
+        .prefix("eso-addon-manager-ui-install-")
+        .suffix(".zip")
+        .tempfile()
+        .map_err(to_string_error)?;
+    std::fs::write(temp_file.path(), &bytes).map_err(to_string_error)?;
+    let extracted = zip_safety::extract_zip_to_temp(temp_file.path()).map_err(to_string_error)?;
+    let install_plan =
+        plan::plan_install(&extracted, addons_dir, &installed_addons).map_err(to_string_error)?;
+
+    Ok(PreparedRemoteInstall {
+        details,
+        plan: install_plan,
+    })
+}
+
+fn install_remote_addon_response(
+    details: &AddonDetails,
+    addons_dir: &std::path::Path,
+    plan: &InstallPlan,
+    result: &InstallResult,
+) -> InstallRemoteAddonResponse {
+    InstallRemoteAddonResponse {
+        applied: install_result_applied(result),
+        installed_new: result.installed_new,
+        replaced: result.replaced,
+        skipped: result.skipped,
+        backup_dir: result.backup_dir.as_ref().map(|path| path_string(path)),
+        remote: addon_details_dto(details),
+        addons_dir: path_string(addons_dir),
+        plan: install_plan_dto(plan),
+        items: result.items.iter().map(installed_item_dto).collect(),
+    }
+}
+
+fn installed_item_dto(item: &InstalledItem) -> InstalledItemDto {
+    InstalledItemDto {
+        source_folder: item.source_folder.clone(),
+        target_folder: item.target_folder.as_ref().map(|path| path_string(path)),
+        backup_folder: item.backup_folder.as_ref().map(|path| path_string(path)),
+        action: install_action_as_str(&item.action).to_owned(),
+        message: item.message.clone(),
+    }
+}
+
+fn install_result_applied(result: &InstallResult) -> bool {
+    result.installed_new > 0 || result.replaced > 0
+}
+
+fn install_action_as_str(action: &InstallActionPerformed) -> &'static str {
+    match action {
+        InstallActionPerformed::InstalledNew => "installed-new",
+        InstallActionPerformed::ReplacedExisting => "replaced-existing",
+        InstallActionPerformed::Skipped => "skipped",
     }
 }
 

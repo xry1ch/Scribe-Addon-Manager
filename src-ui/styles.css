@@ -93,6 +93,15 @@ nav {
   margin-bottom: 18px;
 }
 
+.toolbar.compact {
+  margin: 8px 0 12px;
+}
+
+.toolbar h3 {
+  margin: 0;
+  font-size: 18px;
+}
+
 .toolbar h2 {
   margin: 0;
   font-size: 24px;
@@ -114,6 +123,18 @@ nav {
 
 .primary:hover {
   background: #115e59;
+}
+
+.danger {
+  border: 1px solid #b42318;
+  background: #b42318;
+  color: white;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+.danger:hover {
+  background: #8f1d15;
 }
 
 .notice {
