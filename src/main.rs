@@ -20,38 +20,55 @@ async fn main() -> Result<()> {
     let client = api::ApiClient::new()?;
 
     match cli.command {
-        Commands::FetchConfig => commands::fetch_config(&client).await,
-        Commands::List => commands::list(&client).await,
-        Commands::Search { query, limit } => commands::search(&client, &query, limit).await,
-        Commands::Details { addon_id } => commands::details(&client, &addon_id).await,
+        Commands::FetchConfig { json } => commands::fetch_config(&client, json).await,
+        Commands::List { json } => commands::list(&client, json).await,
+        Commands::Search { query, limit, json } => {
+            commands::search(&client, &query, limit, json).await
+        }
+        Commands::Details { addon_id, json } => commands::details(&client, &addon_id, json).await,
         Commands::Download { addon_id, output } => {
             commands::download(&client, &addon_id, &output).await
         }
-        Commands::LocalPaths => commands::local_paths(),
-        Commands::Installed { path } => commands::installed(path.as_deref()),
+        Commands::LocalPaths { json } => commands::local_paths(json),
+        Commands::Installed { path, json } => commands::installed(path.as_deref(), json),
         Commands::Check {
             path,
             refresh,
             limit,
             verbose,
-        } => commands::check(&client, path.as_deref(), refresh, limit, verbose).await,
+            json,
+        } => commands::check(&client, path.as_deref(), refresh, limit, verbose, json).await,
         Commands::PlanUpdate {
             path,
             refresh,
             limit,
             include_unknown,
-        } => commands::plan_update(&client, path.as_deref(), refresh, limit, include_unknown).await,
-        Commands::InspectZip { zip_path } => commands::inspect_zip(&zip_path),
-        Commands::ExtractTemp { zip_path } => commands::extract_temp(&zip_path),
-        Commands::PlanInstall { zip_path, path } => {
-            commands::plan_install(&zip_path, path.as_deref())
+            json,
+        } => {
+            commands::plan_update(
+                &client,
+                path.as_deref(),
+                refresh,
+                limit,
+                include_unknown,
+                json,
+            )
+            .await
         }
+        Commands::InspectZip { zip_path, json } => commands::inspect_zip(&zip_path, json),
+        Commands::ExtractTemp { zip_path } => commands::extract_temp(&zip_path),
+        Commands::PlanInstall {
+            zip_path,
+            path,
+            json,
+        } => commands::plan_install(&zip_path, path.as_deref(), json),
         Commands::InstallZip {
             zip_path,
             path,
             yes,
             backup_dir,
-        } => commands::install_zip(&zip_path, path.as_deref(), yes, backup_dir.as_deref()),
+            json,
+        } => commands::install_zip(&zip_path, path.as_deref(), yes, backup_dir.as_deref(), json),
         Commands::Install {
             addon_id,
             path,
@@ -59,6 +76,7 @@ async fn main() -> Result<()> {
             backup_dir,
             keep_download,
             download_dir,
+            json,
         } => {
             commands::install_remote(
                 &client,
@@ -68,6 +86,7 @@ async fn main() -> Result<()> {
                 backup_dir.as_deref(),
                 keep_download,
                 download_dir.as_deref(),
+                json,
             )
             .await
         }
@@ -79,6 +98,7 @@ async fn main() -> Result<()> {
             keep_download,
             download_dir,
             force,
+            json,
         } => {
             commands::update_one(
                 &client,
@@ -89,6 +109,7 @@ async fn main() -> Result<()> {
                 keep_download,
                 download_dir.as_deref(),
                 force,
+                json,
             )
             .await
         }
@@ -101,6 +122,7 @@ async fn main() -> Result<()> {
             download_dir,
             include_unknown,
             limit,
+            json,
         } => {
             commands::update_all(
                 &client,
@@ -112,6 +134,7 @@ async fn main() -> Result<()> {
                 download_dir.as_deref(),
                 include_unknown,
                 limit,
+                json,
             )
             .await
         }

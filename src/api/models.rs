@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GlobalConfig {
     #[serde(rename = "GAMES", default, deserialize_with = "de::vec_from_value")]
     pub games: Vec<GameEntry>,
@@ -12,7 +12,7 @@ pub struct GlobalConfig {
     pub _extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GameEntry {
     #[serde(rename = "GameID", default, deserialize_with = "de::optional_string")]
     pub game_id: Option<String>,
@@ -28,7 +28,7 @@ pub struct GameEntry {
     pub _extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GameConfig {
     #[serde(
         rename = "WebsiteTitle",
@@ -58,7 +58,7 @@ pub struct GameConfig {
     pub _extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ApiFeeds {
     #[serde(rename = "FileList", default, deserialize_with = "de::optional_string")]
     pub file_list: Option<String>,
@@ -88,7 +88,7 @@ pub struct ApiFeeds {
     pub _extra: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddonSummary {
     #[serde(rename = "UID", default, deserialize_with = "de::optional_string")]
     pub uid: Option<String>,
@@ -157,7 +157,7 @@ impl AddonSummary {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddonDetails {
     #[serde(rename = "UID", default, deserialize_with = "de::optional_string")]
     pub uid: Option<String>,

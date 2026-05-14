@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
+use serde_json::{json, Value};
 use tokio::fs;
 
 use crate::api::models::{AddonDetails, AddonSummary, ApiFeeds};
@@ -29,10 +31,16 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Fetch global and ESO game configuration and print discovered feeds.
-    FetchConfig,
+    FetchConfig {
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Fetch the ESO FileList feed and print the first 25 addons.
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Search addon metadata from the ESO FileList feed.
     Search {
@@ -40,10 +48,18 @@ pub enum Commands {
 
         #[arg(long, default_value_t = 25)]
         limit: usize,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Fetch details for a single addon id.
-    Details { addon_id: String },
+    Details {
+        addon_id: String,
+
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Download an addon ZIP without extracting it.
     Download {
@@ -54,12 +70,18 @@ pub enum Commands {
     },
 
     /// Print candidate ESO AddOns directories.
-    LocalPaths,
+    LocalPaths {
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Scan a local ESO AddOns directory and print detected addons.
     Installed {
         #[arg(long)]
         path: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Compare installed local addons with the remote ESOUI FileList feed.
@@ -75,6 +97,9 @@ pub enum Commands {
 
         #[arg(long)]
         verbose: bool,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print a read-only dry-run update plan.
@@ -90,10 +115,18 @@ pub enum Commands {
 
         #[arg(long)]
         include_unknown: bool,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Validate and inspect a local addon ZIP without extracting it.
-    InspectZip { zip_path: PathBuf },
+    InspectZip {
+        zip_path: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Validate and extract a local addon ZIP into a temporary directory only.
     ExtractTemp { zip_path: PathBuf },
@@ -104,6 +137,9 @@ pub enum Commands {
 
         #[arg(long)]
         path: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Install addon folders from a validated ZIP, backing up replacements first.
@@ -118,6 +154,9 @@ pub enum Commands {
 
         #[arg(long)]
         backup_dir: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Download and install an addon from ESOUI by MMOUI addon id.
@@ -138,6 +177,9 @@ pub enum Commands {
 
         #[arg(long)]
         download_dir: Option<PathBuf>,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Update exactly one installed addon by local folder name or remote UID.
@@ -161,6 +203,9 @@ pub enum Commands {
 
         #[arg(long)]
         force: bool,
+
+        #[arg(long)]
+        json: bool,
     },
 
     /// Update all installed addons with reliable update candidates.
@@ -188,11 +233,17 @@ pub enum Commands {
 
         #[arg(long)]
         limit: Option<usize>,
+
+        #[arg(long)]
+        json: bool,
     },
 }
 
-pub async fn fetch_config(client: &ApiClient) -> Result<()> {
+pub async fn fetch_config(client: &ApiClient, json_output: bool) -> Result<()> {
     let config = client.eso_game_config().await?;
+    if json_output {
+        return print_json(&config);
+    }
     println!(
         "{}",
         config
@@ -211,26 +262,50 @@ pub async fn fetch_config(client: &ApiClient) -> Result<()> {
     Ok(())
 }
 
-pub async fn list(client: &ApiClient) -> Result<()> {
+pub async fn list(client: &ApiClient, json_output: bool) -> Result<()> {
     let addons = client.eso_file_list().await?;
+    if json_output {
+        return print_json_value(json!({
+            "addons": addons.iter().take(25).collect::<Vec<_>>(),
+            "limit": 25,
+            "total_remote": addons.len(),
+        }));
+    }
     print_addons(addons.iter().take(25));
     Ok(())
 }
 
-pub async fn search(client: &ApiClient, query: &str, limit: usize) -> Result<()> {
+pub async fn search(
+    client: &ApiClient,
+    query: &str,
+    limit: usize,
+    json_output: bool,
+) -> Result<()> {
     let needle = query.to_lowercase();
     let addons = client.eso_file_list().await?;
     let matches = addons
         .iter()
         .filter(|addon| addon.searchable_text().contains(&needle))
-        .take(limit);
+        .take(limit)
+        .collect::<Vec<_>>();
 
-    print_addons(matches);
+    if json_output {
+        return print_json_value(json!({
+            "query": query,
+            "limit": limit,
+            "addons": matches,
+        }));
+    }
+
+    print_addons(matches.into_iter());
     Ok(())
 }
 
-pub async fn details(client: &ApiClient, addon_id: &str) -> Result<()> {
+pub async fn details(client: &ApiClient, addon_id: &str, json_output: bool) -> Result<()> {
     let details = client.eso_file_details(addon_id).await?;
+    if json_output {
+        return print_json(&details);
+    }
     print_details(&details);
     Ok(())
 }
@@ -277,8 +352,14 @@ pub async fn download(client: &ApiClient, addon_id: &str, output: &Path) -> Resu
     Ok(())
 }
 
-pub fn local_paths() -> Result<()> {
+pub fn local_paths(json_output: bool) -> Result<()> {
     let candidates = local::addon_path_candidates();
+
+    if json_output {
+        return print_json_value(json!({
+            "candidates": candidates.iter().map(addon_path_candidate_json).collect::<Vec<_>>(),
+        }));
+    }
 
     println!("{:<8} {:<8} Path", "Exists", "Addons");
     println!("{}", "-".repeat(96));
@@ -294,7 +375,7 @@ pub fn local_paths() -> Result<()> {
     Ok(())
 }
 
-pub fn installed(path: Option<&Path>) -> Result<()> {
+pub fn installed(path: Option<&Path>, json_output: bool) -> Result<()> {
     let path = match path {
         Some(path) => path.to_path_buf(),
         None => local::detect_best_addons_dir()
@@ -303,6 +384,13 @@ pub fn installed(path: Option<&Path>) -> Result<()> {
 
     let addons = local::scan_addons_dir(&path)
         .with_context(|| format!("failed to scan AddOns directory {}", path.display()))?;
+
+    if json_output {
+        return print_json_value(json!({
+            "addons_dir": path_string(&path),
+            "addons": addons.iter().map(local_addon_json).collect::<Vec<_>>(),
+        }));
+    }
 
     println!("AddOns directory: {}", path.display());
     println!();
@@ -316,6 +404,7 @@ pub async fn check(
     refresh: bool,
     limit: Option<usize>,
     verbose: bool,
+    json_output: bool,
 ) -> Result<()> {
     if refresh {
         tracing::debug!("refresh requested; fetching live remote FileList");
@@ -337,6 +426,16 @@ pub async fn check(
         results.truncate(limit);
     }
 
+    if json_output {
+        return print_json_value(json!({
+            "addons_dir": path_string(&path),
+            "remote_addons_loaded": remote_addons.len(),
+            "limit": limit,
+            "verbose": verbose,
+            "matches": results.iter().map(|result| match_result_json(result, verbose)).collect::<Vec<_>>(),
+        }));
+    }
+
     println!("AddOns directory: {}", path.display());
     println!("Remote addons loaded: {}", remote_addons.len());
     println!();
@@ -350,6 +449,7 @@ pub async fn plan_update(
     refresh: bool,
     limit: Option<usize>,
     include_unknown: bool,
+    json_output: bool,
 ) -> Result<()> {
     if refresh {
         tracing::debug!("refresh requested; fetching live remote FileList");
@@ -378,6 +478,18 @@ pub async fn plan_update(
         plan.attach_details(&uid, details);
     }
 
+    if json_output {
+        return print_json_value(json!({
+            "addons_dir": path_string(&path),
+            "remote_addons_loaded": remote_addons.len(),
+            "dry_run": true,
+            "applied": false,
+            "include_unknown": include_unknown,
+            "limit": limit,
+            "plan": update_plan_json(&plan),
+        }));
+    }
+
     println!("AddOns directory: {}", path.display());
     println!("Remote addons loaded: {}", remote_addons.len());
     println!("Dry run only: no files will be downloaded, extracted, modified, or deleted.");
@@ -396,6 +508,7 @@ pub async fn update_all(
     download_dir: Option<&Path>,
     include_unknown: bool,
     limit: Option<usize>,
+    json_output: bool,
 ) -> Result<()> {
     if refresh {
         tracing::debug!("refresh requested; fetching live remote FileList");
@@ -419,26 +532,59 @@ pub async fn update_all(
 
     let plan = update_all_core::build_update_all_plan(&matches, include_unknown);
 
-    println!("AddOns directory: {}", addons_dir.display());
-    println!("Remote addons loaded: {}", remote_addons.len());
-    println!("Dry run by default: no files will be downloaded, extracted, modified, or deleted without --yes.");
-    println!();
-    print_update_all_plan(&plan);
+    if json_output && !yes {
+        return print_json_value(json!({
+            "addons_dir": path_string(&addons_dir),
+            "remote_addons_loaded": remote_addons.len(),
+            "dry_run": true,
+            "applied": false,
+            "include_unknown": include_unknown,
+            "limit": limit,
+            "plan": update_all_plan_json(&plan),
+            "results": [],
+        }));
+    }
+
+    if !json_output {
+        println!("AddOns directory: {}", addons_dir.display());
+        println!("Remote addons loaded: {}", remote_addons.len());
+        println!("Dry run by default: no files will be downloaded, extracted, modified, or deleted without --yes.");
+        println!();
+        print_update_all_plan(&plan);
+    }
 
     if !yes {
-        println!();
-        println!("No changes made. Re-run with --yes to update all planned addons.");
+        if !json_output {
+            println!();
+            println!("No changes made. Re-run with --yes to update all planned addons.");
+        }
         return Ok(());
     }
 
     if plan.targets.is_empty() {
+        if json_output {
+            return print_json_value(json!({
+                "addons_dir": path_string(&addons_dir),
+                "remote_addons_loaded": remote_addons.len(),
+                "dry_run": false,
+                "applied": false,
+                "include_unknown": include_unknown,
+                "limit": limit,
+                "plan": update_all_plan_json(&plan),
+                "results": [],
+            }));
+        }
         println!();
         println!("No planned addons to update.");
         return Ok(());
     }
 
-    println!();
-    println!("Applying planned updates sequentially:");
+    let mut applied_results = Vec::new();
+
+    if !json_output {
+        println!();
+        println!("Applying planned updates sequentially:");
+    }
 
     for target in &plan.targets {
         let remote_uid = target.remote_uid.as_deref().ok_or_else(|| {
@@ -448,13 +594,15 @@ pub async fn update_all(
             )
         })?;
 
-        println!();
-        println!(
-            "Updating {} -> {} ({})",
-            target.local_folder,
-            target.remote_name.as_deref().unwrap_or("-"),
-            remote_uid
-        );
+        if !json_output {
+            println!();
+            println!(
+                "Updating {} -> {} ({})",
+                target.local_folder,
+                target.remote_name.as_deref().unwrap_or("-"),
+                remote_uid
+            );
+        }
 
         let result = match update_all_one(
             client,
@@ -465,18 +613,31 @@ pub async fn update_all(
             backup_dir,
             keep_download,
             download_dir,
+            json_output,
         )
         .await
         {
             Ok(result) => result,
             Err(error) => {
-                println!("failed: {} ({})", target.local_folder, error);
+                if !json_output {
+                    println!("failed: {} ({})", target.local_folder, error);
+                }
                 return Err(error)
                     .with_context(|| format!("failed to update {}", target.local_folder));
             }
         };
 
-        print_update_all_item_result(target, &result);
+        if json_output {
+            applied_results.push(json!({
+                "local_folder": target.local_folder,
+                "remote_uid": target.remote_uid,
+                "remote_name": target.remote_name,
+                "status": "updated",
+                "result": install_result_json(&result),
+            }));
+        } else {
+            print_update_all_item_result(target, &result);
+        }
         local_addons = local::scan_addons_dir(&addons_dir).with_context(|| {
             format!(
                 "failed to rescan AddOns directory {} after updating {}",
@@ -484,6 +645,19 @@ pub async fn update_all(
                 target.local_folder
             )
         })?;
+    }
+
+    if json_output {
+        return print_json_value(json!({
+            "addons_dir": path_string(&addons_dir),
+            "remote_addons_loaded": remote_addons.len(),
+            "dry_run": false,
+            "applied": !applied_results.is_empty(),
+            "include_unknown": include_unknown,
+            "limit": limit,
+            "plan": update_all_plan_json(&plan),
+            "results": applied_results,
+        }));
     }
 
     println!();
@@ -500,6 +674,7 @@ async fn update_all_one(
     backup_dir: Option<&Path>,
     keep_download: bool,
     download_dir: Option<&Path>,
+    quiet: bool,
 ) -> Result<InstallResult> {
     let details = client.eso_file_details(remote_uid).await?;
     let install_plan = prepare_remote_install_plan(
@@ -510,6 +685,7 @@ async fn update_all_one(
         local_addons,
         keep_download,
         download_dir,
+        quiet,
     )
     .await?;
     validate_single_update_plan(&install_plan, &target.local_folder)?;
@@ -517,9 +693,12 @@ async fn update_all_one(
     Ok(apply::apply_install_plan(&install_plan, backup_dir)?)
 }
 
-pub fn inspect_zip(zip_path: &Path) -> Result<()> {
+pub fn inspect_zip(zip_path: &Path, json_output: bool) -> Result<()> {
     let inspection = zip_safety::inspect_zip(zip_path)
         .with_context(|| format!("failed to inspect ZIP {}", zip_path.display()))?;
+    if json_output {
+        return print_json_value(zip_inspection_json(&inspection));
+    }
     print_zip_inspection(&inspection);
     Ok(())
 }
@@ -531,7 +710,7 @@ pub fn extract_temp(zip_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn plan_install(zip_path: &Path, path: Option<&Path>) -> Result<()> {
+pub fn plan_install(zip_path: &Path, path: Option<&Path>, json_output: bool) -> Result<()> {
     let addons_dir = match path {
         Some(path) => path.to_path_buf(),
         None => local::detect_best_addons_dir()
@@ -542,6 +721,16 @@ pub fn plan_install(zip_path: &Path, path: Option<&Path>) -> Result<()> {
         .with_context(|| format!("failed to validate and extract ZIP {}", zip_path.display()))?;
     let plan = plan::plan_install(&extracted, &addons_dir, &installed_addons)?;
 
+    if json_output {
+        return print_json_value(json!({
+            "zip_path": path_string(zip_path),
+            "addons_dir": path_string(&addons_dir),
+            "dry_run": true,
+            "applied": false,
+            "plan": install_plan_json(&plan),
+        }));
+    }
+
     print_install_plan(&plan, true);
     Ok(())
 }
@@ -551,6 +740,7 @@ pub fn install_zip(
     path: Option<&Path>,
     yes: bool,
     backup_dir: Option<&Path>,
+    json_output: bool,
 ) -> Result<()> {
     let addons_dir = match path {
         Some(path) => path.to_path_buf(),
@@ -563,10 +753,32 @@ pub fn install_zip(
     let plan = plan::plan_install(&extracted, &addons_dir, &installed_addons)?;
 
     if !yes {
+        if json_output {
+            return print_json_value(json!({
+                "zip_path": path_string(zip_path),
+                "addons_dir": path_string(&addons_dir),
+                "dry_run": true,
+                "applied": false,
+                "plan": install_plan_json(&plan),
+                "result": Value::Null,
+            }));
+        }
         print_install_plan(&plan, true);
         println!();
         println!("No changes made. Re-run with --yes to install.");
         return Ok(());
+    }
+
+    if json_output {
+        let result = apply::apply_install_plan(&plan, backup_dir)?;
+        return print_json_value(json!({
+            "zip_path": path_string(zip_path),
+            "addons_dir": path_string(&addons_dir),
+            "dry_run": false,
+            "applied": install_result_applied(&result),
+            "plan": install_plan_json(&plan),
+            "result": install_result_json(&result),
+        }));
     }
 
     print_install_plan(&plan, false);
@@ -584,9 +796,12 @@ pub async fn install_remote(
     backup_dir: Option<&Path>,
     keep_download: bool,
     download_dir: Option<&Path>,
+    json_output: bool,
 ) -> Result<()> {
     let details = client.eso_file_details(addon_id).await?;
-    print_remote_install_metadata(&details);
+    if !json_output {
+        print_remote_install_metadata(&details);
+    }
 
     let download_url = remote::download_url(&details)?;
     let file_name = remote::download_file_name(&details, addon_id);
@@ -609,7 +824,9 @@ pub async fn install_remote(
         fs::write(&path, &bytes)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
-        println!("Saved ZIP: {}", path.display());
+        if !json_output {
+            println!("Saved ZIP: {}", path.display());
+        }
         path
     } else {
         temp_file = tempfile::Builder::new()
@@ -633,10 +850,36 @@ pub async fn install_remote(
     let plan = plan::plan_install(&extracted, &addons_dir, &installed_addons)?;
 
     if !yes {
+        if json_output {
+            return print_json_value(json!({
+                "addon_id": addon_id,
+                "remote": details,
+                "addons_dir": path_string(&addons_dir),
+                "download_path": path_string(&zip_path),
+                "dry_run": true,
+                "applied": false,
+                "plan": install_plan_json(&plan),
+                "result": Value::Null,
+            }));
+        }
         print_install_plan(&plan, true);
         println!();
         println!("No changes made. Re-run with --yes to install.");
         return Ok(());
+    }
+
+    if json_output {
+        let result = apply::apply_install_plan(&plan, backup_dir)?;
+        return print_json_value(json!({
+            "addon_id": addon_id,
+            "remote": details,
+            "addons_dir": path_string(&addons_dir),
+            "download_path": path_string(&zip_path),
+            "dry_run": false,
+            "applied": install_result_applied(&result),
+            "plan": install_plan_json(&plan),
+            "result": install_result_json(&result),
+        }));
     }
 
     print_install_plan(&plan, false);
@@ -655,6 +898,7 @@ pub async fn update_one(
     keep_download: bool,
     download_dir: Option<&Path>,
     force: bool,
+    json_output: bool,
 ) -> Result<()> {
     let addons_dir = match path {
         Some(path) => path.to_path_buf(),
@@ -668,9 +912,22 @@ pub async fn update_one(
     let selected = update::resolve_update_request(&matches, request)?;
     let decision = update::update_decision(selected, force);
 
-    print_update_selection(selected, &decision);
+    if !json_output {
+        print_update_selection(selected, &decision);
+    }
 
     if !decision.should_install() {
+        if json_output {
+            return print_json_value(json!({
+                "request": request,
+                "addons_dir": path_string(&addons_dir),
+                "dry_run": true,
+                "applied": false,
+                "selection": update_selection_json(selected, &decision),
+                "plan": Value::Null,
+                "result": Value::Null,
+            }));
+        }
         match decision {
             update::UpdateDecision::SkippedCurrent
             | update::UpdateDecision::SkippedLocalNewer
@@ -695,7 +952,9 @@ pub async fn update_one(
         .and_then(|remote| remote.uid.as_deref())
         .ok_or_else(|| anyhow!("selected addon has no clean remote UID"))?;
     let details = client.eso_file_details(remote_uid).await?;
-    print_remote_install_metadata(&details);
+    if !json_output {
+        print_remote_install_metadata(&details);
+    }
 
     let plan = prepare_remote_install_plan(
         client,
@@ -705,15 +964,42 @@ pub async fn update_one(
         &local_addons,
         keep_download,
         download_dir,
+        json_output,
     )
     .await?;
     validate_single_update_plan(&plan, &selected.local.folder_name)?;
 
     if !yes {
+        if json_output {
+            return print_json_value(json!({
+                "request": request,
+                "addons_dir": path_string(&addons_dir),
+                "dry_run": true,
+                "applied": false,
+                "selection": update_selection_json(selected, &decision),
+                "remote": details,
+                "plan": install_plan_json(&plan),
+                "result": Value::Null,
+            }));
+        }
         print_install_plan(&plan, true);
         println!();
         println!("No changes made. Re-run with --yes to update.");
         return Ok(());
+    }
+
+    if json_output {
+        let result = apply::apply_install_plan(&plan, backup_dir)?;
+        return print_json_value(json!({
+            "request": request,
+            "addons_dir": path_string(&addons_dir),
+            "dry_run": false,
+            "applied": install_result_applied(&result),
+            "selection": update_selection_json(selected, &decision),
+            "remote": details,
+            "plan": install_plan_json(&plan),
+            "result": install_result_json(&result),
+        }));
     }
 
     print_install_plan(&plan, false);
@@ -731,6 +1017,7 @@ async fn prepare_remote_install_plan(
     installed_addons: &[LocalAddon],
     keep_download: bool,
     download_dir: Option<&Path>,
+    quiet: bool,
 ) -> Result<InstallPlan> {
     let download_url = remote::download_url(details)?;
     let file_name = remote::download_file_name(details, addon_id);
@@ -753,7 +1040,9 @@ async fn prepare_remote_install_plan(
         fs::write(&path, &bytes)
             .await
             .with_context(|| format!("failed to write {}", path.display()))?;
-        println!("Saved ZIP: {}", path.display());
+        if !quiet {
+            println!("Saved ZIP: {}", path.display());
+        }
         path
     } else {
         temp_file = tempfile::Builder::new()
@@ -773,6 +1062,232 @@ async fn prepare_remote_install_plan(
         addons_dir,
         installed_addons,
     )?)
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn print_json_value(value: Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn path_string(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn addon_path_candidate_json(candidate: &local::AddonPathCandidate) -> Value {
+    json!({
+        "path": path_string(&candidate.path),
+        "exists": candidate.exists,
+        "contains_addons": candidate.contains_addons,
+    })
+}
+
+fn local_addon_json(addon: &LocalAddon) -> Value {
+    json!({
+        "folder_name": addon.folder_name,
+        "folder_path": path_string(&addon.folder_path),
+        "manifest_path": addon.manifest_path.as_ref().map(|path| path_string(path)),
+        "title": addon.title,
+        "addon_version": addon.addon_version,
+        "version": addon.version,
+        "display_version": addon.addon_version.as_deref().or(addon.version.as_deref()),
+        "api_versions": addon.api_versions,
+        "depends_on": addon.depends_on,
+        "optional_depends_on": addon.optional_depends_on,
+        "is_library": addon.is_library,
+        "author": addon.author,
+        "description": addon.description,
+        "valid_manifest": addon.valid_manifest,
+    })
+}
+
+fn remote_candidate_json(candidate: &match_remote::RemoteCandidate) -> Value {
+    json!({
+        "uid": candidate.uid,
+        "name": candidate.name,
+        "version": candidate.version,
+        "updated": candidate.updated,
+        "updated_display": candidate.updated.map(format_mmoui_date),
+        "tier": candidate.tier,
+        "score": candidate.score,
+        "reason": candidate.reason,
+    })
+}
+
+fn match_result_json(result: &MatchResult, verbose: bool) -> Value {
+    json!({
+        "local": local_addon_json(&result.local),
+        "status": result.status.as_str(),
+        "remote": result.remote.as_ref().map(remote_candidate_json),
+        "candidates": result.candidates.iter().map(remote_candidate_json).collect::<Vec<_>>(),
+        "debug_candidates": if verbose {
+            result.debug_candidates.iter().map(remote_candidate_json).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+fn planned_action_json(action: &PlannedAddonAction) -> Value {
+    json!({
+        "local_folder": action.local_folder,
+        "remote_name": action.remote_name,
+        "remote_uid": action.remote_uid,
+        "local_version": action.local_version,
+        "remote_version": action.remote_version,
+        "action": action.kind.as_str(),
+        "details": action.details.as_ref().map(|details| {
+            json!({
+                "file_name": details.file_name,
+                "md5": details.md5,
+                "download_url": details.download_url,
+            })
+        }),
+    })
+}
+
+fn update_plan_json(plan: &UpdatePlan) -> Value {
+    let summary = plan.summary();
+    json!({
+        "actions": plan.actions.iter().map(planned_action_json).collect::<Vec<_>>(),
+        "summary": {
+            "would_update": summary.would_update,
+            "current_skipped": summary.current_skipped,
+            "local_newer": summary.local_newer,
+            "unknown": summary.unknown,
+            "no_match": summary.no_match,
+            "ambiguous": summary.ambiguous,
+            "libraries": summary.libraries,
+        }
+    })
+}
+
+fn update_all_plan_json(plan: &update_all_core::UpdateAllPlan) -> Value {
+    let display_actions = plan
+        .display_plan
+        .actions
+        .iter()
+        .map(|action| {
+            let mut value = planned_action_json(action);
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "update_all_action".to_owned(),
+                    Value::String(update_all_action_label(action, &plan.targets).to_owned()),
+                );
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "actions": display_actions,
+        "targets": plan.targets.iter().map(planned_action_json).collect::<Vec<_>>(),
+        "summary": update_all_summary_json(plan),
+    })
+}
+
+fn update_all_summary_json(plan: &update_all_core::UpdateAllPlan) -> Value {
+    let mut skipped_current = 0;
+    let mut skipped_local_newer = 0;
+    let mut skipped_unknown = 0;
+    let mut skipped_no_match = 0;
+    let mut skipped_ambiguous = 0;
+    let mut skipped_libraries = 0;
+
+    for action in &plan.display_plan.actions {
+        if update_all_targets_contain(&plan.targets, action) {
+            continue;
+        }
+
+        match action.kind {
+            PlannedActionKind::WouldUpdate => {}
+            PlannedActionKind::WouldSkipCurrent => skipped_current += 1,
+            PlannedActionKind::WouldSkipLocalNewer => skipped_local_newer += 1,
+            PlannedActionKind::WouldSkipUnknownVersion => skipped_unknown += 1,
+            PlannedActionKind::WouldSkipNoMatch => skipped_no_match += 1,
+            PlannedActionKind::WouldSkipAmbiguous => skipped_ambiguous += 1,
+            PlannedActionKind::WouldSkipLibrary => skipped_libraries += 1,
+        }
+    }
+
+    json!({
+        "planned_updates": plan.targets.len(),
+        "skipped_current": skipped_current,
+        "skipped_local_newer": skipped_local_newer,
+        "skipped_unknown": skipped_unknown,
+        "skipped_no_match": skipped_no_match,
+        "skipped_ambiguous": skipped_ambiguous,
+        "skipped_libraries": skipped_libraries,
+    })
+}
+
+fn install_plan_json(plan: &InstallPlan) -> Value {
+    json!({
+        "addons_dir": path_string(&plan.addons_dir),
+        "temp_dir": path_string(&plan.temp_dir),
+        "items": plan.items.iter().map(|item| {
+            json!({
+                "source_folder": item.source_folder,
+                "title": item.title,
+                "version": item.version,
+                "target_folder": item.target_folder.as_ref().map(|path| path_string(path)),
+                "action": item.action.as_str(),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn install_result_json(result: &InstallResult) -> Value {
+    json!({
+        "backup_dir": result.backup_dir.as_ref().map(|path| path_string(path)),
+        "installed_new": result.installed_new,
+        "replaced": result.replaced,
+        "skipped": result.skipped,
+        "items": result.items.iter().map(|item| {
+            json!({
+                "source_folder": item.source_folder,
+                "target_folder": item.target_folder.as_ref().map(|path| path_string(path)),
+                "backup_folder": item.backup_folder.as_ref().map(|path| path_string(path)),
+                "action": item.action.as_str(),
+                "message": item.message,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn install_result_applied(result: &InstallResult) -> bool {
+    result.installed_new > 0 || result.replaced > 0
+}
+
+fn update_selection_json(result: &MatchResult, decision: &update::UpdateDecision) -> Value {
+    json!({
+        "match": match_result_json(result, true),
+        "decision": decision.as_str(),
+        "should_install": decision.should_install(),
+    })
+}
+
+fn zip_inspection_json(inspection: &ZipInspection) -> Value {
+    json!({
+        "zip_path": path_string(&inspection.zip_path),
+        "total_entries": inspection.total_entries,
+        "total_uncompressed_size": inspection.total_uncompressed_size,
+        "top_level_items": inspection.top_level_items,
+        "likely_addon_folders": inspection.likely_addon_folders.iter().map(|folder| {
+            json!({
+                "folder_name": folder.folder_name,
+                "has_manifest": folder.has_manifest,
+                "manifest_path": folder.manifest_path,
+                "title": folder.title,
+                "addon_version": folder.addon_version,
+                "version": folder.version,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 fn print_feeds(feeds: Option<&ApiFeeds>) -> Result<()> {
@@ -1473,4 +1988,121 @@ fn format_mmoui_date(timestamp: i64) -> String {
     DateTime::<Utc>::from_timestamp(seconds, 0)
         .map(|date| date.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| seconds.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::Value;
+
+    use crate::install::apply::{InstallActionPerformed, InstallResult, InstalledItem};
+    use crate::install::plan::{InstallPlan, InstallPlanAction, InstallPlanItem};
+    use crate::local::match_remote::{MatchResult, MatchStatus, RemoteCandidate};
+    use crate::local::LocalAddon;
+
+    use super::{install_plan_json, install_result_json, match_result_json};
+
+    fn local(folder_name: &str) -> LocalAddon {
+        LocalAddon {
+            folder_name: folder_name.to_owned(),
+            folder_path: PathBuf::from(folder_name),
+            manifest_path: Some(PathBuf::from(format!("{folder_name}/{folder_name}.txt"))),
+            title: Some(folder_name.to_owned()),
+            addon_version: Some("1".to_owned()),
+            version: None,
+            api_versions: Vec::new(),
+            depends_on: Vec::new(),
+            optional_depends_on: Vec::new(),
+            is_library: None,
+            author: None,
+            description: None,
+            valid_manifest: true,
+        }
+    }
+
+    #[test]
+    fn check_json_shape_serializes_status_and_candidates() {
+        let result = MatchResult {
+            local: local("Addon"),
+            status: MatchStatus::PossibleUpdate,
+            remote: Some(RemoteCandidate {
+                uid: Some("1".to_owned()),
+                name: Some("Addon".to_owned()),
+                version: Some("2".to_owned()),
+                updated: None,
+                tier: 1,
+                score: 100,
+                reason: "test".to_owned(),
+            }),
+            candidates: Vec::new(),
+            debug_candidates: vec![RemoteCandidate {
+                uid: Some("1".to_owned()),
+                name: Some("Addon".to_owned()),
+                version: Some("2".to_owned()),
+                updated: None,
+                tier: 1,
+                score: 100,
+                reason: "test".to_owned(),
+            }],
+        };
+
+        let value = match_result_json(&result, true);
+        let reparsed: Value =
+            serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
+
+        assert_eq!(reparsed["status"], "possible-update");
+        assert_eq!(reparsed["remote"]["uid"], "1");
+        assert_eq!(reparsed["debug_candidates"][0]["reason"], "test");
+    }
+
+    #[test]
+    fn dry_run_install_json_can_report_applied_false() {
+        let plan = InstallPlan {
+            addons_dir: PathBuf::from("/tmp/AddOns"),
+            temp_dir: PathBuf::from("/tmp/extracted"),
+            items: vec![InstallPlanItem {
+                source_folder: Some("Addon".to_owned()),
+                title: Some("Addon".to_owned()),
+                version: Some("1".to_owned()),
+                target_folder: Some(PathBuf::from("/tmp/AddOns/Addon")),
+                action: InstallPlanAction::WouldReplaceExisting,
+            }],
+        };
+        let value = serde_json::json!({
+            "dry_run": true,
+            "applied": false,
+            "plan": install_plan_json(&plan),
+        });
+
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["applied"], false);
+        assert_eq!(
+            value["plan"]["items"][0]["action"],
+            "would-replace-existing"
+        );
+    }
+
+    #[test]
+    fn applied_install_json_includes_backup_paths() {
+        let result = InstallResult {
+            items: vec![InstalledItem {
+                source_folder: Some("Addon".to_owned()),
+                target_folder: Some(PathBuf::from("/tmp/AddOns/Addon")),
+                backup_folder: Some(PathBuf::from("/tmp/backup/Addon")),
+                action: InstallActionPerformed::ReplacedExisting,
+                message: None,
+            }],
+            backup_dir: Some(PathBuf::from("/tmp/backup")),
+            installed_new: 0,
+            replaced: 1,
+            skipped: 0,
+        };
+
+        let value = install_result_json(&result);
+
+        assert_eq!(value["replaced"], 1);
+        assert_eq!(value["backup_dir"], "/tmp/backup");
+        assert_eq!(value["items"][0]["backup_folder"], "/tmp/backup/Addon");
+    }
 }
