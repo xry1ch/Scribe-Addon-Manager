@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use eso_addon_manager::api::models::{AddonDetails, AddonSummary};
 use eso_addon_manager::api::ApiClient;
+use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanItem};
+use eso_addon_manager::install::remote;
+use eso_addon_manager::install::zip_safety;
 use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
 use eso_addon_manager::local::update_plan::{self, PlannedAddonAction};
 use eso_addon_manager::local::{self, AddonPathCandidate, LocalAddon};
@@ -136,6 +139,31 @@ struct UpdatePlanSummaryDto {
     libraries: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct PlanRemoteInstallResponse {
+    dry_run: bool,
+    applied: bool,
+    remote: AddonDetailsDto,
+    addons_dir: String,
+    plan: InstallPlanDto,
+}
+
+#[derive(Debug, Serialize)]
+struct InstallPlanDto {
+    addons_dir: String,
+    temp_dir: String,
+    items: Vec<InstallPlanItemDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstallPlanItemDto {
+    source_folder: Option<String>,
+    title: Option<String>,
+    version: Option<String>,
+    target_folder: Option<String>,
+    action: String,
+}
+
 #[tauri::command]
 async fn get_installed_addons(path: Option<String>) -> Result<InstalledAddonsResponse, String> {
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
@@ -233,6 +261,45 @@ async fn plan_updates(
     })
 }
 
+#[tauri::command]
+async fn plan_remote_install(
+    addon_id: String,
+    path: Option<String>,
+) -> Result<PlanRemoteInstallResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let installed_addons =
+        scan_installed_addons_for_install(&addons_dir).map_err(to_string_error)?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let details = client
+        .eso_file_details(&addon_id)
+        .await
+        .map_err(to_string_error)?;
+    let download_url = remote::download_url(&details).map_err(to_string_error)?;
+    let bytes = client
+        .download_bytes(download_url)
+        .await
+        .map_err(to_string_error)?;
+    remote::verify_md5(&bytes, details.md5.as_deref()).map_err(to_string_error)?;
+
+    let temp_file = tempfile::Builder::new()
+        .prefix("eso-addon-manager-ui-plan-")
+        .suffix(".zip")
+        .tempfile()
+        .map_err(to_string_error)?;
+    std::fs::write(temp_file.path(), &bytes).map_err(to_string_error)?;
+    let extracted = zip_safety::extract_zip_to_temp(temp_file.path()).map_err(to_string_error)?;
+    let install_plan =
+        plan::plan_install(&extracted, &addons_dir, &installed_addons).map_err(to_string_error)?;
+
+    Ok(PlanRemoteInstallResponse {
+        dry_run: true,
+        applied: false,
+        remote: addon_details_dto(&details),
+        addons_dir: path_string(&addons_dir),
+        plan: install_plan_dto(&install_plan),
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -240,7 +307,8 @@ fn main() {
             search_remote_addons,
             get_remote_addon_details,
             check_addons,
-            plan_updates
+            plan_updates,
+            plan_remote_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running Scribe Addon Manager");
@@ -351,6 +419,34 @@ fn planned_action_dto(action: &PlannedAddonAction) -> PlannedActionDto {
         remote_version: action.remote_version.clone(),
         action: action.kind.as_str().to_owned(),
     }
+}
+
+fn install_plan_dto(plan: &InstallPlan) -> InstallPlanDto {
+    InstallPlanDto {
+        addons_dir: path_string(&plan.addons_dir),
+        temp_dir: path_string(&plan.temp_dir),
+        items: plan.items.iter().map(install_plan_item_dto).collect(),
+    }
+}
+
+fn install_plan_item_dto(item: &InstallPlanItem) -> InstallPlanItemDto {
+    InstallPlanItemDto {
+        source_folder: item.source_folder.clone(),
+        title: item.title.clone(),
+        version: item.version.clone(),
+        target_folder: item.target_folder.as_ref().map(|path| path_string(path)),
+        action: item.action.as_str().to_owned(),
+    }
+}
+
+fn scan_installed_addons_for_install(
+    addons_dir: &std::path::Path,
+) -> anyhow::Result<Vec<LocalAddon>> {
+    if !addons_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    Ok(local::scan_addons_dir(addons_dir)?)
 }
 
 fn path_string(path: &std::path::Path) -> String {

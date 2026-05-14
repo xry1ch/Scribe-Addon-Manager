@@ -13,3 +13,4 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 eso-addon-manager = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+tempfile = "3"

@@ -254,6 +254,10 @@ th {
   margin-bottom: 12px;
 }
 
+.plan-panel {
+  margin-bottom: 16px;
+}
+
 .text-block h3 {
   margin: 0 0 8px;
   font-size: 16px;

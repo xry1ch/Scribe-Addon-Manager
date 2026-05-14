@@ -5,6 +5,7 @@ import type {
   AddonSummary,
   CheckAddonsResponse,
   InstalledAddonsResponse,
+  PlanRemoteInstallResponse,
   PlanUpdatesResponse,
   SearchResponse,
 } from "./types";
@@ -24,6 +25,7 @@ interface AppState {
   updates: CheckAddonsResponse | null;
   updatePlan: PlanUpdatesResponse | null;
   includeUnknown: boolean;
+  installPlan: PlanRemoteInstallResponse | null;
 }
 
 const state: AppState = {
@@ -39,6 +41,7 @@ const state: AppState = {
   updates: null,
   updatePlan: null,
   includeUnknown: false,
+  installPlan: null,
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -202,7 +205,12 @@ function renderDetails() {
         <h2>${escapeHtml(details.name ?? "Addon Details")}</h2>
         <p>${escapeHtml(details.uid ?? "-")}</p>
       </div>
+      <button class="primary" id="plan-install">Plan Install</button>
     </header>
+    <div class="path-row">
+      <label for="details-path-input">AddOns path</label>
+      <input id="details-path-input" value="${escapeAttr(state.path)}" placeholder="Auto-detect" />
+    </div>
     <section class="details-grid">
       ${detailItem("UID", details.uid)}
       ${detailItem("Author", details.author_name)}
@@ -213,8 +221,56 @@ function renderDetails() {
       ${detailItem("Info URL", details.file_info_url)}
       ${detailItem("Download URL", details.download_url)}
     </section>
+    ${renderInstallPlan()}
     ${textBlock("Description", details.description)}
     ${textBlock("Changelog", details.changelog)}
+  `;
+}
+
+function renderInstallPlan() {
+  const plan = state.installPlan;
+  if (!plan) return "";
+
+  return `
+    <section class="plan-panel">
+      <div class="notice">Dry run only. This preview downloaded and validated the ZIP, but did not install, update, delete, back up, or extract anything into the real AddOns directory.</div>
+      <section class="details-grid">
+        ${detailItem("Remote name", plan.remote.name)}
+        ${detailItem("UID", plan.remote.uid)}
+        ${detailItem("Version", plan.remote.version)}
+        ${detailItem("Filename", plan.remote.file_name)}
+        ${detailItem("MD5", plan.remote.md5)}
+        ${detailItem("Target AddOns directory", plan.addons_dir)}
+      </section>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Source folder</th>
+              <th>Title</th>
+              <th>Version</th>
+              <th>Target folder</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${plan.plan.items
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${escapeHtml(item.source_folder ?? "-")}</td>
+                    <td>${escapeHtml(item.title ?? "-")}</td>
+                    <td>${escapeHtml(item.version ?? "-")}</td>
+                    <td>${escapeHtml(item.target_folder ?? "-")}</td>
+                    <td><span class="pill">${escapeHtml(item.action)}</span></td>
+                  </tr>
+                `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -289,6 +345,10 @@ function bindTabEvents() {
     state.path = (event.currentTarget as HTMLInputElement).value;
   });
   document.querySelector<HTMLButtonElement>("#run-search")?.addEventListener("click", runSearch);
+  document.querySelector<HTMLButtonElement>("#plan-install")?.addEventListener("click", planInstall);
+  document.querySelector<HTMLInputElement>("#details-path-input")?.addEventListener("input", (event) => {
+    state.path = (event.currentTarget as HTMLInputElement).value;
+  });
   document.querySelector<HTMLInputElement>("#search-query")?.addEventListener("input", (event) => {
     state.searchQuery = (event.currentTarget as HTMLInputElement).value;
   });
@@ -345,6 +405,20 @@ function loadDetails(addonId: string) {
     state.selectedDetails = await invoke<AddonDetails>("get_remote_addon_details", {
       addonId,
     });
+    state.installPlan = null;
+  });
+}
+
+function planInstall() {
+  const addonId = state.selectedDetails?.uid;
+  if (!addonId) return;
+
+  return withLoading(async () => {
+    state.installPlan = await invoke<PlanRemoteInstallResponse>("plan_remote_install", {
+      addonId,
+      path: state.path || null,
+    });
+    state.path = state.installPlan.addons_dir;
   });
 }
 

@@ -83,3 +83,23 @@ export interface PlanUpdatesResponse {
     libraries: number;
   };
 }
+
+export interface InstallPlanItem {
+  source_folder: string | null;
+  title: string | null;
+  version: string | null;
+  target_folder: string | null;
+  action: string;
+}
+
+export interface PlanRemoteInstallResponse {
+  dry_run: boolean;
+  applied: boolean;
+  remote: AddonDetails;
+  addons_dir: string;
+  plan: {
+    addons_dir: string;
+    temp_dir: string;
+    items: InstallPlanItem[];
+  };
+}
