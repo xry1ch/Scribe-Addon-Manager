@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -15,11 +16,13 @@ use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
 use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
 use eso_addon_manager::local::update_plan::{self, PlannedAddonAction};
+use eso_addon_manager::local::version::{compare_versions, VersionComparison};
 use eso_addon_manager::local::{self, AddonPathCandidate, LocalAddon};
 use serde::Deserialize;
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 #[derive(Debug, Serialize)]
@@ -72,6 +75,10 @@ struct AddonSummaryDto {
     file_info_url: Option<String>,
     summary: Option<String>,
     directories: Vec<String>,
+    category_id: Option<String>,
+    category_name: Option<String>,
+    downloads: Option<i64>,
+    monthly_downloads: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +95,10 @@ struct AddonDetailsDto {
     file_info_url: Option<String>,
     description: Option<String>,
     changelog: Option<String>,
+    category_id: Option<String>,
+    category_name: Option<String>,
+    downloads: Option<i64>,
+    monthly_downloads: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +112,9 @@ struct CheckAddonsResponse {
 struct MatchResultDto {
     local: LocalAddonDto,
     status: String,
+    update_confidence: String,
+    update_reason: String,
+    managed: bool,
     remote: Option<RemoteCandidateDto>,
     candidates: Vec<RemoteCandidateDto>,
     debug_candidates: Vec<RemoteCandidateDto>,
@@ -110,9 +124,17 @@ struct MatchResultDto {
 struct RemoteCandidateDto {
     uid: Option<String>,
     name: Option<String>,
+    author_name: Option<String>,
     version: Option<String>,
     updated: Option<i64>,
     updated_display: Option<String>,
+    file_info_url: Option<String>,
+    summary: Option<String>,
+    directories: Vec<String>,
+    category_id: Option<String>,
+    category_name: Option<String>,
+    downloads: Option<i64>,
+    monthly_downloads: Option<i64>,
     tier: u8,
     score: usize,
     reason: String,
@@ -136,6 +158,8 @@ struct PlannedActionDto {
     local_version: Option<String>,
     remote_version: Option<String>,
     action: String,
+    update_confidence: Option<String>,
+    update_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -213,6 +237,29 @@ struct InstalledItemDto {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct InstalledMetadata {
+    addons: BTreeMap<String, InstalledAddonMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstalledAddonMetadata {
+    remote_uid: Option<String>,
+    remote_version: Option<String>,
+    remote_date: Option<i64>,
+    downloaded_filename: Option<String>,
+    md5: Option<String>,
+    installed_timestamp: String,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct UpdateConfidence {
+    confidence: &'static str,
+    reason: &'static str,
+    managed: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct InstallPlanDto {
     addons_dir: String,
@@ -264,6 +311,8 @@ struct UpdateAllActionDto {
     local_version: Option<String>,
     remote_version: Option<String>,
     action: String,
+    update_confidence: Option<String>,
+    update_reason: Option<String>,
     update_all_action: String,
 }
 
@@ -402,11 +451,15 @@ async fn check_addons(path: Option<String>) -> Result<CheckAddonsResponse, Strin
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
     let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
+    let metadata = load_installed_metadata(&addons_dir);
 
     Ok(CheckAddonsResponse {
         addons_dir: path_string(&addons_dir),
         remote_addons_loaded: remote_addons.len(),
-        matches: matches.iter().map(match_result_dto).collect(),
+        matches: matches
+            .iter()
+            .map(|result| match_result_dto(result, &metadata))
+            .collect(),
     })
 }
 
@@ -424,13 +477,21 @@ async fn plan_updates(
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
     let plan = update_plan::build_update_plan(&matches, include_unknown);
     let summary = plan.summary();
+    let metadata = load_installed_metadata(&addons_dir);
 
     Ok(PlanUpdatesResponse {
         addons_dir: path_string(&addons_dir),
         remote_addons_loaded: remote_addons.len(),
         include_unknown,
-        matches: matches.iter().map(match_result_dto).collect(),
-        actions: plan.actions.iter().map(planned_action_dto).collect(),
+        matches: matches
+            .iter()
+            .map(|result| match_result_dto(result, &metadata))
+            .collect(),
+        actions: plan
+            .actions
+            .iter()
+            .map(|action| planned_action_dto(action, &metadata))
+            .collect(),
         summary: UpdatePlanSummaryDto {
             would_update: summary.would_update,
             current_skipped: summary.current_skipped,
@@ -450,8 +511,9 @@ async fn plan_update_all(
     limit: Option<usize>,
 ) -> Result<PlanUpdateAllResponse, String> {
     let include_unknown = include_unknown.unwrap_or(false);
-    let (addons_dir, remote_addons_loaded, plan) =
+    let (addons_dir, remote_addons_loaded, mut plan) =
         build_update_all_plan_for_ui(path.as_deref(), include_unknown, limit).await?;
+    apply_reliable_update_filter(&addons_dir, &mut plan);
 
     Ok(plan_update_all_response(
         &addons_dir,
@@ -474,8 +536,9 @@ async fn apply_update_all(
     let include_unknown = include_unknown.unwrap_or(false);
     let backup_dir = optional_path(backup_dir);
     let download_dir = optional_path(download_dir);
-    let (addons_dir, remote_addons_loaded, plan) =
+    let (addons_dir, remote_addons_loaded, mut plan) =
         build_update_all_plan_for_ui(path.as_deref(), include_unknown, limit).await?;
+    apply_reliable_update_filter(&addons_dir, &mut plan);
     let client = ApiClient::new().map_err(to_string_error)?;
     let mut results = Vec::new();
 
@@ -500,9 +563,17 @@ async fn apply_update_all(
 
         let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
             .map_err(|error| format!("failed to update {}: {}", target.local_folder, error))?;
+        record_installed_metadata(
+            &addons_dir,
+            &prepared.details,
+            remote_uid,
+            &result,
+            "update-all",
+        )
+        .map_err(to_string_error)?;
 
         results.push(UpdateAllResultDto {
-            target: planned_action_dto(target),
+            target: planned_action_dto(target, &load_installed_metadata(&addons_dir)),
             remote_details: addon_details_dto(&prepared.details),
             plan: install_plan_dto(&prepared.plan),
             installed_new: result.installed_new,
@@ -567,6 +638,14 @@ async fn install_remote_addon(
 
     let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
         .map_err(to_string_error)?;
+    record_installed_metadata(
+        &addons_dir,
+        &prepared.details,
+        &addon_id,
+        &result,
+        "remote-install",
+    )
+    .map_err(to_string_error)?;
     Ok(install_remote_addon_response(
         &prepared.details,
         &addons_dir,
@@ -690,6 +769,14 @@ async fn apply_single_update(
 
     let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
         .map_err(to_string_error)?;
+    record_installed_metadata(
+        &addons_dir,
+        &prepared.details,
+        remote_uid,
+        &result,
+        "update",
+    )
+    .map_err(to_string_error)?;
     Ok(single_update_apply_response(
         &target,
         selected,
@@ -841,6 +928,10 @@ fn addon_summary_dto(addon: &AddonSummary) -> AddonSummaryDto {
         file_info_url: addon.file_info_url.clone(),
         summary: addon.summary.clone(),
         directories: addon.directories.clone(),
+        category_id: addon.category_id(),
+        category_name: addon.category_name(),
+        downloads: addon.downloads(),
+        monthly_downloads: addon.monthly_downloads(),
     }
 }
 
@@ -858,13 +949,21 @@ fn addon_details_dto(details: &AddonDetails) -> AddonDetailsDto {
         file_info_url: details.file_info_url.clone(),
         description: details.description.clone(),
         changelog: details.changelog.clone(),
+        category_id: details.category_id(),
+        category_name: details.category_name(),
+        downloads: details.downloads(),
+        monthly_downloads: details.monthly_downloads(),
     }
 }
 
-fn match_result_dto(result: &MatchResult) -> MatchResultDto {
+fn match_result_dto(result: &MatchResult, metadata: &InstalledMetadata) -> MatchResultDto {
+    let confidence = update_confidence_for_match(result, metadata);
     MatchResultDto {
         local: local_addon_dto(&result.local),
         status: result.status.as_str().to_owned(),
+        update_confidence: confidence.confidence.to_owned(),
+        update_reason: confidence.reason.to_owned(),
+        managed: confidence.managed,
         remote: result.remote.as_ref().map(remote_candidate_dto),
         candidates: result.candidates.iter().map(remote_candidate_dto).collect(),
         debug_candidates: result
@@ -879,16 +978,25 @@ fn remote_candidate_dto(candidate: &RemoteCandidate) -> RemoteCandidateDto {
     RemoteCandidateDto {
         uid: candidate.uid.clone(),
         name: candidate.name.clone(),
+        author_name: candidate.author_name.clone(),
         version: candidate.version.clone(),
         updated: candidate.updated,
         updated_display: candidate.updated.map(format_mmoui_date),
+        file_info_url: candidate.file_info_url.clone(),
+        summary: candidate.summary.clone(),
+        directories: candidate.directories.clone(),
+        category_id: candidate.category_id.clone(),
+        category_name: candidate.category_name.clone(),
+        downloads: candidate.downloads,
+        monthly_downloads: candidate.monthly_downloads,
         tier: candidate.tier,
         score: candidate.score,
         reason: candidate.reason.clone(),
     }
 }
 
-fn planned_action_dto(action: &PlannedAddonAction) -> PlannedActionDto {
+fn planned_action_dto(action: &PlannedAddonAction, metadata: &InstalledMetadata) -> PlannedActionDto {
+    let confidence = update_confidence_for_action(action, metadata);
     PlannedActionDto {
         local_folder: action.local_folder.clone(),
         remote_name: action.remote_name.clone(),
@@ -896,13 +1004,17 @@ fn planned_action_dto(action: &PlannedAddonAction) -> PlannedActionDto {
         local_version: action.local_version.clone(),
         remote_version: action.remote_version.clone(),
         action: action.kind.as_str().to_owned(),
+        update_confidence: confidence.as_ref().map(|value| value.confidence.to_owned()),
+        update_reason: confidence.as_ref().map(|value| value.reason.to_owned()),
     }
 }
 
 fn update_all_action_dto(
     action: &PlannedAddonAction,
     targets: &[PlannedAddonAction],
+    metadata: &InstalledMetadata,
 ) -> UpdateAllActionDto {
+    let confidence = update_confidence_for_action(action, metadata);
     UpdateAllActionDto {
         local_folder: action.local_folder.clone(),
         remote_name: action.remote_name.clone(),
@@ -910,7 +1022,139 @@ fn update_all_action_dto(
         local_version: action.local_version.clone(),
         remote_version: action.remote_version.clone(),
         action: action.kind.as_str().to_owned(),
+        update_confidence: confidence.as_ref().map(|value| value.confidence.to_owned()),
+        update_reason: confidence.as_ref().map(|value| value.reason.to_owned()),
         update_all_action: update_all_action_label(action, targets).to_owned(),
+    }
+}
+
+fn update_confidence_for_match(
+    result: &MatchResult,
+    metadata: &InstalledMetadata,
+) -> UpdateConfidence {
+    let Some(remote) = result.remote.as_ref() else {
+        return match result.status {
+            match_remote::MatchStatus::Ambiguous => UpdateConfidence {
+                confidence: "unknown",
+                reason: "remote match is ambiguous",
+                managed: false,
+            },
+            _ => UpdateConfidence {
+                confidence: "unknown",
+                reason: "remote match missing",
+                managed: false,
+            },
+        };
+    };
+
+    let Some(managed) = metadata.addons.get(&result.local.folder_name) else {
+        return match result.status {
+            match_remote::MatchStatus::Matched => UpdateConfidence {
+                confidence: "current",
+                reason: "versions match",
+                managed: false,
+            },
+            match_remote::MatchStatus::LocalNewer => UpdateConfidence {
+                confidence: "local-newer",
+                reason: "local version source is manifest only",
+                managed: false,
+            },
+            match_remote::MatchStatus::PossibleUpdate => UpdateConfidence {
+                confidence: "possible-update",
+                reason: "manager install metadata missing",
+                managed: false,
+            },
+            _ => UpdateConfidence {
+                confidence: "unknown",
+                reason: "manager install metadata missing",
+                managed: false,
+            },
+        };
+    };
+
+    if managed.remote_uid != remote.uid {
+        return UpdateConfidence {
+            confidence: "unknown",
+            reason: "stored remote UID differs",
+            managed: true,
+        };
+    }
+
+    confidence_from_versions(
+        managed.remote_version.as_deref(),
+        remote.version.as_deref(),
+        true,
+    )
+}
+
+fn update_confidence_for_action(
+    action: &PlannedAddonAction,
+    metadata: &InstalledMetadata,
+) -> Option<UpdateConfidence> {
+    let managed = metadata.addons.get(&action.local_folder);
+
+    match managed {
+        Some(managed) if managed.remote_uid == action.remote_uid => Some(confidence_from_versions(
+            managed.remote_version.as_deref(),
+            action.remote_version.as_deref(),
+            true,
+        )),
+        Some(_) => Some(UpdateConfidence {
+            confidence: "unknown",
+            reason: "stored remote UID differs",
+            managed: true,
+        }),
+        None => match action.kind {
+            update_plan::PlannedActionKind::WouldUpdate => Some(UpdateConfidence {
+                confidence: "possible-update",
+                reason: "manager install metadata missing",
+                managed: false,
+            }),
+            update_plan::PlannedActionKind::WouldSkipCurrent => Some(UpdateConfidence {
+                confidence: "current",
+                reason: "versions match",
+                managed: false,
+            }),
+            update_plan::PlannedActionKind::WouldSkipLocalNewer => Some(UpdateConfidence {
+                confidence: "local-newer",
+                reason: "local version source is manifest only",
+                managed: false,
+            }),
+            _ => Some(UpdateConfidence {
+                confidence: "unknown",
+                reason: "manager install metadata missing",
+                managed: false,
+            }),
+        },
+    }
+}
+
+fn confidence_from_versions(
+    installed_remote_version: Option<&str>,
+    current_remote_version: Option<&str>,
+    managed: bool,
+) -> UpdateConfidence {
+    match compare_versions(installed_remote_version, current_remote_version) {
+        VersionComparison::RemoteNewer => UpdateConfidence {
+            confidence: "reliable-update",
+            reason: "remote version differs",
+            managed,
+        },
+        VersionComparison::Same => UpdateConfidence {
+            confidence: "current",
+            reason: "versions match",
+            managed,
+        },
+        VersionComparison::LocalNewer => UpdateConfidence {
+            confidence: "local-newer",
+            reason: "local version source is manager metadata",
+            managed,
+        },
+        VersionComparison::Unknown => UpdateConfidence {
+            confidence: "unknown",
+            reason: "remote version format differs",
+            managed,
+        },
     }
 }
 
@@ -974,6 +1218,7 @@ fn plan_update_all_response(
     limit: Option<usize>,
     plan: &update_all::UpdateAllPlan,
 ) -> PlanUpdateAllResponse {
+    let metadata = load_installed_metadata(addons_dir);
     PlanUpdateAllResponse {
         dry_run: true,
         applied: false,
@@ -985,9 +1230,13 @@ fn plan_update_all_response(
             .display_plan
             .actions
             .iter()
-            .map(|action| update_all_action_dto(action, &plan.targets))
+            .map(|action| update_all_action_dto(action, &plan.targets, &metadata))
             .collect(),
-        targets: plan.targets.iter().map(planned_action_dto).collect(),
+        targets: plan
+            .targets
+            .iter()
+            .map(|target| planned_action_dto(target, &metadata))
+            .collect(),
         summary: update_all_summary_dto(plan),
     }
 }
@@ -1000,6 +1249,7 @@ fn apply_update_all_response(
     plan: &update_all::UpdateAllPlan,
     results: Vec<UpdateAllResultDto>,
 ) -> ApplyUpdateAllResponse {
+    let metadata = load_installed_metadata(addons_dir);
     ApplyUpdateAllResponse {
         dry_run: false,
         applied: !results.is_empty(),
@@ -1011,9 +1261,13 @@ fn apply_update_all_response(
             .display_plan
             .actions
             .iter()
-            .map(|action| update_all_action_dto(action, &plan.targets))
+            .map(|action| update_all_action_dto(action, &plan.targets, &metadata))
             .collect(),
-        targets: plan.targets.iter().map(planned_action_dto).collect(),
+        targets: plan
+            .targets
+            .iter()
+            .map(|target| planned_action_dto(target, &metadata))
+            .collect(),
         summary: update_all_summary_dto(plan),
         results,
     }
@@ -1089,6 +1343,87 @@ async fn build_update_all_plan_for_ui(
 
     let plan = update_all::build_update_all_plan(&matches, include_unknown);
     Ok((addons_dir, remote_addons.len(), plan))
+}
+
+fn apply_reliable_update_filter(addons_dir: &std::path::Path, plan: &mut update_all::UpdateAllPlan) {
+    let metadata = load_installed_metadata(addons_dir);
+    plan.targets.retain(|target| {
+        update_confidence_for_action(target, &metadata)
+            .is_some_and(|confidence| confidence.confidence == "reliable-update")
+    });
+}
+
+fn metadata_path(addons_dir: &std::path::Path) -> PathBuf {
+    addons_dir
+        .parent()
+        .unwrap_or(addons_dir)
+        .join(".scribe-addon-manager")
+        .join("installed.json")
+}
+
+fn load_installed_metadata(addons_dir: &std::path::Path) -> InstalledMetadata {
+    let path = metadata_path(addons_dir);
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_installed_metadata(
+    addons_dir: &std::path::Path,
+    metadata: &InstalledMetadata,
+) -> anyhow::Result<()> {
+    let path = metadata_path(addons_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(metadata)?)?;
+    Ok(())
+}
+
+fn record_installed_metadata(
+    addons_dir: &std::path::Path,
+    details: &AddonDetails,
+    remote_uid: &str,
+    result: &InstallResult,
+    source: &str,
+) -> anyhow::Result<()> {
+    if !install_result_applied(result) {
+        return Ok(());
+    }
+
+    let mut metadata = load_installed_metadata(addons_dir);
+    let installed_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let downloaded_filename = Some(remote::download_file_name(details, remote_uid));
+
+    for item in &result.items {
+        if matches!(item.action, InstallActionPerformed::Skipped) {
+            continue;
+        }
+
+        let Some(folder_name) = item.target_folder.as_ref().and_then(|path| path.file_name()) else {
+            continue;
+        };
+
+        metadata.addons.insert(
+            folder_name.to_string_lossy().to_string(),
+            InstalledAddonMetadata {
+                remote_uid: details.uid.clone().or_else(|| Some(remote_uid.to_owned())),
+                remote_version: details.version.clone(),
+                remote_date: details.date,
+                downloaded_filename: downloaded_filename.clone(),
+                md5: details.md5.clone(),
+                installed_timestamp: installed_timestamp.clone(),
+                source: source.to_owned(),
+            },
+        );
+    }
+
+    save_installed_metadata(addons_dir, &metadata)
 }
 
 fn install_remote_addon_response(

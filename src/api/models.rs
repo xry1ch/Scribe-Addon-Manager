@@ -155,6 +155,58 @@ impl AddonSummary {
         .join(" ")
         .to_lowercase()
     }
+
+    pub fn category_id(&self) -> Option<String> {
+        extra_string(
+            &self._extra,
+            &[
+                "UICategoryID",
+                "UICategoryId",
+                "CategoryID",
+                "CategoryId",
+                "category_id",
+            ],
+        )
+    }
+
+    pub fn category_name(&self) -> Option<String> {
+        extra_string(
+            &self._extra,
+            &[
+                "UICategoryName",
+                "CategoryName",
+                "UICategory",
+                "Category",
+                "category_name",
+            ],
+        )
+    }
+
+    pub fn downloads(&self) -> Option<i64> {
+        extra_i64(
+            &self._extra,
+            &[
+                "UIDownloads",
+                "UIDownloadCount",
+                "UIDownloadTotal",
+                "Downloads",
+                "DownloadCount",
+                "TotalDownloads",
+            ],
+        )
+    }
+
+    pub fn monthly_downloads(&self) -> Option<i64> {
+        extra_i64(
+            &self._extra,
+            &[
+                "UIMonthlyDownloads",
+                "UIDownloadsMonthly",
+                "MonthlyDownloads",
+                "MonthlyDownloadCount",
+            ],
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -222,6 +274,83 @@ pub struct AddonDetails {
 
     #[serde(default, flatten)]
     pub _extra: BTreeMap<String, Value>,
+}
+
+impl AddonDetails {
+    pub fn category_id(&self) -> Option<String> {
+        extra_string(
+            &self._extra,
+            &[
+                "UICategoryID",
+                "UICategoryId",
+                "CategoryID",
+                "CategoryId",
+                "category_id",
+            ],
+        )
+    }
+
+    pub fn category_name(&self) -> Option<String> {
+        extra_string(
+            &self._extra,
+            &[
+                "UICategoryName",
+                "CategoryName",
+                "UICategory",
+                "Category",
+                "category_name",
+            ],
+        )
+    }
+
+    pub fn downloads(&self) -> Option<i64> {
+        extra_i64(
+            &self._extra,
+            &[
+                "UIDownloads",
+                "UIDownloadCount",
+                "UIDownloadTotal",
+                "Downloads",
+                "DownloadCount",
+                "TotalDownloads",
+            ],
+        )
+    }
+
+    pub fn monthly_downloads(&self) -> Option<i64> {
+        extra_i64(
+            &self._extra,
+            &[
+                "UIMonthlyDownloads",
+                "UIDownloadsMonthly",
+                "MonthlyDownloads",
+                "MonthlyDownloadCount",
+            ],
+        )
+    }
+}
+
+fn extra_string(extra: &BTreeMap<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        extra.get(*key).and_then(|value| match value {
+            Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn extra_i64(extra: &BTreeMap<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        extra.get(*key).and_then(|value| match value {
+            Value::Number(value) => value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok())),
+            Value::String(value) => value.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+    })
 }
 
 mod de {

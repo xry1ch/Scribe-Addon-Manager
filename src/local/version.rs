@@ -20,6 +20,18 @@ pub fn compare_versions(local: Option<&str>, remote: Option<&str>) -> VersionCom
         return ordering_to_comparison(local.cmp(&remote));
     }
 
+    if let (Some(local), Some(remote)) = (parse_integer(local), parse_dotted_numeric(remote)) {
+        if let Some(comparison) = compare_packed_integer_to_dotted(local, &remote) {
+            return comparison;
+        }
+    }
+
+    if let (Some(local), Some(remote)) = (parse_dotted_numeric(local), parse_integer(remote)) {
+        if let Some(comparison) = compare_dotted_to_packed_integer(&local, remote) {
+            return comparison;
+        }
+    }
+
     if let (Some(local), Some(remote)) = (parse_dotted_numeric(local), parse_dotted_numeric(remote))
     {
         return compare_numeric_segments(&local, &remote);
@@ -154,6 +166,58 @@ fn compare_numeric_segments(local: &[u64], remote: &[u64]) -> VersionComparison 
     VersionComparison::Same
 }
 
+fn compare_packed_integer_to_dotted(integer: u64, dotted: &[u64]) -> Option<VersionComparison> {
+    let packed = packed_dotted_versions(dotted)?;
+    if packed.iter().any(|candidate| *candidate == integer) {
+        return Some(VersionComparison::Same);
+    }
+
+    let integer_digits = digit_count(integer);
+    packed
+        .into_iter()
+        .find(|candidate| digit_count(*candidate) == integer_digits)
+        .map(|candidate| ordering_to_comparison(integer.cmp(&candidate)))
+}
+
+fn compare_dotted_to_packed_integer(dotted: &[u64], integer: u64) -> Option<VersionComparison> {
+    let packed = packed_dotted_versions(dotted)?;
+    if packed.iter().any(|candidate| *candidate == integer) {
+        return Some(VersionComparison::Same);
+    }
+
+    let integer_digits = digit_count(integer);
+    packed
+        .into_iter()
+        .find(|candidate| digit_count(*candidate) == integer_digits)
+        .map(|candidate| ordering_to_comparison(candidate.cmp(&integer)))
+}
+
+fn packed_dotted_versions(segments: &[u64]) -> Option<Vec<u64>> {
+    if segments.len() != 3 {
+        return None;
+    }
+
+    let [major, minor, patch] = [segments[0], segments[1], segments[2]];
+    Some(vec![
+        major
+            .checked_mul(10_000)?
+            .checked_add(minor.checked_mul(100)?)?
+            .checked_add(patch)?,
+        major
+            .checked_mul(100_000)?
+            .checked_add(minor.checked_mul(1_000)?)?
+            .checked_add(patch.checked_mul(10)?)?,
+        major
+            .checked_mul(1_000_000)?
+            .checked_add(minor.checked_mul(10_000)?)?
+            .checked_add(patch.checked_mul(100)?)?,
+    ])
+}
+
+fn digit_count(value: u64) -> usize {
+    value.to_string().len()
+}
+
 fn ordering_to_comparison(ordering: Ordering) -> VersionComparison {
     match ordering {
         Ordering::Less => VersionComparison::RemoteNewer,
@@ -267,6 +331,42 @@ mod tests {
         assert_eq!(
             compare_versions(Some("rev5"), Some("revision 6")),
             VersionComparison::RemoteNewer
+        );
+    }
+
+    #[test]
+    fn packed_addon_version_matches_dotted_remote_version() {
+        assert_eq!(
+            compare_versions(Some("10707"), Some("1.7.7")),
+            VersionComparison::Same
+        );
+        assert_eq!(
+            compare_versions(Some("204100"), Some("2.4.10")),
+            VersionComparison::Same
+        );
+        assert_eq!(
+            compare_versions(Some("304080"), Some("3.4.8")),
+            VersionComparison::Same
+        );
+    }
+
+    #[test]
+    fn packed_addon_version_compares_against_matching_width_dotted_form() {
+        assert_eq!(
+            compare_versions(Some("204090"), Some("2.4.10")),
+            VersionComparison::RemoteNewer
+        );
+        assert_eq!(
+            compare_versions(Some("204110"), Some("2.4.10")),
+            VersionComparison::LocalNewer
+        );
+    }
+
+    #[test]
+    fn dotted_local_version_matches_packed_remote_version() {
+        assert_eq!(
+            compare_versions(Some("1.7.7"), Some("10707")),
+            VersionComparison::Same
         );
     }
 }

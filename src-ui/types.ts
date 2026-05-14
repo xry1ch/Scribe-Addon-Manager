@@ -1,9 +1,12 @@
 export interface LocalAddon {
   folder_name: string;
+  folder_path: string;
   title: string | null;
+  author: string | null;
   display_version: string | null;
   api_versions: string[];
   depends_on: string[];
+  is_library: boolean | null;
   valid_manifest: boolean;
 }
 
@@ -18,6 +21,13 @@ export interface AddonSummary {
   author_name: string | null;
   version: string | null;
   updated_display: string | null;
+  file_info_url: string | null;
+  summary: string | null;
+  directories: string[];
+  category_id: string | null;
+  category_name: string | null;
+  downloads: number | null;
+  monthly_downloads: number | null;
 }
 
 export interface SearchResponse {
@@ -38,18 +48,33 @@ export interface AddonDetails {
   file_info_url: string | null;
   description: string | null;
   changelog: string | null;
+  category_id: string | null;
+  category_name: string | null;
+  downloads: number | null;
+  monthly_downloads: number | null;
 }
 
 export interface RemoteCandidate {
   uid: string | null;
   name: string | null;
+  author_name: string | null;
   version: string | null;
   updated_display: string | null;
+  file_info_url: string | null;
+  summary: string | null;
+  directories: string[];
+  category_id: string | null;
+  category_name: string | null;
+  downloads: number | null;
+  monthly_downloads: number | null;
 }
 
 export interface MatchResult {
   local: LocalAddon & { folder_name: string };
   status: string;
+  update_confidence: string;
+  update_reason: string;
+  managed: boolean;
   remote: RemoteCandidate | null;
 }
 
@@ -66,6 +91,8 @@ export interface PlannedAction {
   remote_uid: string | null;
   remote_version: string | null;
   action: string;
+  update_confidence?: string | null;
+  update_reason?: string | null;
 }
 
 export interface PlanUpdatesResponse {
