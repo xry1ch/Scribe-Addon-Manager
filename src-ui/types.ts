@@ -90,6 +90,7 @@ export interface PlannedAction {
   remote_name: string | null;
   remote_uid: string | null;
   remote_version: string | null;
+  remote_date?: number | null;
   action: string;
   update_confidence?: string | null;
   update_reason?: string | null;
@@ -255,6 +256,24 @@ export interface AppSettings {
   download_dir: string | null;
   keep_downloads_default: boolean;
   include_unknown_updates_default: boolean;
+}
+
+export interface AppStartupInfo {
+  settings: AppSettings;
+  settings_exists: boolean;
+  detected_addons_dir: string | null;
+}
+
+export interface ImportExistingAddonsResponse {
+  addons_dir: string;
+  detected_addons: number;
+  imported: number;
+  skipped_invalid_manifest: number;
+  skipped_libraries: number;
+  skipped_no_match: number;
+  skipped_ambiguous: number;
+  skipped_missing_remote_uid: number;
+  skipped_missing_remote_version: number;
 }
 
 export interface AppSettingsInput {

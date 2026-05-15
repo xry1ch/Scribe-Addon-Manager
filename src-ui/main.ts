@@ -1,13 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
-import iconSpriteUrl from "./assets/esoui/icons-45px.jpg";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import iconSpriteUrl from "./assets/esoui/icons-45px.png";
+import logoUrl from "./assets/LOGO.png";
 import "./styles.css";
 import type {
   AddonDetails,
   AddonSummary,
   AppSettings,
   AppSettingsInput,
+  AppStartupInfo,
   ApplyUpdateAllResponse,
   CheckAddonsResponse,
+  ImportExistingAddonsResponse,
   InstallRemoteAddonResponse,
   InstalledAddonsResponse,
   LocalAddon,
@@ -24,6 +28,7 @@ import type {
 type Tab = "installed" | "search" | "settings";
 type InstalledFilter = "all" | "update" | "unknown" | "current";
 type InstalledSort = "name" | "updated" | "downloads" | "status";
+type IconName = "check" | "folder" | "rotate" | "target";
 
 interface AppState {
   tab: Tab;
@@ -53,6 +58,11 @@ interface AppState {
   updateAllResult: ApplyUpdateAllResponse | null;
   settings: AppSettings | null;
   addonsPathExists: boolean | null;
+  needsInitialSetup: boolean;
+  detectedAddonsPath: string | null;
+  setupAddonsPath: string;
+  setupImportPath: string | null;
+  setupExistingAddonsCount: number;
 }
 
 interface InstalledViewModel {
@@ -94,6 +104,11 @@ const state: AppState = {
   updateAllResult: null,
   settings: null,
   addonsPathExists: null,
+  needsInitialSetup: false,
+  detectedAddonsPath: null,
+  setupAddonsPath: "",
+  setupImportPath: null,
+  setupExistingAddonsCount: 0,
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -105,11 +120,17 @@ if (!appRoot) {
 const app = appRoot;
 
 function render() {
+  if (state.needsInitialSetup) {
+    app.innerHTML = renderInitialSetup();
+    bindInitialSetupEvents();
+    return;
+  }
+
   app.innerHTML = `
     <main class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <span class="brand-mark">S</span>
+          ${brandMark()}
           <div>
             <h1>Scribe</h1>
             <p>ESO Addon Manager</p>
@@ -134,6 +155,63 @@ function render() {
   bindTabEvents();
 }
 
+function renderInitialSetup() {
+  return `
+    <main class="setup-shell">
+      <section class="setup-panel">
+        <div class="brand setup-brand">
+          ${brandMark()}
+          <div>
+            <h1>Scribe</h1>
+            <p>ESO Addon Manager</p>
+          </div>
+        </div>
+        ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
+        ${state.loading ? renderLoading() : ""}
+        <div class="setup-heading">
+          <h2>Select AddOns Path</h2>
+          <p>Choose the ESO AddOns folder Scribe should manage.</p>
+        </div>
+        ${state.detectedAddonsPath ? `<div class="banner info">Detected AddOns path: ${escapeHtml(state.detectedAddonsPath)}</div>` : `<div class="banner warning">No ESO AddOns path was detected automatically.</div>`}
+        <div class="field" id="setup-addons-field">
+          <label for="setup-addons-dir">AddOns path</label>
+          <div class="field-with-action">
+            <input id="setup-addons-dir" value="${escapeAttr(state.setupAddonsPath)}" placeholder="C:\\Users\\Name\\Documents\\Elder Scrolls Online\\live\\AddOns" ${disabledAttr()} />
+            <button class="secondary icon-button" id="browse-setup-addons" title="Browse for AddOns folder" ${disabledAttr()}>${icon("folder")} Browse</button>
+          </div>
+        </div>
+        <div class="setup-actions">
+          ${state.detectedAddonsPath ? `<button class="secondary icon-button" id="use-detected-addons" ${disabledAttr()}>${icon("target")} Use Detected</button>` : ""}
+          <button class="primary icon-button" id="save-initial-setup" ${disabledAttr()}>${icon("check")} Continue</button>
+        </div>
+      </section>
+      ${renderInitialImportModal()}
+    </main>
+  `;
+}
+
+function renderInitialImportModal() {
+  if (!state.setupImportPath) return "";
+  return `
+    <div class="modal-backdrop" role="presentation">
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="setup-import-title">
+        <div class="modal-icon">${icon("target")}</div>
+        <div class="modal-content">
+          <h2 id="setup-import-title">Import Existing AddOns As Current</h2>
+          <p>Scribe found ${state.setupExistingAddonsCount} existing addon${state.setupExistingAddonsCount === 1 ? "" : "s"} in this folder.</p>
+          <p>Before continuing, update them with your current addon manager. Scribe cannot reliably verify every existing installed version.</p>
+          <p>If you confirm, matched existing addons will be imported as up to date and used as the baseline for future updates.</p>
+          <div class="modal-path" title="${escapeAttr(state.setupImportPath)}">${escapeHtml(state.setupImportPath)}</div>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary" id="cancel-initial-import" ${disabledAttr()}>Go Back</button>
+          <button class="primary icon-button" id="confirm-initial-import" ${disabledAttr()}>${icon("check")} Import As Current</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function renderCurrentTab() {
   if (state.tab === "installed") return renderInstalled();
   if (state.tab === "search") return renderSearch();
@@ -142,6 +220,10 @@ function renderCurrentTab() {
 
 function tabButton(tab: Tab, label: string) {
   return `<button class="nav-button ${state.tab === tab ? "active" : ""}" data-tab="${tab}">${escapeHtml(label)}</button>`;
+}
+
+function brandMark() {
+  return `<span class="brand-mark"><img src="${escapeAttr(logoUrl)}" alt="" /></span>`;
 }
 
 function renderInstalled() {
@@ -191,9 +273,9 @@ function renderInstalledCard(item: InstalledViewModel) {
   const addon = item.addon;
   const remote = item.match?.remote ?? null;
   const status = installedStatus(item.match, addon);
-  const title = addon.title ?? remote?.name ?? addon.folder_name;
+  const title = addon.folder_name;
   const category = categoryMeta(remote?.category_name ?? null, remote?.category_id ?? null, addon.is_library);
-  const author = remote?.author_name ?? addon.author ?? null;
+  const author = addon.author ?? remote?.author_name ?? null;
   const statusNote = installedStatusNote(status);
   return `
     <article class="addon-card clickable ${cardStatusClass(status.kind)}" data-installed-folder="${escapeAttr(addon.folder_name)}">
@@ -202,7 +284,7 @@ function renderInstalledCard(item: InstalledViewModel) {
         <div class="addon-title-row">
           <div>
             <h3>${renderEsoText(title)}</h3>
-            <p>${escapeHtml(author ? `by ${plainEsoText(author)}` : "Author unknown")} &middot; ${escapeHtml(category.name)}</p>
+            <p>${escapeHtml(installedSubtitle(addon, author, category.name))}</p>
           </div>
           ${statusNote ? `<span class="status-note">${escapeHtml(statusNote)}</span>` : ""}
         </div>
@@ -216,6 +298,13 @@ function renderInstalledCard(item: InstalledViewModel) {
       <div class="card-actions">${renderCardUpdateAction(item.match)}</div>
     </article>
   `;
+}
+
+function installedSubtitle(addon: LocalAddon, author: string | null, category: string) {
+  if (!addon.valid_manifest) {
+    return `No valid addon manifest - folder ${addon.folder_name}`;
+  }
+  return `${author ? `by ${plainEsoText(author)}` : "Author unknown"} - ${category}`;
 }
 
 function renderSearch() {
@@ -345,16 +434,16 @@ function renderSettings() {
   return `
     ${pageHeader("Settings", "Desktop defaults for install and update actions.", `
       <div class="toolbar-actions">
-        <button class="secondary" id="reset-settings" ${disabledAttr()}>Reset</button>
-        <button class="primary" id="save-settings" ${disabledAttr()}>Save</button>
+        <button class="secondary icon-button" id="reset-settings" ${disabledAttr()}>${icon("rotate")} Reset</button>
+        <button class="primary icon-button" id="save-settings" ${disabledAttr()}>${icon("check")} Save</button>
       </div>
     `)}
     ${addonsMissing ? `<div class="banner error">Configured AddOns path does not exist: ${escapeHtml(settings?.addons_dir_override ?? "")}</div>` : ""}
     <div class="banner info">Blank paths use auto-detection or built-in defaults. Backup and download directories are created only when an install or update writes files there.</div>
     <section class="settings-grid">
-      ${settingField("AddOns path override", "settings-addons-dir", settings?.addons_dir_override ?? "")}
-      ${settingField("Backup directory override", "settings-backup-dir", settings?.backup_dir_override ?? "")}
-      ${settingField("Download directory", "settings-download-dir", settings?.download_dir ?? "")}
+      ${settingField("AddOns path override", "settings-addons-dir", settings?.addons_dir_override ?? "", true)}
+      ${settingField("Backup directory override", "settings-backup-dir", settings?.backup_dir_override ?? "", true)}
+      ${settingField("Download directory", "settings-download-dir", settings?.download_dir ?? "", true)}
       ${settingCheckbox("Keep downloads default", "settings-keep-downloads", settings?.keep_downloads_default ?? false)}
       ${settingCheckbox("Include unknown updates default", "settings-include-unknown", settings?.include_unknown_updates_default ?? false)}
     </section>
@@ -567,6 +656,26 @@ function bindCommonEvents() {
   });
 }
 
+function bindInitialSetupEvents() {
+  document.querySelector<HTMLInputElement>("#setup-addons-dir")?.addEventListener("input", (event) => {
+    state.setupAddonsPath = (event.currentTarget as HTMLInputElement).value;
+    clearPendingInitialImport();
+  });
+  document.querySelector<HTMLButtonElement>("#browse-setup-addons")?.addEventListener("click", browseInitialSetupFolder);
+  document.querySelector<HTMLButtonElement>("#use-detected-addons")?.addEventListener("click", () => {
+    state.setupAddonsPath = state.detectedAddonsPath ?? "";
+    clearPendingInitialImport();
+    state.error = null;
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#save-initial-setup")?.addEventListener("click", saveInitialSetup);
+  document.querySelector<HTMLButtonElement>("#cancel-initial-import")?.addEventListener("click", () => {
+    clearPendingInitialImport();
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#confirm-initial-import")?.addEventListener("click", confirmInitialImport);
+}
+
 function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#refresh-installed")?.addEventListener("click", loadInstalled);
   document.querySelector<HTMLButtonElement>("#plan-update-all-installed")?.addEventListener("click", planUpdateAll);
@@ -618,6 +727,9 @@ function bindTabEvents() {
   document.querySelector<HTMLInputElement>("#settings-download-dir")?.addEventListener("input", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-keep-downloads")?.addEventListener("change", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-include-unknown")?.addEventListener("change", syncSettingsDraft);
+  document.querySelectorAll<HTMLButtonElement>("[data-browse-target]").forEach((button) => {
+    button.addEventListener("click", () => browseSettingsFolder(button.dataset.browseTarget ?? ""));
+  });
 }
 
 async function withLoading(task: () => Promise<void>) {
@@ -659,29 +771,69 @@ function bindCardEventsOnly() {
   });
 }
 
+async function browseInitialSetupFolder() {
+  const selected = await browseForFolder(state.setupAddonsPath || state.detectedAddonsPath);
+  if (!selected) return;
+  state.setupAddonsPath = selected;
+  clearPendingInitialImport();
+  state.error = null;
+  render();
+}
+
+async function browseSettingsFolder(targetId: string) {
+  const input = document.querySelector<HTMLInputElement>(`#${targetId}`);
+  if (!input) return;
+  const selected = await browseForFolder(input.value || state.detectedAddonsPath);
+  if (!selected) return;
+  input.value = selected;
+  state.error = null;
+  syncSettingsDraft();
+  render();
+}
+
+async function browseForFolder(defaultPath: string | null | undefined) {
+  try {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      defaultPath: defaultPath || undefined,
+    });
+
+    return typeof selected === "string" ? selected : null;
+  } catch (error) {
+    state.error = `Could not open folder browser. ${error instanceof Error ? error.message : String(error)}`;
+    render();
+    return null;
+  }
+}
+
 function loadInstalled() {
   return withLoading(async () => {
     if (!state.settings) {
       state.settings = await invoke<AppSettings>("get_app_settings");
       applySettingsToState(state.settings);
     }
-    state.addonsPathExists = await invoke<boolean>("path_exists", { path: effectiveAddonsPath() });
-    state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: effectiveAddonsPath() });
-    state.path = state.installed.addons_dir;
-    try {
-      const updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
-        path: effectiveAddonsPath(),
-        includeUnknown: updateIncludeUnknownDefault(),
-      });
-      state.updatePlan = updatePlan;
-      state.updates = updatesFromPlan(updatePlan);
-      state.warning = null;
-    } catch (error) {
-      state.updatePlan = null;
-      state.updates = null;
-      state.warning = `Remote metadata could not be loaded. Showing local addons only. ${error instanceof Error ? error.message : String(error)}`;
-    }
+    await refreshInstalledData();
   });
+}
+
+async function refreshInstalledData() {
+  state.addonsPathExists = await invoke<boolean>("path_exists", { path: effectiveAddonsPath() });
+  state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: effectiveAddonsPath() });
+  state.path = state.installed.addons_dir;
+  try {
+    const updatePlan = await invoke<PlanUpdatesResponse>("plan_updates", {
+      path: effectiveAddonsPath(),
+      includeUnknown: updateIncludeUnknownDefault(),
+    });
+    state.updatePlan = updatePlan;
+    state.updates = updatesFromPlan(updatePlan);
+    state.warning = null;
+  } catch (error) {
+    state.updatePlan = null;
+    state.updates = null;
+    state.warning = `Remote metadata could not be loaded. Showing local addons only. ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 function runSearch() {
@@ -917,7 +1069,7 @@ function compareInstalled(left: InstalledViewModel, right: InstalledViewModel) {
 }
 
 function displayName(item: InstalledViewModel) {
-  return plainEsoText(item.addon.title ?? item.match?.remote?.name ?? item.addon.folder_name);
+  return plainEsoText(item.addon.title ?? item.addon.folder_name);
 }
 
 function dateValue(value: string | null | undefined) {
@@ -925,11 +1077,12 @@ function dateValue(value: string | null | undefined) {
 }
 
 function installedStatus(match: MatchResult | null, addon: LocalAddon) {
+  if (!addon.valid_manifest) return { label: "Invalid folder", kind: "invalid", rank: 3 };
+  if (match?.update_confidence === "current") return { label: "Current", kind: "current", rank: 4 };
   if (addon.is_library === true) return { label: "Unknown", kind: "unknown", rank: 2 };
   if (!match) return { label: "Unknown", kind: "unknown", rank: 2 };
   if (match.update_confidence === "reliable-update") return { label: "Update candidate", kind: "reliable-update", rank: 1 };
   if (match.update_confidence === "possible-update") return { label: "Version check uncertain", kind: "possible-update", rank: 2 };
-  if (match.update_confidence === "current") return { label: "Current", kind: "current", rank: 4 };
   if (match.update_confidence === "local-newer") return { label: "Local newer", kind: "local-newer", rank: 5 };
   if (match.status === "possible-update") return { label: "Version differs", kind: "possible-update", rank: 2 };
   if (match.status === "unknown-update") return { label: "Unknown", kind: "unknown", rank: 2 };
@@ -954,6 +1107,7 @@ function renderCardUpdateAction(match: MatchResult | null) {
 function installedStatusNote(status: { label: string; kind: string }) {
   if (status.kind === "reliable-update") return "Remote version differs";
   if (status.kind === "possible-update" || status.kind === "unknown") return "Version check uncertain";
+  if (status.kind === "invalid") return "No valid manifest";
   if (status.kind === "not-found") return "Remote match not found";
   if (status.kind === "ambiguous") return "Remote match ambiguous";
   if (status.kind === "local-newer") return "Local newer";
@@ -962,7 +1116,7 @@ function installedStatusNote(status: { label: string; kind: string }) {
 
 function cardStatusClass(kind: string) {
   if (kind === "reliable-update") return "is-update-candidate";
-  if (["possible-update", "unknown", "not-found", "ambiguous", "local-newer"].includes(kind)) {
+  if (["possible-update", "unknown", "not-found", "ambiguous", "local-newer", "invalid"].includes(kind)) {
     return "is-uncertain";
   }
   return "";
@@ -1015,39 +1169,45 @@ const categoryIconByKey: Record<string, { name: string; x: number; y: number }> 
 };
 
 const categoryKeyById: Record<string, string> = {
-  "1": "action-bar",
-  "2": "auction-vendors",
-  "3": "bags-bank-inventory",
-  "4": "buff-debuff-spell",
-  "5": "casting-cooldowns",
-  "6": "character-advancement",
-  "7": "chat",
-  "8": "class-role",
-  "9": "combat",
-  "10": "data",
-  "11": "game-controller",
-  "12": "graphic-ui",
-  "13": "group-guild-friends",
-  "14": "homestead",
-  "15": "info-bars",
-  "16": "map",
-  "17": "mail",
-  "18": "pvp",
-  "19": "raid",
-  "20": "roleplay",
-  "21": "tradeskill",
-  "22": "tooltip",
-  "23": "ui-media",
-  "24": "unit",
-  "25": "misc",
-  "26": "utility",
-  "27": "libraries",
-  "28": "developer-utilities",
-  "29": "eso-tools",
-  "30": "unofficial-translations",
-  "31": "beta",
-  "32": "plugins-patches",
-  "33": "discontinued",
+  "17": "graphic-ui",
+  "18": "character-advancement",
+  "19": "action-bar",
+  "20": "bags-bank-inventory",
+  "21": "unit",
+  "22": "buff-debuff-spell",
+  "24": "map",
+  "25": "combat",
+  "26": "data",
+  "27": "misc",
+  "33": "plugins-patches",
+  "40": "tradeskill",
+  "45": "raid",
+  "53": "libraries",
+  "55": "chat",
+  "56": "class-role",
+  "57": "class-role",
+  "58": "class-role",
+  "94": "auction-vendors",
+  "95": "group-guild-friends",
+  "96": "pvp",
+  "97": "mail",
+  "98": "tooltip",
+  "109": "info-bars",
+  "112": "casting-cooldowns",
+  "114": "roleplay",
+  "147": "ui-media",
+  "149": "class-role",
+  "150": "class-role",
+  "151": "class-role",
+  "152": "class-role",
+  "155": "beta",
+  "159": "utility",
+  "160": "homestead",
+  "162": "game-controller",
+  "163": "unofficial-translations",
+  "164": "class-role",
+  "165": "class-role",
+  "166": "class-role",
 };
 
 function CategoryIcon(category: CategoryMeta, large = false) {
@@ -1209,11 +1369,14 @@ function updatesFromPlan(plan: PlanUpdatesResponse): CheckAddonsResponse {
   };
 }
 
-function loadSettings() {
+function loadStartup() {
   return withLoading(async () => {
-    state.settings = await invoke<AppSettings>("get_app_settings");
-    applySettingsToState(state.settings);
-    state.addonsPathExists = await invoke<boolean>("path_exists", { path: effectiveAddonsPath() });
+    const startup = await invoke<AppStartupInfo>("get_startup_info");
+    state.settings = startup.settings;
+    state.detectedAddonsPath = startup.detected_addons_dir;
+    state.needsInitialSetup = !startup.settings_exists;
+    state.setupAddonsPath = startup.settings.addons_dir_override ?? startup.detected_addons_dir ?? "";
+    applySettingsToState(startup.settings);
   });
 }
 
@@ -1246,6 +1409,68 @@ function readSettingsDraft(): AppSettings {
   };
 }
 
+function saveInitialSetup() {
+  const selectedPath = state.setupAddonsPath.trim();
+  if (!selectedPath) {
+    state.error = "Enter an ESO AddOns path before continuing.";
+    render();
+    return;
+  }
+
+  return withLoading(async () => {
+    const exists = await invoke<boolean>("path_exists", { path: selectedPath });
+    if (!exists) {
+      throw new Error(`Selected AddOns path does not exist: ${selectedPath}`);
+    }
+
+    const installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: selectedPath });
+    const existingAddonsCount = installed.addons.filter((addon) => addon.valid_manifest).length;
+    if (existingAddonsCount > 0) {
+      state.setupImportPath = selectedPath;
+      state.setupExistingAddonsCount = existingAddonsCount;
+      return;
+    }
+
+    await finishInitialSetup(selectedPath, false);
+  });
+}
+
+function confirmInitialImport() {
+  const selectedPath = state.setupImportPath;
+  if (!selectedPath) return;
+  return withLoading(async () => {
+    await finishInitialSetup(selectedPath, true);
+  });
+}
+
+async function finishInitialSetup(selectedPath: string, importExisting: boolean) {
+  if (importExisting) {
+    await invoke<ImportExistingAddonsResponse>("import_existing_addons_as_current", {
+      path: selectedPath,
+    });
+  }
+
+  const saved = await invoke<AppSettings>("save_app_settings", {
+    settings: {
+      addons_dir_override: selectedPath,
+      backup_dir_override: state.settings?.backup_dir_override ?? null,
+      download_dir: state.settings?.download_dir ?? null,
+      keep_downloads_default: state.settings?.keep_downloads_default ?? false,
+      include_unknown_updates_default: state.settings?.include_unknown_updates_default ?? false,
+    } satisfies AppSettingsInput,
+  });
+  state.settings = saved;
+  state.needsInitialSetup = false;
+  clearPendingInitialImport();
+  applySettingsToState(saved);
+  await refreshInstalledData();
+}
+
+function clearPendingInitialImport() {
+  state.setupImportPath = null;
+  state.setupExistingAddonsCount = 0;
+}
+
 function saveSettings() {
   return withLoading(async () => {
     const saved = await invoke<AppSettings>("save_app_settings", {
@@ -1266,12 +1491,15 @@ function resetSettings() {
   });
 }
 
-function settingField(label: string, id: string, value: string) {
+function settingField(label: string, id: string, value: string, browse = false) {
   return `
-    <label class="field setting-item" for="${escapeAttr(id)}">
-      <span>${escapeHtml(label)}</span>
-      <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="Leave blank for default" ${disabledAttr()} />
-    </label>
+    <div class="field setting-item">
+      <label for="${escapeAttr(id)}">${escapeHtml(label)}</label>
+      <div class="${browse ? "field-with-action" : ""}">
+        <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="Leave blank for default" ${disabledAttr()} />
+        ${browse ? `<button class="secondary icon-button browse-button" data-browse-target="${escapeAttr(id)}" title="Browse for ${escapeAttr(label)}" ${disabledAttr()}>${icon("folder")} Browse</button>` : ""}
+      </div>
+    </div>
   `;
 }
 
@@ -1309,6 +1537,16 @@ function escapeAttr(value: string) {
   return escapeHtml(value);
 }
 
+function icon(name: IconName) {
+  const paths: Record<IconName, string> = {
+    check: '<path d="M20 6 9 17l-5-5"/>',
+    folder: '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z"/><path d="M2 10h20"/>',
+    rotate: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/>',
+    target: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
+  };
+  return `<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]}</svg>`;
+}
+
 function plainEsoText(value: string) {
   return value.replace(/\|c[0-9a-fA-F]{6,8}/g, "").replace(/\|r/g, "");
 }
@@ -1331,4 +1569,8 @@ function renderEsoText(value: string) {
 }
 
 render();
-loadSettings().then(loadInstalled);
+loadStartup().then(() => {
+  if (!state.needsInitialSetup) {
+    loadInstalled();
+  }
+});

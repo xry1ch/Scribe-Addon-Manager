@@ -66,6 +66,16 @@ pub fn match_installed_addons(
 }
 
 fn match_one(local: &LocalAddon, remote_addons: &[AddonSummary]) -> MatchResult {
+    if !local.valid_manifest {
+        return MatchResult {
+            local: local.clone(),
+            status: MatchStatus::NoMatch,
+            remote: None,
+            candidates: Vec::new(),
+            debug_candidates: Vec::new(),
+        };
+    }
+
     let mut candidates = scored_candidates(local, remote_addons);
     candidates.sort_by(|left, right| {
         left.tier

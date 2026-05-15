@@ -162,9 +162,11 @@ impl AddonSummary {
             &[
                 "UICategoryID",
                 "UICategoryId",
+                "UICATID",
                 "CategoryID",
                 "CategoryId",
                 "category_id",
+                "categoryId",
             ],
         )
     }
@@ -174,10 +176,12 @@ impl AddonSummary {
             &self._extra,
             &[
                 "UICategoryName",
+                "UICATTitle",
                 "CategoryName",
                 "UICategory",
                 "Category",
                 "category_name",
+                "categoryName",
             ],
         )
     }
@@ -187,10 +191,11 @@ impl AddonSummary {
             &self._extra,
             &[
                 "UIDownloads",
-                "UIDownloadCount",
                 "UIDownloadTotal",
+                "UIDownloadCount",
                 "Downloads",
                 "DownloadCount",
+                "downloads",
                 "TotalDownloads",
             ],
         )
@@ -201,9 +206,11 @@ impl AddonSummary {
             &self._extra,
             &[
                 "UIMonthlyDownloads",
+                "UIDownloadMonthly",
                 "UIDownloadsMonthly",
                 "MonthlyDownloads",
                 "MonthlyDownloadCount",
+                "downloadsMonthly",
             ],
         )
     }
@@ -283,9 +290,11 @@ impl AddonDetails {
             &[
                 "UICategoryID",
                 "UICategoryId",
+                "UICATID",
                 "CategoryID",
                 "CategoryId",
                 "category_id",
+                "categoryId",
             ],
         )
     }
@@ -295,10 +304,12 @@ impl AddonDetails {
             &self._extra,
             &[
                 "UICategoryName",
+                "UICATTitle",
                 "CategoryName",
                 "UICategory",
                 "Category",
                 "category_name",
+                "categoryName",
             ],
         )
     }
@@ -308,10 +319,11 @@ impl AddonDetails {
             &self._extra,
             &[
                 "UIDownloads",
-                "UIDownloadCount",
                 "UIDownloadTotal",
+                "UIDownloadCount",
                 "Downloads",
                 "DownloadCount",
+                "downloads",
                 "TotalDownloads",
             ],
         )
@@ -322,9 +334,11 @@ impl AddonDetails {
             &self._extra,
             &[
                 "UIMonthlyDownloads",
+                "UIDownloadMonthly",
                 "UIDownloadsMonthly",
                 "MonthlyDownloads",
                 "MonthlyDownloadCount",
+                "downloadsMonthly",
             ],
         )
     }
@@ -436,5 +450,44 @@ mod de {
             Value::Bool(value) => Some(value.to_string()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AddonDetails, AddonSummary};
+
+    #[test]
+    fn addon_summary_reads_current_esoui_category_fields() {
+        let summary: AddonSummary = serde_json::from_value(serde_json::json!({
+            "UID": "4574",
+            "UICATID": "17",
+            "UIName": "NirnSteelUI",
+            "UIDownloadTotal": "341",
+            "UIDownloadMonthly": "169",
+            "UIDir": ["NirnsteelUI"]
+        }))
+        .expect("valid summary");
+
+        assert_eq!(summary.category_id().as_deref(), Some("17"));
+        assert_eq!(summary.downloads(), Some(341));
+        assert_eq!(summary.monthly_downloads(), Some(169));
+        assert_eq!(summary.directories, vec!["NirnsteelUI"]);
+    }
+
+    #[test]
+    fn addon_details_reads_current_esoui_category_fields() {
+        let details: AddonDetails = serde_json::from_value(serde_json::json!({
+            "UID": "4574",
+            "UICATID": "17",
+            "UIName": "NirnSteelUI",
+            "UIDownloadTotal": "341",
+            "UIDownloadMonthly": "169"
+        }))
+        .expect("valid details");
+
+        assert_eq!(details.category_id().as_deref(), Some("17"));
+        assert_eq!(details.downloads(), Some(341));
+        assert_eq!(details.monthly_downloads(), Some(169));
     }
 }

@@ -40,6 +40,7 @@ pub struct PlannedAddonAction {
     pub remote_uid: Option<String>,
     pub local_version: Option<String>,
     pub remote_version: Option<String>,
+    pub remote_date: Option<i64>,
     pub kind: PlannedActionKind,
     pub details: Option<PlannedAddonDetails>,
 }
@@ -113,6 +114,7 @@ fn planned_action(result: &MatchResult) -> PlannedAddonAction {
         .remote
         .as_ref()
         .and_then(|remote| remote.version.clone());
+    let remote_date = result.remote.as_ref().and_then(|remote| remote.updated);
     let kind = match result.status {
         MatchStatus::PossibleUpdate => PlannedActionKind::WouldUpdate,
         MatchStatus::Matched => PlannedActionKind::WouldSkipCurrent,
@@ -129,6 +131,7 @@ fn planned_action(result: &MatchResult) -> PlannedAddonAction {
         remote_uid,
         local_version,
         remote_version,
+        remote_date,
         kind,
         details: None,
     }
