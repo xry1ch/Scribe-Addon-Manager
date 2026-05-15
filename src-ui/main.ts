@@ -15,6 +15,7 @@ import type {
   CachedImageResponse,
   CheckAddonsResponse,
   ClearSavedVariablesResponse,
+  DependencyPlan,
   HttpCacheStatsResponse,
   ImportExistingAddonsResponse,
   InstallRemoteAddonResponse,
@@ -997,17 +998,27 @@ function renderInstallPlan() {
         <div class="panel-heading">
           <div>
             <h3>Installing</h3>
-            <p>All validated addon folders are new installs.</p>
+            <p>All validated addon folders and required libraries are new installs.</p>
           </div>
         </div>
         ${renderPlanItems(plan.plan.items)}
+        ${renderDependencyPlan(plan.dependency_plan)}
       </section>
     `;
   }
   const requiresReplacementReview = hasReplacementPlanItems(plan);
+  const requiredDependencyIssues = hasRequiredDependencyIssues(plan.dependency_plan);
+  const dependencyReplacementReview = hasDependencyReplacementItems(plan.dependency_plan);
   const hasInstallableItems = hasInstallablePlanItems(plan);
-  const bannerClass = requiresReplacementReview || !hasInstallableItems || hasSkippedPlanItems(plan) ? "warning" : "info";
-  const bannerText = requiresReplacementReview
+  const bannerClass =
+    requiresReplacementReview || requiredDependencyIssues || dependencyReplacementReview || !hasInstallableItems || hasSkippedPlanItems(plan)
+      ? "warning"
+      : "info";
+  const bannerText = requiredDependencyIssues
+    ? "Some required dependencies could not be resolved. Confirm only if you want to install the main addon anyway."
+    : dependencyReplacementReview
+      ? "Review required: installing required libraries may replace existing addon folders after creating backups."
+      : requiresReplacementReview
     ? "Review required: this install will replace existing addon folders after creating backups."
     : !hasInstallableItems
       ? "No valid addon folders were found. Nothing can be installed from this package."
@@ -1024,6 +1035,7 @@ function renderInstallPlan() {
         </div>
       </div>
       ${renderPlanItems(plan.plan.items)}
+      ${renderDependencyPlan(plan.dependency_plan)}
     </section>
   `;
 }
@@ -1135,6 +1147,7 @@ function renderSingleUpdatePlan() {
         </div>
       </div>
       ${plan.plan ? renderPlanItems(plan.plan.items) : emptyState("No file changes previewed", "This addon is not eligible for update with the current options.")}
+      ${renderDependencyPlan(plan.dependency_plan)}
     </section>
   `;
 }
@@ -1190,8 +1203,16 @@ function renderCompactInstallResult(result: InstallRemoteAddonResponse) {
   return renderCompactResultPanel({
     kind: "success",
     title: "Installed successfully",
-    message: "The addon is ready to use in ESO.",
+    message: installSuccessMessage(result),
   });
+}
+
+function installSuccessMessage(result: InstallRemoteAddonResponse) {
+  const requiredInstalled = result.dependency_plan.required_dependencies.filter((dependency) => dependency.status === "will-install").length;
+  if (requiredInstalled > 0) {
+    return `Installed 1 addon and ${requiredInstalled} required ${requiredInstalled === 1 ? "library" : "libraries"}.`;
+  }
+  return "The addon is ready to use in ESO.";
 }
 
 function renderCompactUpdateResult(result: SingleUpdateApplyResponse) {
@@ -1345,12 +1366,104 @@ function renderPlanItems(items: { source_folder: string | null; target_folder: s
   `;
 }
 
+function renderDependencyPlan(plan: DependencyPlan | null) {
+  if (!plan) return "";
+  const hasRequired = plan.required_dependencies.length > 0;
+  const hasOptional = plan.optional_dependencies.length > 0;
+  if (!hasRequired && !hasOptional) return "";
+
+  return `
+    <div class="dependency-section">
+      <div class="dependency-heading">
+        <h4>Required libraries</h4>
+        <span>${requiredDependencySummary(plan)}</span>
+      </div>
+      ${
+        hasRequired
+          ? `<div class="dependency-list">${plan.required_dependencies.map(renderRequiredDependencyRow).join("")}</div>`
+          : `<p class="muted-text">No required libraries were declared.</p>`
+      }
+      ${
+        hasOptional
+          ? `<details class="dependency-optional">
+              <summary>Optional dependencies</summary>
+              <div class="dependency-list">${plan.optional_dependencies.map(renderOptionalDependencyRow).join("")}</div>
+            </details>`
+          : ""
+      }
+    </div>
+  `;
+}
+
+function renderRequiredDependencyRow(dependency: DependencyPlan["required_dependencies"][number]) {
+  return renderDependencyRow(dependency, dependencyStatusText(dependency), dependencyDetailText(dependency));
+}
+
+function renderOptionalDependencyRow(dependency: DependencyPlan["optional_dependencies"][number]) {
+  return renderDependencyRow(dependency, optionalDependencyStatusText(dependency), dependencyDetailText(dependency));
+}
+
+function renderDependencyRow(dependency: DependencyPlan["required_dependencies"][number], status: string, detail: string) {
+  const constraint = dependency.constraint ? ` ${dependency.constraint}` : "";
+  return `
+    <div class="dependency-row ${dependencyStatusClass(dependency.status)}">
+      <strong>${escapeHtml(dependency.name)}${escapeHtml(constraint)}</strong>
+      <span>${escapeHtml(status)}</span>
+      <span>${escapeHtml(detail)}</span>
+    </div>
+  `;
+}
+
+function requiredDependencySummary(plan: DependencyPlan) {
+  if (hasRequiredDependencyIssues(plan)) return "Needs confirmation";
+  const willInstall = plan.required_dependencies.filter((dependency) => dependency.status === "will-install").length;
+  const installed = plan.required_dependencies.filter((dependency) => dependency.status === "already-installed").length;
+  if (willInstall > 0) return `${willInstall} will install`;
+  if (installed > 0) return "Already satisfied";
+  return "None";
+}
+
+function dependencyStatusText(dependency: DependencyPlan["required_dependencies"][number]) {
+  if (dependency.status === "already-installed") return "Already installed";
+  if (dependency.status === "will-install") return dependency.bundled_folder ? "Bundled" : "Will install";
+  if (dependency.status === "ambiguous") return "Ambiguous";
+  if (dependency.status === "unresolved") return "Unresolved";
+  return dependency.status;
+}
+
+function optionalDependencyStatusText(dependency: DependencyPlan["optional_dependencies"][number]) {
+  if (dependency.status === "already-installed") return "Already installed";
+  if (dependency.status === "not-installed") return "Not installed";
+  if (dependency.status === "unresolved") return "Not resolved";
+  return dependency.status;
+}
+
+function dependencyDetailText(dependency: DependencyPlan["required_dependencies"][number]) {
+  if (dependency.installed_folder) return dependency.installed_folder;
+  if (dependency.bundled_folder) return dependency.bundled_folder;
+  if (dependency.remote_name) return dependency.remote_name;
+  if (dependency.status === "ambiguous") return "Multiple remote matches";
+  if (dependency.status === "unresolved") return "No safe remote match";
+  return "Not installed automatically";
+}
+
+function dependencyStatusClass(status: string) {
+  if (status === "already-installed") return "is-installed";
+  if (status === "will-install") return "is-planned";
+  if (status === "ambiguous" || status === "unresolved") return "is-warning";
+  return "is-muted";
+}
+
 function isSafeNewInstallPlan(plan: PlanRemoteInstallResponse) {
-  return plan.plan.items.length > 0 && plan.plan.items.every((item) => item.action === "would-install-new");
+  return (
+    plan.plan.items.length > 0 &&
+    plan.plan.items.every((item) => item.action === "would-install-new") &&
+    isSafeDependencyPlan(plan.dependency_plan)
+  );
 }
 
 function hasReplacementPlanItems(plan: PlanRemoteInstallResponse) {
-  return plan.plan.items.some((item) => item.action === "would-replace-existing");
+  return plan.plan.items.some((item) => item.action === "would-replace-existing") || hasDependencyReplacementItems(plan.dependency_plan);
 }
 
 function hasInstallablePlanItems(plan: PlanRemoteInstallResponse) {
@@ -1358,7 +1471,41 @@ function hasInstallablePlanItems(plan: PlanRemoteInstallResponse) {
 }
 
 function hasSkippedPlanItems(plan: PlanRemoteInstallResponse) {
-  return plan.plan.items.some((item) => item.action !== "would-install-new" && item.action !== "would-replace-existing");
+  return (
+    plan.plan.items.some((item) => item.action !== "would-install-new" && item.action !== "would-replace-existing") ||
+    plan.dependency_plan.install_items.some(
+      (item) => item.role === "required-dependency" && item.action !== "would-install-new" && item.action !== "would-replace-existing",
+    )
+  );
+}
+
+function isSafeDependencyPlan(plan: DependencyPlan) {
+  return (
+    !hasRequiredDependencyIssues(plan) &&
+    plan.install_items
+      .filter((item) => item.role === "required-dependency")
+      .every((item) => item.action === "would-install-new")
+  );
+}
+
+function hasRequiredDependencyIssues(plan: DependencyPlan | null) {
+  return Boolean(plan?.required_dependencies.some((dependency) => dependency.status === "unresolved" || dependency.status === "ambiguous"));
+}
+
+function hasDependencyReplacementItems(plan: DependencyPlan | null) {
+  return Boolean(plan?.install_items.some((item) => item.role === "required-dependency" && item.action === "would-replace-existing"));
+}
+
+function installDependencyConfirmText(plan: DependencyPlan) {
+  const unresolved = plan.required_dependencies.filter((dependency) => dependency.status === "unresolved" || dependency.status === "ambiguous");
+  if (unresolved.length > 0) {
+    return `Some required dependencies could not be resolved: ${unresolved.map((dependency) => dependency.name).join(", ")}.`;
+  }
+  const willInstall = plan.required_dependencies.filter((dependency) => dependency.status === "will-install").length;
+  if (willInstall > 0) {
+    return `The app will also install ${willInstall} required ${willInstall === 1 ? "library" : "libraries"}.`;
+  }
+  return "No required library changes are currently expected.";
 }
 
 function renderInstalledItems(items: { target_folder: string | null; action: string; message: string | null }[]) {
@@ -1934,8 +2081,9 @@ function confirmInstall() {
   const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
     ? "Existing addon folders may be backed up and replaced."
     : "No existing addon folder replacement is currently expected.";
+  const dependencyText = installDependencyConfirmText(plan.dependency_plan);
   const confirmed = window.confirm(
-    `Install ${plan.remote.name ?? addonId}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n\nThe app will fetch fresh metadata, download and verify the ZIP, validate it, build a fresh preview, and back up replacements before applying.`,
+    `Install ${plan.remote.name ?? addonId}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n${dependencyText}\n\nThe app will fetch fresh metadata, download and verify the ZIP, validate it, build a fresh preview, and back up replacements before applying.`,
   );
   if (!confirmed) return;
   state.removeResult = null;
@@ -1980,8 +2128,9 @@ function confirmUpdate() {
   const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
     ? "Existing addon folders may be backed up and replaced."
     : "No existing addon folder replacement is currently expected.";
+  const dependencyText = plan.dependency_plan ? installDependencyConfirmText(plan.dependency_plan) : "No required library changes are currently expected.";
   const confirmed = window.confirm(
-    `Update ${plan.local.folder_name}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n\nThe app will match the addon again, fetch fresh metadata, download and verify the ZIP, validate it, build a fresh preview, and back up replacements before applying.`,
+    `Update ${plan.local.folder_name}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n${dependencyText}\n\nThe app will match the addon again, fetch fresh metadata, download and verify the ZIP, validate it, build a fresh preview, and back up replacements before applying.`,
   );
   if (!confirmed) return;
   state.removeResult = null;
@@ -2189,10 +2338,17 @@ function syncInstalledStateAfterRemove(result: RemoveInstalledAddonResponse) {
 }
 
 function installedLocalFromResult(result: InstallRemoteAddonResponse) {
+  const mainFolders = new Set(
+    result.plan.items
+      .filter((item) => item.action === "would-install-new" || item.action === "would-replace-existing")
+      .map((item) => folderNameFromPath(item.target_folder))
+      .filter(Boolean)
+      .map((folder) => folder!.toLowerCase()),
+  );
   const folderName = result.items
     .filter((item) => item.action === "installed-new" || item.action === "replaced-existing")
     .map((item) => folderNameFromPath(item.target_folder))
-    .find(Boolean);
+    .find((folder) => folder && mainFolders.has(folder.toLowerCase()));
 
   if (!folderName) return null;
   return state.installed?.addons.find((addon) => addon.folder_name.toLowerCase() === folderName.toLowerCase()) ?? null;

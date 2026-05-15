@@ -146,6 +146,30 @@ pub fn apply_install_plan(
     Ok(result)
 }
 
+pub fn apply_install_plan_sequence(
+    plans: &[&InstallPlan],
+    backup_root: Option<&Path>,
+) -> Result<InstallResult, InstallApplyError> {
+    let mut aggregate = InstallResult::default();
+
+    for plan in plans {
+        let result = apply_install_plan(plan, backup_root)?;
+        merge_install_result(&mut aggregate, result);
+    }
+
+    Ok(aggregate)
+}
+
+pub fn merge_install_result(aggregate: &mut InstallResult, result: InstallResult) {
+    if aggregate.backup_dir.is_none() {
+        aggregate.backup_dir = result.backup_dir;
+    }
+    aggregate.installed_new += result.installed_new;
+    aggregate.replaced += result.replaced;
+    aggregate.skipped += result.skipped;
+    aggregate.items.extend(result.items);
+}
+
 fn install_new(
     plan: &InstallPlan,
     item: &InstallPlanItem,
@@ -328,7 +352,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::install::apply::{apply_install_plan, InstallActionPerformed, InstallApplyError};
+    use crate::install::apply::{
+        apply_install_plan, apply_install_plan_sequence, InstallActionPerformed, InstallApplyError,
+    };
     use crate::install::plan::{InstallPlan, InstallPlanAction, InstallPlanItem};
 
     fn plan(
@@ -554,5 +580,67 @@ mod tests {
 
         assert!(addons.join("Addon").exists());
         assert!(!addons.join("root-file.txt").exists());
+    }
+
+    #[test]
+    fn install_sequence_applies_dependencies_before_main() {
+        let dir = tempdir().unwrap();
+        let dep_temp = dir.path().join("dep-temp");
+        let main_temp = dir.path().join("main-temp");
+        let addons = dir.path().join("AddOns");
+        write_addon(&dep_temp, "LibAddonMenu-2.0", "dependency");
+        write_addon(&main_temp, "MainAddon", "main");
+
+        let dep_plan = plan(
+            dep_temp,
+            addons.clone(),
+            "LibAddonMenu-2.0",
+            InstallPlanAction::WouldInstallNew,
+        );
+        let main_plan = plan(
+            main_temp,
+            addons.clone(),
+            "MainAddon",
+            InstallPlanAction::WouldInstallNew,
+        );
+
+        let result = apply_install_plan_sequence(&[&dep_plan, &main_plan], None).unwrap();
+
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .filter_map(|item| item.source_folder.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["LibAddonMenu-2.0", "MainAddon"]
+        );
+        assert_eq!(result.installed_new, 2);
+    }
+
+    #[test]
+    fn install_sequence_dependency_failure_prevents_main_install() {
+        let dir = tempdir().unwrap();
+        let dep_temp = dir.path().join("dep-temp");
+        let main_temp = dir.path().join("main-temp");
+        let addons = dir.path().join("AddOns");
+        write_addon(&main_temp, "MainAddon", "main");
+
+        let dep_plan = plan(
+            dep_temp,
+            addons.clone(),
+            "MissingDependency",
+            InstallPlanAction::WouldInstallNew,
+        );
+        let main_plan = plan(
+            main_temp,
+            addons.clone(),
+            "MainAddon",
+            InstallPlanAction::WouldInstallNew,
+        );
+
+        let result = apply_install_plan_sequence(&[&dep_plan, &main_plan], None);
+
+        assert!(matches!(result, Err(InstallApplyError::Io(_))));
+        assert!(!addons.join("MainAddon").exists());
     }
 }

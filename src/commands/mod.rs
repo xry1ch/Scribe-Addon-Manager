@@ -11,6 +11,7 @@ use crate::api::models::{AddonDetails, AddonSummary, ApiFeeds};
 use crate::api::ApiClient;
 use crate::error::AppError;
 use crate::install::apply::{self, InstallResult};
+use crate::install::dependencies::{self, DependencyPlan, DependencyStatus, RemoteAddonRef};
 use crate::install::plan::{self, InstallPlan, InstallPlanAction};
 use crate::install::remote;
 use crate::install::update;
@@ -26,6 +27,20 @@ use crate::local::{self, LocalAddon};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+}
+
+struct PreparedRemoteInstall {
+    details: AddonDetails,
+    download_path: PathBuf,
+    main_plan: InstallPlan,
+    dependency_plan: DependencyPlan,
+    dependency_installs: Vec<PreparedDependencyInstall>,
+}
+
+struct PreparedDependencyInstall {
+    details: AddonDetails,
+    remote_uid: String,
+    plan: InstallPlan,
 }
 
 #[derive(Debug, Subcommand)]
@@ -693,7 +708,7 @@ async fn update_all_one(
     quiet: bool,
 ) -> Result<InstallResult> {
     let details = client.eso_file_details_fresh(remote_uid).await?;
-    let install_plan = prepare_remote_install_plan(
+    let prepared = prepare_remote_install_plan(
         client,
         &details,
         remote_uid,
@@ -704,9 +719,9 @@ async fn update_all_one(
         quiet,
     )
     .await?;
-    validate_single_update_plan(&install_plan, &target.local_folder)?;
+    validate_single_update_plan(&prepared.main_plan, &target.local_folder)?;
 
-    Ok(apply::apply_install_plan(&install_plan, backup_dir)?)
+    Ok(apply_prepared_install(&prepared, backup_dir)?)
 }
 
 pub fn inspect_zip(zip_path: &Path, json_output: bool) -> Result<()> {
@@ -819,87 +834,65 @@ pub async fn install_remote(
         print_remote_install_metadata(&details);
     }
 
-    let download_url = remote::download_url(&details)?;
-    let file_name = remote::download_file_name(&details, addon_id);
-    tracing::debug!(
-        "downloading remote addon {} from {}",
-        addon_id,
-        download_url
-    );
-    let bytes = client.download_bytes(download_url).await?;
-    remote::verify_md5(&bytes, details.md5.as_deref())?;
-
-    let temp_file;
-    let zip_path = if keep_download {
-        let path = remote::keep_download_path(download_dir, &file_name);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::write(&path, &bytes)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        if !json_output {
-            println!("Saved ZIP: {}", path.display());
-        }
-        path
-    } else {
-        temp_file = tempfile::Builder::new()
-            .prefix("eso-addon-manager-download-")
-            .suffix(".zip")
-            .tempfile()?;
-        fs::write(temp_file.path(), &bytes)
-            .await
-            .with_context(|| format!("failed to write {}", temp_file.path().display()))?;
-        temp_file.path().to_path_buf()
-    };
-
     let addons_dir = match path {
         Some(path) => path.to_path_buf(),
         None => local::detect_best_addons_dir()
             .ok_or_else(|| anyhow!("could not auto-detect an ESO AddOns directory"))?,
     };
     let installed_addons = scan_installed_addons_for_install(&addons_dir)?;
-    let extracted = zip_safety::extract_zip_to_temp(&zip_path)
-        .with_context(|| format!("failed to validate and extract ZIP {}", zip_path.display()))?;
-    let plan = plan::plan_install(&extracted, &addons_dir, &installed_addons)?;
+    let prepared = prepare_remote_install_plan(
+        client,
+        &details,
+        addon_id,
+        &addons_dir,
+        &installed_addons,
+        keep_download,
+        download_dir,
+        json_output,
+    )
+    .await?;
 
     if !yes {
         if json_output {
             return print_json_value(json!({
                 "addon_id": addon_id,
-                "remote": details,
+                "remote": prepared.details,
                 "addons_dir": path_string(&addons_dir),
-                "download_path": path_string(&zip_path),
+                "download_path": path_string(&prepared.download_path),
                 "dry_run": true,
                 "applied": false,
-                "plan": install_plan_json(&plan),
+                "plan": install_plan_json(&prepared.main_plan),
+                "dependency_plan": dependency_plan_json(&prepared),
                 "result": Value::Null,
             }));
         }
-        print_install_plan(&plan, true);
+        print_dependency_plan(&prepared.dependency_plan);
+        println!();
+        print_install_plan(&prepared.main_plan, true);
         println!();
         println!("No changes made. Re-run with --yes to install.");
         return Ok(());
     }
 
     if json_output {
-        let result = apply::apply_install_plan(&plan, backup_dir)?;
+        let result = apply_prepared_install(&prepared, backup_dir)?;
         return print_json_value(json!({
             "addon_id": addon_id,
-            "remote": details,
+            "remote": prepared.details,
             "addons_dir": path_string(&addons_dir),
-            "download_path": path_string(&zip_path),
+            "download_path": path_string(&prepared.download_path),
             "dry_run": false,
             "applied": install_result_applied(&result),
-            "plan": install_plan_json(&plan),
+            "plan": install_plan_json(&prepared.main_plan),
+            "dependency_plan": dependency_plan_json(&prepared),
             "result": install_result_json(&result),
         }));
     }
 
-    print_install_plan(&plan, false);
-    let result = apply::apply_install_plan(&plan, backup_dir)?;
+    print_dependency_plan(&prepared.dependency_plan);
+    println!();
+    print_install_plan(&prepared.main_plan, false);
+    let result = apply_prepared_install(&prepared, backup_dir)?;
     println!();
     print_install_result(&result);
     Ok(())
@@ -972,7 +965,7 @@ pub async fn update_one(
         print_remote_install_metadata(&details);
     }
 
-    let plan = prepare_remote_install_plan(
+    let prepared = prepare_remote_install_plan(
         client,
         &details,
         remote_uid,
@@ -983,7 +976,7 @@ pub async fn update_one(
         json_output,
     )
     .await?;
-    validate_single_update_plan(&plan, &selected.local.folder_name)?;
+    validate_single_update_plan(&prepared.main_plan, &selected.local.folder_name)?;
 
     if !yes {
         if json_output {
@@ -993,33 +986,39 @@ pub async fn update_one(
                 "dry_run": true,
                 "applied": false,
                 "selection": update_selection_json(selected, &decision),
-                "remote": details,
-                "plan": install_plan_json(&plan),
+                "remote": prepared.details,
+                "plan": install_plan_json(&prepared.main_plan),
+                "dependency_plan": dependency_plan_json(&prepared),
                 "result": Value::Null,
             }));
         }
-        print_install_plan(&plan, true);
+        print_dependency_plan(&prepared.dependency_plan);
+        println!();
+        print_install_plan(&prepared.main_plan, true);
         println!();
         println!("No changes made. Re-run with --yes to update.");
         return Ok(());
     }
 
     if json_output {
-        let result = apply::apply_install_plan(&plan, backup_dir)?;
+        let result = apply_prepared_install(&prepared, backup_dir)?;
         return print_json_value(json!({
             "request": request,
             "addons_dir": path_string(&addons_dir),
             "dry_run": false,
             "applied": install_result_applied(&result),
             "selection": update_selection_json(selected, &decision),
-            "remote": details,
-            "plan": install_plan_json(&plan),
+            "remote": prepared.details,
+            "plan": install_plan_json(&prepared.main_plan),
+            "dependency_plan": dependency_plan_json(&prepared),
             "result": install_result_json(&result),
         }));
     }
 
-    print_install_plan(&plan, false);
-    let result = apply::apply_install_plan(&plan, backup_dir)?;
+    print_dependency_plan(&prepared.dependency_plan);
+    println!();
+    print_install_plan(&prepared.main_plan, false);
+    let result = apply_prepared_install(&prepared, backup_dir)?;
     println!();
     print_install_result(&result);
     Ok(())
@@ -1034,7 +1033,74 @@ async fn prepare_remote_install_plan(
     keep_download: bool,
     download_dir: Option<&Path>,
     quiet: bool,
-) -> Result<InstallPlan> {
+) -> Result<PreparedRemoteInstall> {
+    let remote_addons = client.eso_file_list().await?;
+    let (main_plan, extracted, download_path) = prepare_remote_package(
+        client,
+        details,
+        addon_id,
+        addons_dir,
+        installed_addons,
+        keep_download,
+        download_dir,
+        quiet,
+    )
+    .await?;
+    let dependency_plan = dependencies::build_dependency_plan(
+        RemoteAddonRef {
+            uid: addon_id.to_owned(),
+            name: details.name.clone(),
+        },
+        &extracted,
+        installed_addons,
+        &remote_addons,
+        &[],
+    );
+
+    let mut dependency_installs = Vec::new();
+    for dependency in dependency_plan.required_dependencies_to_install() {
+        let remote_uid = dependency
+            .remote_uid
+            .as_deref()
+            .expect("required dependency to install has remote UID");
+        let dependency_details = client.eso_file_details_fresh(remote_uid).await?;
+        let (plan, _, _) = prepare_remote_package(
+            client,
+            &dependency_details,
+            remote_uid,
+            addons_dir,
+            installed_addons,
+            keep_download,
+            download_dir,
+            quiet,
+        )
+        .await?;
+        dependency_installs.push(PreparedDependencyInstall {
+            details: dependency_details,
+            remote_uid: remote_uid.to_owned(),
+            plan,
+        });
+    }
+
+    Ok(PreparedRemoteInstall {
+        details: details.clone(),
+        download_path,
+        main_plan,
+        dependency_plan,
+        dependency_installs,
+    })
+}
+
+async fn prepare_remote_package(
+    client: &ApiClient,
+    details: &AddonDetails,
+    addon_id: &str,
+    addons_dir: &Path,
+    installed_addons: &[LocalAddon],
+    keep_download: bool,
+    download_dir: Option<&Path>,
+    quiet: bool,
+) -> Result<(InstallPlan, ExtractedZip, PathBuf)> {
     let download_url = remote::download_url(details)?;
     let file_name = remote::download_file_name(details, addon_id);
     tracing::debug!(
@@ -1073,11 +1139,26 @@ async fn prepare_remote_install_plan(
 
     let extracted = zip_safety::extract_zip_to_temp(&zip_path)
         .with_context(|| format!("failed to validate and extract ZIP {}", zip_path.display()))?;
-    Ok(plan::plan_install(
-        &extracted,
-        addons_dir,
-        installed_addons,
-    )?)
+    let install_plan = plan::plan_install(&extracted, addons_dir, installed_addons)?;
+
+    Ok((install_plan, extracted, zip_path))
+}
+
+fn apply_prepared_install(
+    prepared: &PreparedRemoteInstall,
+    backup_dir: Option<&Path>,
+) -> Result<InstallResult> {
+    let mut aggregate = InstallResult::default();
+
+    for dependency in &prepared.dependency_installs {
+        let result = apply::apply_install_plan(&dependency.plan, backup_dir)?;
+        apply::merge_install_result(&mut aggregate, result);
+    }
+
+    let result = apply::apply_install_plan(&prepared.main_plan, backup_dir)?;
+    apply::merge_install_result(&mut aggregate, result);
+
+    Ok(aggregate)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -1257,6 +1338,77 @@ fn install_plan_json(plan: &InstallPlan) -> Value {
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+fn dependency_plan_json(prepared: &PreparedRemoteInstall) -> Value {
+    json!({
+        "main_addon": {
+            "uid": prepared.dependency_plan.main_addon.uid,
+            "name": prepared.dependency_plan.main_addon.name,
+        },
+        "required_dependencies": prepared.dependency_plan.required_dependencies.iter().map(dependency_entry_json).collect::<Vec<_>>(),
+        "optional_dependencies": prepared.dependency_plan.optional_dependencies.iter().map(dependency_entry_json).collect::<Vec<_>>(),
+        "install_items": dependency_install_items_json(prepared),
+    })
+}
+
+fn dependency_entry_json(entry: &dependencies::DependencyPlanEntry) -> Value {
+    json!({
+        "name": entry.name,
+        "constraint": entry.constraint,
+        "raw": entry.raw,
+        "status": entry.status.as_str(),
+        "remote_uid": entry.remote_uid,
+        "remote_name": entry.remote_name,
+        "installed_folder": entry.installed_folder,
+        "bundled_folder": entry.bundled_folder,
+    })
+}
+
+fn dependency_install_items_json(prepared: &PreparedRemoteInstall) -> Vec<Value> {
+    let mut items = prepared
+        .dependency_installs
+        .iter()
+        .map(|dependency| {
+            json!({
+                "role": "required-dependency",
+                "name": dependency.details.name.as_deref().unwrap_or(&dependency.remote_uid),
+                "remote_uid": dependency.remote_uid,
+                "remote_name": dependency.details.name,
+                "action": install_plan_action_summary(&dependency.plan),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    items.push(json!({
+        "role": "main-addon",
+        "name": prepared.details.name.as_deref().unwrap_or(&prepared.dependency_plan.main_addon.uid),
+        "remote_uid": prepared.dependency_plan.main_addon.uid,
+        "remote_name": prepared.details.name,
+        "action": install_plan_action_summary(&prepared.main_plan),
+    }));
+
+    items
+}
+
+fn install_plan_action_summary(plan: &InstallPlan) -> &'static str {
+    if plan
+        .items
+        .iter()
+        .any(|item| item.action == InstallPlanAction::WouldReplaceExisting)
+    {
+        "would-replace-existing"
+    } else if plan
+        .items
+        .iter()
+        .any(|item| item.action == InstallPlanAction::WouldInstallNew)
+    {
+        "would-install-new"
+    } else if let Some(item) = plan.items.first() {
+        item.action.as_str()
+    } else {
+        "empty"
+    }
 }
 
 fn install_result_json(result: &InstallResult) -> Value {
@@ -1890,6 +2042,64 @@ fn print_install_plan(plan: &InstallPlan, dry_run: bool) {
                 "Archive contains multiple addon folders; review all planned targets before real install support is added."
             );
         }
+    }
+}
+
+fn print_dependency_plan(plan: &DependencyPlan) {
+    if plan.required_dependencies.is_empty() && plan.optional_dependencies.is_empty() {
+        return;
+    }
+
+    println!("Required libraries:");
+    if plan.required_dependencies.is_empty() {
+        println!("  -");
+    } else {
+        for dependency in &plan.required_dependencies {
+            println!(
+                "  {:<28} {:<18} {}",
+                truncate(&dependency.name, 28),
+                dependency.status.as_str(),
+                dependency_detail(dependency)
+            );
+        }
+    }
+
+    if plan.has_unresolved_required_dependencies() {
+        println!();
+        println!("Some required dependencies could not be resolved.");
+    }
+
+    if !plan.optional_dependencies.is_empty() {
+        println!();
+        println!("Optional dependencies (not installed automatically):");
+        for dependency in &plan.optional_dependencies {
+            println!(
+                "  {:<28} {:<18} {}",
+                truncate(&dependency.name, 28),
+                dependency.status.as_str(),
+                dependency_detail(dependency)
+            );
+        }
+    }
+}
+
+fn dependency_detail(dependency: &dependencies::DependencyPlanEntry) -> String {
+    if let Some(folder) = dependency.installed_folder.as_deref() {
+        return format!("installed folder: {folder}");
+    }
+    if let Some(folder) = dependency.bundled_folder.as_deref() {
+        return format!("bundled folder: {folder}");
+    }
+    if let Some(uid) = dependency.remote_uid.as_deref() {
+        return format!(
+            "{} ({uid})",
+            dependency.remote_name.as_deref().unwrap_or("-")
+        );
+    }
+    if dependency.status == DependencyStatus::Ambiguous {
+        "multiple remote matches; not installed automatically".to_owned()
+    } else {
+        "no remote match; not installed automatically".to_owned()
     }
 }
 

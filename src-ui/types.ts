@@ -6,6 +6,7 @@ export interface LocalAddon {
   display_version: string | null;
   api_versions: string[];
   depends_on: string[];
+  optional_depends_on: string[];
   saved_variables: string[];
   saved_variables_per_character: string[];
   description: string | null;
@@ -188,6 +189,35 @@ export interface InstallPlanItem {
   action: string;
 }
 
+export interface DependencyPlanEntry {
+  name: string;
+  constraint: string | null;
+  raw: string;
+  status: "already-installed" | "will-install" | "not-installed" | "unresolved" | "ambiguous" | string;
+  remote_uid: string | null;
+  remote_name: string | null;
+  installed_folder: string | null;
+  bundled_folder: string | null;
+}
+
+export interface DependencyInstallItem {
+  role: "main-addon" | "required-dependency" | string;
+  name: string;
+  remote_uid: string | null;
+  remote_name: string | null;
+  action: string;
+}
+
+export interface DependencyPlan {
+  main_addon: {
+    uid: string;
+    name: string | null;
+  };
+  required_dependencies: DependencyPlanEntry[];
+  optional_dependencies: DependencyPlanEntry[];
+  install_items: DependencyInstallItem[];
+}
+
 export interface PlanRemoteInstallResponse {
   dry_run: boolean;
   applied: boolean;
@@ -198,6 +228,7 @@ export interface PlanRemoteInstallResponse {
     temp_dir: string;
     items: InstallPlanItem[];
   };
+  dependency_plan: DependencyPlan;
 }
 
 export interface InstallResultItem {
@@ -221,6 +252,7 @@ export interface InstallRemoteAddonResponse {
     temp_dir: string;
     items: InstallPlanItem[];
   };
+  dependency_plan: DependencyPlan;
   items: InstallResultItem[];
 }
 
@@ -240,6 +272,7 @@ export interface SingleUpdatePlanResponse {
     temp_dir: string;
     items: InstallPlanItem[];
   } | null;
+  dependency_plan: DependencyPlan | null;
 }
 
 export interface SingleUpdateApplyResponse {
@@ -256,6 +289,7 @@ export interface SingleUpdateApplyResponse {
     temp_dir: string;
     items: InstallPlanItem[];
   } | null;
+  dependency_plan: DependencyPlan | null;
   installed_new: number;
   replaced: number;
   skipped: number;
@@ -302,6 +336,7 @@ export interface UpdateAllResult {
     temp_dir: string;
     items: InstallPlanItem[];
   };
+  dependency_plan: DependencyPlan;
   installed_new: number;
   replaced: number;
   skipped: number;

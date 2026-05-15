@@ -11,11 +11,10 @@ use eso_addon_manager::install::apply::{
     self, InstallActionPerformed, InstallResult, InstalledItem,
 };
 use eso_addon_manager::install::backup::{self, ManualBackupResult};
+use eso_addon_manager::install::dependencies::{self, DependencyPlan, DependencyStatus};
 use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanAction, InstallPlanItem};
 use eso_addon_manager::install::remote;
-use eso_addon_manager::install::remove::{
-    self, ClearSavedVariablesResult, RemoveAddonResult,
-};
+use eso_addon_manager::install::remove::{self, ClearSavedVariablesResult, RemoveAddonResult};
 use eso_addon_manager::install::update;
 use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
@@ -230,6 +229,7 @@ struct PlanRemoteInstallResponse {
     remote: AddonDetailsDto,
     addons_dir: String,
     plan: InstallPlanDto,
+    dependency_plan: DependencyPlanDto,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,6 +242,7 @@ struct InstallRemoteAddonResponse {
     remote: AddonDetailsDto,
     addons_dir: String,
     plan: InstallPlanDto,
+    dependency_plan: DependencyPlanDto,
     items: Vec<InstalledItemDto>,
 }
 
@@ -258,6 +259,7 @@ struct SingleUpdatePlanResponse {
     remote_details: Option<AddonDetailsDto>,
     addons_dir: String,
     plan: Option<InstallPlanDto>,
+    dependency_plan: Option<DependencyPlanDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +273,7 @@ struct SingleUpdateApplyResponse {
     remote_details: Option<AddonDetailsDto>,
     addons_dir: String,
     plan: Option<InstallPlanDto>,
+    dependency_plan: Option<DependencyPlanDto>,
     installed_new: usize,
     replaced: usize,
     skipped: usize,
@@ -363,6 +366,41 @@ struct InstallPlanItemDto {
 }
 
 #[derive(Debug, Serialize)]
+struct DependencyPlanDto {
+    main_addon: DependencyPlanMainDto,
+    required_dependencies: Vec<DependencyPlanEntryDto>,
+    optional_dependencies: Vec<DependencyPlanEntryDto>,
+    install_items: Vec<DependencyInstallItemDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyPlanMainDto {
+    uid: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyPlanEntryDto {
+    name: String,
+    constraint: Option<String>,
+    raw: String,
+    status: String,
+    remote_uid: Option<String>,
+    remote_name: Option<String>,
+    installed_folder: Option<String>,
+    bundled_folder: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DependencyInstallItemDto {
+    role: String,
+    name: String,
+    remote_uid: Option<String>,
+    remote_name: Option<String>,
+    action: String,
+}
+
+#[derive(Debug, Serialize)]
 struct PlanUpdateAllResponse {
     dry_run: bool,
     applied: bool,
@@ -419,6 +457,7 @@ struct UpdateAllResultDto {
     target: PlannedActionDto,
     remote_details: AddonDetailsDto,
     plan: InstallPlanDto,
+    dependency_plan: DependencyPlanDto,
     installed_new: usize,
     replaced: usize,
     skipped: usize,
@@ -476,6 +515,14 @@ struct CachedImageResponse {
 
 struct PreparedRemoteInstall {
     details: AddonDetails,
+    main_plan: InstallPlan,
+    dependency_plan: DependencyPlan,
+    dependency_installs: Vec<PreparedDependencyInstall>,
+}
+
+struct PreparedDependencyInstall {
+    details: AddonDetails,
+    remote_uid: String,
     plan: InstallPlan,
 }
 
@@ -517,12 +564,8 @@ async fn remove_installed_addon(
     remove_saved_variables: bool,
 ) -> Result<RemoveInstalledAddonResponse, String> {
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
-    let result = remove::remove_installed_addon(
-        &addons_dir,
-        &folder_name,
-        remove_saved_variables,
-    )
-    .map_err(to_string_error)?;
+    let result = remove::remove_installed_addon(&addons_dir, &folder_name, remove_saved_variables)
+        .map_err(to_string_error)?;
     remove_installed_metadata(&addons_dir, &result.addon_folder).map_err(to_string_error)?;
 
     Ok(remove_installed_addon_response(&result))
@@ -548,12 +591,8 @@ async fn create_manual_backup(
 ) -> Result<ManualBackupResponse, String> {
     let addons_dir = resolve_addons_dir(addons_path.as_deref()).map_err(to_string_error)?;
     let backup_dir = required_path(&backup_dir, "backup folder").map_err(to_string_error)?;
-    let result = backup::create_manual_backup(
-        &addons_dir,
-        &backup_dir,
-        include_saved_variables,
-    )
-    .map_err(to_string_error)?;
+    let result = backup::create_manual_backup(&addons_dir, &backup_dir, include_saved_variables)
+        .map_err(to_string_error)?;
 
     Ok(manual_backup_response(&result))
 }
@@ -810,7 +849,8 @@ async fn open_addon_folder(
     path: Option<String>,
 ) -> Result<(), String> {
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
-    let target = resolve_addon_folder_for_open(&addons_dir, &folder_name).map_err(to_string_error)?;
+    let target =
+        resolve_addon_folder_for_open(&addons_dir, &folder_name).map_err(to_string_error)?;
     app.opener()
         .open_path(path_string(&target), None::<&str>)
         .map_err(to_string_error)
@@ -944,7 +984,7 @@ async fn apply_update_all(
             )
         })?;
         let prepared = prepare_remote_install_plan(&client, remote_uid, &addons_dir).await?;
-        validate_single_update_plan(&prepared.plan, &target.local_folder)
+        validate_single_update_plan(&prepared.main_plan, &target.local_folder)
             .map_err(to_string_error)?;
 
         if keep_download.unwrap_or(false) {
@@ -957,21 +997,20 @@ async fn apply_update_all(
             .await?;
         }
 
-        let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
-            .map_err(|error| format!("failed to update {}: {}", target.local_folder, error))?;
-        record_installed_metadata(
+        let result = apply_prepared_remote_install(
             &addons_dir,
-            &prepared.details,
+            &prepared,
             remote_uid,
-            &result,
+            backup_dir.as_deref(),
             "update-all",
         )
-        .map_err(to_string_error)?;
+        .map_err(|error| format!("failed to update {}: {}", target.local_folder, error))?;
 
         results.push(UpdateAllResultDto {
             target: planned_action_dto(target, &load_installed_metadata(&addons_dir)),
             remote_details: addon_details_dto(&prepared.details),
-            plan: install_plan_dto(&prepared.plan),
+            plan: install_plan_dto(&prepared.main_plan),
+            dependency_plan: dependency_plan_dto(&prepared),
             installed_new: result.installed_new,
             replaced: result.replaced,
             skipped: result.skipped,
@@ -1004,7 +1043,8 @@ async fn plan_remote_install(
         applied: false,
         remote: addon_details_dto(&prepared.details),
         addons_dir: path_string(&addons_dir),
-        plan: install_plan_dto(&prepared.plan),
+        plan: install_plan_dto(&prepared.main_plan),
+        dependency_plan: dependency_plan_dto(&prepared),
     })
 }
 
@@ -1032,20 +1072,18 @@ async fn install_remote_addon(
         .await?;
     }
 
-    let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
-        .map_err(to_string_error)?;
-    record_installed_metadata(
+    let result = apply_prepared_remote_install(
         &addons_dir,
-        &prepared.details,
+        &prepared,
         &addon_id,
-        &result,
+        backup_dir.as_deref(),
         "remote-install",
     )
     .map_err(to_string_error)?;
     Ok(install_remote_addon_response(
         &prepared.details,
         &addons_dir,
-        &prepared.plan,
+        &prepared,
         &result,
     ))
 }
@@ -1063,7 +1101,7 @@ async fn install_remote_addon_new_only(
     let download_dir = optional_path(download_dir);
     let client = ApiClient::new().map_err(to_string_error)?;
     let prepared = prepare_remote_install_plan(&client, &addon_id, &addons_dir).await?;
-    validate_new_only_install_plan(&prepared.plan)?;
+    validate_new_only_prepared_install(&prepared)?;
 
     if keep_download.unwrap_or(false) {
         keep_remote_download(
@@ -1075,20 +1113,18 @@ async fn install_remote_addon_new_only(
         .await?;
     }
 
-    let result =
-        apply::apply_install_plan(&prepared.plan, backup_dir.as_deref()).map_err(to_string_error)?;
-    record_installed_metadata(
+    let result = apply_prepared_remote_install(
         &addons_dir,
-        &prepared.details,
+        &prepared,
         &addon_id,
-        &result,
+        backup_dir.as_deref(),
         "remote-install",
     )
     .map_err(to_string_error)?;
     Ok(install_remote_addon_response(
         &prepared.details,
         &addons_dir,
-        &prepared.plan,
+        &prepared,
         &result,
     ))
 }
@@ -1121,6 +1157,7 @@ async fn plan_single_update(
             remote_details: None,
             addons_dir: path_string(&addons_dir),
             plan: None,
+            dependency_plan: None,
         });
     }
 
@@ -1130,7 +1167,7 @@ async fn plan_single_update(
         .and_then(|remote| remote.uid.as_deref())
         .ok_or_else(|| "selected addon has no clean remote UID".to_owned())?;
     let prepared = prepare_remote_install_plan(&client, remote_uid, &addons_dir).await?;
-    validate_single_update_plan(&prepared.plan, &selected.local.folder_name)
+    validate_single_update_plan(&prepared.main_plan, &selected.local.folder_name)
         .map_err(to_string_error)?;
 
     Ok(SingleUpdatePlanResponse {
@@ -1144,7 +1181,8 @@ async fn plan_single_update(
         reason: None,
         remote_details: Some(addon_details_dto(&prepared.details)),
         addons_dir: path_string(&addons_dir),
-        plan: Some(install_plan_dto(&prepared.plan)),
+        plan: Some(install_plan_dto(&prepared.main_plan)),
+        dependency_plan: Some(dependency_plan_dto(&prepared)),
     })
 }
 
@@ -1179,6 +1217,7 @@ async fn apply_single_update(
             remote_details: None,
             addons_dir: path_string(&addons_dir),
             plan: None,
+            dependency_plan: None,
             installed_new: 0,
             replaced: 0,
             skipped: 0,
@@ -1193,7 +1232,7 @@ async fn apply_single_update(
         .and_then(|remote| remote.uid.as_deref())
         .ok_or_else(|| "selected addon has no clean remote UID".to_owned())?;
     let prepared = prepare_remote_install_plan(&client, remote_uid, &addons_dir).await?;
-    validate_single_update_plan(&prepared.plan, &selected.local.folder_name)
+    validate_single_update_plan(&prepared.main_plan, &selected.local.folder_name)
         .map_err(to_string_error)?;
 
     if keep_download.unwrap_or(false) {
@@ -1206,13 +1245,11 @@ async fn apply_single_update(
         .await?;
     }
 
-    let result = apply::apply_install_plan(&prepared.plan, backup_dir.as_deref())
-        .map_err(to_string_error)?;
-    record_installed_metadata(
+    let result = apply_prepared_remote_install(
         &addons_dir,
-        &prepared.details,
+        &prepared,
         remote_uid,
-        &result,
+        backup_dir.as_deref(),
         "update",
     )
     .map_err(to_string_error)?;
@@ -1222,7 +1259,7 @@ async fn apply_single_update(
         &decision,
         &prepared.details,
         &addons_dir,
-        &prepared.plan,
+        &prepared,
         &result,
     ))
 }
@@ -1434,7 +1471,11 @@ fn browse_remote_results(
         .collect()
 }
 
-fn compare_remote_addons(left: &AddonSummary, right: &AddonSummary, mode: BrowseMode) -> std::cmp::Ordering {
+fn compare_remote_addons(
+    left: &AddonSummary,
+    right: &AddonSummary,
+    mode: BrowseMode,
+) -> std::cmp::Ordering {
     let primary = match mode {
         BrowseMode::MostDownloaded => right
             .downloads()
@@ -1446,7 +1487,8 @@ fn compare_remote_addons(left: &AddonSummary, right: &AddonSummary, mode: Browse
     primary
         .then_with(|| right.date.unwrap_or(0).cmp(&left.date.unwrap_or(0)))
         .then_with(|| {
-            right.downloads()
+            right
+                .downloads()
                 .unwrap_or(-1)
                 .cmp(&left.downloads().unwrap_or(-1))
         })
@@ -1583,7 +1625,10 @@ fn addon_summary_dto_with_local_state(
     dto
 }
 
-fn remote_local_state(path: Option<&str>, remote_addons: &[AddonSummary]) -> anyhow::Result<RemoteLocalState> {
+fn remote_local_state(
+    path: Option<&str>,
+    remote_addons: &[AddonSummary],
+) -> anyhow::Result<RemoteLocalState> {
     let addons_dir = resolve_addons_dir(path)?;
     let local_addons = local::scan_addons_dir(&addons_dir)?;
     let metadata = load_installed_metadata(&addons_dir);
@@ -2110,6 +2155,115 @@ fn install_plan_item_dto(item: &InstallPlanItem) -> InstallPlanItemDto {
     }
 }
 
+fn dependency_plan_dto(prepared: &PreparedRemoteInstall) -> DependencyPlanDto {
+    DependencyPlanDto {
+        main_addon: DependencyPlanMainDto {
+            uid: prepared.dependency_plan.main_addon.uid.clone(),
+            name: prepared.dependency_plan.main_addon.name.clone(),
+        },
+        required_dependencies: prepared
+            .dependency_plan
+            .required_dependencies
+            .iter()
+            .map(dependency_plan_entry_dto)
+            .collect(),
+        optional_dependencies: prepared
+            .dependency_plan
+            .optional_dependencies
+            .iter()
+            .map(dependency_plan_entry_dto)
+            .collect(),
+        install_items: dependency_install_items_dto(prepared),
+    }
+}
+
+fn dependency_plan_entry_dto(entry: &dependencies::DependencyPlanEntry) -> DependencyPlanEntryDto {
+    DependencyPlanEntryDto {
+        name: entry.name.clone(),
+        constraint: entry.constraint.clone(),
+        raw: entry.raw.clone(),
+        status: entry.status.as_str().to_owned(),
+        remote_uid: entry.remote_uid.clone(),
+        remote_name: entry.remote_name.clone(),
+        installed_folder: entry.installed_folder.clone(),
+        bundled_folder: entry.bundled_folder.clone(),
+    }
+}
+
+fn dependency_install_items_dto(prepared: &PreparedRemoteInstall) -> Vec<DependencyInstallItemDto> {
+    let mut items = prepared
+        .dependency_installs
+        .iter()
+        .map(|dependency| DependencyInstallItemDto {
+            role: "required-dependency".to_owned(),
+            name: dependency
+                .details
+                .name
+                .clone()
+                .unwrap_or_else(|| dependency.remote_uid.clone()),
+            remote_uid: Some(dependency.remote_uid.clone()),
+            remote_name: dependency.details.name.clone(),
+            action: install_plan_action_summary(&dependency.plan).to_owned(),
+        })
+        .collect::<Vec<_>>();
+
+    items.push(DependencyInstallItemDto {
+        role: "main-addon".to_owned(),
+        name: prepared
+            .details
+            .name
+            .clone()
+            .unwrap_or_else(|| prepared.dependency_plan.main_addon.uid.clone()),
+        remote_uid: Some(prepared.dependency_plan.main_addon.uid.clone()),
+        remote_name: prepared.details.name.clone(),
+        action: install_plan_action_summary(&prepared.main_plan).to_owned(),
+    });
+
+    items
+}
+
+fn install_plan_action_summary(plan: &InstallPlan) -> &'static str {
+    if plan
+        .items
+        .iter()
+        .any(|item| item.action == InstallPlanAction::WouldReplaceExisting)
+    {
+        "would-replace-existing"
+    } else if plan
+        .items
+        .iter()
+        .any(|item| item.action == InstallPlanAction::WouldInstallNew)
+    {
+        "would-install-new"
+    } else if let Some(item) = plan.items.first() {
+        item.action.as_str()
+    } else {
+        "empty"
+    }
+}
+
+fn validate_new_only_prepared_install(prepared: &PreparedRemoteInstall) -> Result<(), String> {
+    if prepared
+        .dependency_plan
+        .required_dependencies
+        .iter()
+        .any(|dependency| {
+            matches!(
+                dependency.status,
+                DependencyStatus::Unresolved | DependencyStatus::Ambiguous
+            )
+        })
+    {
+        return Err("Some required dependencies could not be resolved.".to_owned());
+    }
+
+    for dependency in &prepared.dependency_installs {
+        validate_new_only_install_plan(&dependency.plan)?;
+    }
+
+    validate_new_only_install_plan(&prepared.main_plan)
+}
+
 fn validate_new_only_install_plan(plan: &InstallPlan) -> Result<(), String> {
     if plan.items.is_empty() {
         return Err("install plan has no valid addon folders to install".to_owned());
@@ -2136,11 +2290,69 @@ async fn prepare_remote_install_plan(
 ) -> Result<PreparedRemoteInstall, String> {
     let installed_addons =
         scan_installed_addons_for_install(addons_dir).map_err(to_string_error)?;
+    let installed_metadata = load_installed_metadata(addons_dir);
+    let installed_remotes = installed_remote_addons(&installed_metadata);
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
     let details = client
         .eso_file_details_fresh(addon_id)
         .await
         .map_err(to_string_error)?;
-    let download_url = remote::download_url(&details).map_err(to_string_error)?;
+    let (install_plan, extracted) =
+        prepare_remote_package(client, &details, addon_id, addons_dir, &installed_addons).await?;
+    let dependency_plan = dependencies::build_dependency_plan(
+        dependencies::RemoteAddonRef {
+            uid: addon_id.to_owned(),
+            name: details.name.clone(),
+        },
+        &extracted,
+        &installed_addons,
+        &remote_addons,
+        &installed_remotes,
+    );
+
+    let dependency_uids = dependency_plan
+        .required_dependencies_to_install()
+        .into_iter()
+        .filter_map(|dependency| dependency.remote_uid.clone())
+        .collect::<Vec<_>>();
+    let mut dependency_installs = Vec::new();
+
+    for remote_uid in dependency_uids {
+        let dependency_details = client
+            .eso_file_details_fresh(&remote_uid)
+            .await
+            .map_err(to_string_error)?;
+        let (plan, _) = prepare_remote_package(
+            client,
+            &dependency_details,
+            &remote_uid,
+            addons_dir,
+            &installed_addons,
+        )
+        .await?;
+        dependency_installs.push(PreparedDependencyInstall {
+            details: dependency_details,
+            remote_uid,
+            plan,
+        });
+    }
+
+    Ok(PreparedRemoteInstall {
+        details,
+        main_plan: install_plan,
+        dependency_plan,
+        dependency_installs,
+    })
+}
+
+async fn prepare_remote_package(
+    client: &ApiClient,
+    details: &AddonDetails,
+    _addon_id: &str,
+    addons_dir: &std::path::Path,
+    installed_addons: &[LocalAddon],
+) -> Result<(InstallPlan, zip_safety::ExtractedZip), String> {
+    let download_url = remote::download_url(details).map_err(to_string_error)?;
     let bytes = client
         .download_bytes(download_url)
         .await
@@ -2155,12 +2367,9 @@ async fn prepare_remote_install_plan(
     std::fs::write(temp_file.path(), &bytes).map_err(to_string_error)?;
     let extracted = zip_safety::extract_zip_to_temp(temp_file.path()).map_err(to_string_error)?;
     let install_plan =
-        plan::plan_install(&extracted, addons_dir, &installed_addons).map_err(to_string_error)?;
+        plan::plan_install(&extracted, addons_dir, installed_addons).map_err(to_string_error)?;
 
-    Ok(PreparedRemoteInstall {
-        details,
-        plan: install_plan,
-    })
+    Ok((install_plan, extracted))
 }
 
 async fn build_update_all_plan_for_ui(
@@ -2211,6 +2420,24 @@ fn load_installed_metadata(addons_dir: &std::path::Path) -> InstalledMetadata {
         .unwrap_or_default()
 }
 
+fn installed_remote_addons(
+    metadata: &InstalledMetadata,
+) -> Vec<dependencies::InstalledRemoteAddon> {
+    metadata
+        .addons
+        .iter()
+        .filter_map(|(folder_name, metadata)| {
+            metadata
+                .remote_uid
+                .as_ref()
+                .map(|remote_uid| dependencies::InstalledRemoteAddon {
+                    folder_name: folder_name.clone(),
+                    remote_uid: remote_uid.clone(),
+                })
+        })
+        .collect()
+}
+
 fn ensure_first_run_baseline_complete(
     addons_dir: &std::path::Path,
     matches: &[MatchResult],
@@ -2255,7 +2482,10 @@ fn save_installed_metadata(
     Ok(())
 }
 
-fn remove_installed_metadata(addons_dir: &std::path::Path, folder_name: &str) -> anyhow::Result<()> {
+fn remove_installed_metadata(
+    addons_dir: &std::path::Path,
+    folder_name: &str,
+) -> anyhow::Result<()> {
     let mut metadata = load_installed_metadata(addons_dir);
     let matching_key = metadata
         .addons
@@ -2385,10 +2615,48 @@ fn record_installed_metadata(
     save_installed_metadata(addons_dir, &metadata)
 }
 
+fn apply_prepared_remote_install(
+    addons_dir: &std::path::Path,
+    prepared: &PreparedRemoteInstall,
+    main_remote_uid: &str,
+    backup_dir: Option<&std::path::Path>,
+    source: &str,
+) -> Result<InstallResult, String> {
+    let mut aggregate = InstallResult::default();
+
+    for dependency in &prepared.dependency_installs {
+        let result =
+            apply::apply_install_plan(&dependency.plan, backup_dir).map_err(to_string_error)?;
+        record_installed_metadata(
+            addons_dir,
+            &dependency.details,
+            &dependency.remote_uid,
+            &result,
+            "dependency-install",
+        )
+        .map_err(to_string_error)?;
+        apply::merge_install_result(&mut aggregate, result);
+    }
+
+    let result =
+        apply::apply_install_plan(&prepared.main_plan, backup_dir).map_err(to_string_error)?;
+    record_installed_metadata(
+        addons_dir,
+        &prepared.details,
+        main_remote_uid,
+        &result,
+        source,
+    )
+    .map_err(to_string_error)?;
+    apply::merge_install_result(&mut aggregate, result);
+
+    Ok(aggregate)
+}
+
 fn install_remote_addon_response(
     details: &AddonDetails,
     addons_dir: &std::path::Path,
-    plan: &InstallPlan,
+    prepared: &PreparedRemoteInstall,
     result: &InstallResult,
 ) -> InstallRemoteAddonResponse {
     InstallRemoteAddonResponse {
@@ -2399,7 +2667,8 @@ fn install_remote_addon_response(
         backup_dir: result.backup_dir.as_ref().map(|path| path_string(path)),
         remote: addon_details_dto(details),
         addons_dir: path_string(addons_dir),
-        plan: install_plan_dto(plan),
+        plan: install_plan_dto(&prepared.main_plan),
+        dependency_plan: dependency_plan_dto(prepared),
         items: result.items.iter().map(installed_item_dto).collect(),
     }
 }
@@ -2410,7 +2679,7 @@ fn single_update_apply_response(
     decision: &update::UpdateDecision,
     details: &AddonDetails,
     addons_dir: &std::path::Path,
-    plan: &InstallPlan,
+    prepared: &PreparedRemoteInstall,
     result: &InstallResult,
 ) -> SingleUpdateApplyResponse {
     SingleUpdateApplyResponse {
@@ -2422,7 +2691,8 @@ fn single_update_apply_response(
         reason: None,
         remote_details: Some(addon_details_dto(details)),
         addons_dir: path_string(addons_dir),
-        plan: Some(install_plan_dto(plan)),
+        plan: Some(install_plan_dto(&prepared.main_plan)),
+        dependency_plan: Some(dependency_plan_dto(prepared)),
         installed_new: result.installed_new,
         replaced: result.replaced,
         skipped: result.skipped,
@@ -2454,7 +2724,9 @@ fn remove_installed_addon_response(result: &RemoveAddonResult) -> RemoveInstalle
     }
 }
 
-fn clear_saved_variables_response(result: &ClearSavedVariablesResult) -> ClearSavedVariablesResponse {
+fn clear_saved_variables_response(
+    result: &ClearSavedVariablesResult,
+) -> ClearSavedVariablesResponse {
     ClearSavedVariablesResponse {
         addon_folder: result.addon_folder.clone(),
         saved_variables_dir: path_string(&result.saved_variables_dir),
@@ -2815,7 +3087,10 @@ mod tests {
 
         let target = resolve_addon_folder_for_open(&addons_dir, "ExampleAddon").unwrap();
 
-        assert_eq!(target, std::fs::canonicalize(addons_dir.join("ExampleAddon")).unwrap());
+        assert_eq!(
+            target,
+            std::fs::canonicalize(addons_dir.join("ExampleAddon")).unwrap()
+        );
     }
 
     #[test]
@@ -2999,7 +3274,8 @@ mod tests {
             test_addon_summary("3", "Mid", "25", 110, "17", "Graphic UI Mods"),
         ];
 
-        let results = browse_remote_results(&addons, &[], None, BrowseMode::MostDownloaded, None, "", 2);
+        let results =
+            browse_remote_results(&addons, &[], None, BrowseMode::MostDownloaded, None, "", 2);
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].uid.as_deref(), Some("2"));
@@ -3038,7 +3314,8 @@ mod tests {
             ),
         ];
 
-        let results = browse_remote_results(&addons, &[], None, BrowseMode::Recent, None, "combat", 25);
+        let results =
+            browse_remote_results(&addons, &[], None, BrowseMode::Recent, None, "combat", 25);
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].uid.as_deref(), Some("2"));
@@ -3119,13 +3396,17 @@ mod tests {
             "25",
             "Combat Mods",
         )];
-        let state = test_remote_local_state(local_addons, InstalledMetadata::default(), &remote_addons);
+        let state =
+            test_remote_local_state(local_addons, InstalledMetadata::default(), &remote_addons);
 
         let result = remote_addon_match("9001", &remote_addons, &state).expect("installed match");
 
         assert_eq!(result.local.folder_name, "HARDCORE");
         assert_eq!(
-            result.remote.as_ref().and_then(|remote| remote.uid.as_deref()),
+            result
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.uid.as_deref()),
             Some("9001")
         );
     }
@@ -3180,15 +3461,7 @@ mod tests {
         category_id: &str,
         category_name: &str,
     ) -> AddonSummary {
-        test_addon_summary_with_summary(
-            uid,
-            name,
-            downloads,
-            date,
-            category_id,
-            category_name,
-            "",
-        )
+        test_addon_summary_with_summary(uid, name, downloads, date, category_id, category_name, "")
     }
 
     fn test_addon_summary_with_summary(

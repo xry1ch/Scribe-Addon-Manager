@@ -247,18 +247,10 @@ fn split_values(value: &str) -> Vec<String> {
 }
 
 fn split_dependency_values(value: &str) -> Vec<String> {
-    let values: Vec<String> = value
-        .split(|ch| ch == ',' || ch == ';')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-
-    if values.is_empty() && !value.trim().is_empty() {
-        vec![value.trim().to_owned()]
-    } else {
-        values
-    }
+    crate::install::dependencies::parse_dependency_values(value)
+        .into_iter()
+        .map(|dependency| dependency.raw)
+        .collect()
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -312,6 +304,16 @@ mod tests {
         let manifest = parse_manifest_text("## DependsOn: LibAddonMenu-2.0 >= 28");
 
         assert_eq!(manifest.depends_on, vec!["LibAddonMenu-2.0 >= 28"]);
+    }
+
+    #[test]
+    fn splits_multiple_dependencies_with_constraints() {
+        let manifest = parse_manifest_text("## DependsOn: LibDebugLogger LibAddonMenu-2.0>=41");
+
+        assert_eq!(
+            manifest.depends_on,
+            vec!["LibDebugLogger", "LibAddonMenu-2.0>=41"]
+        );
     }
 
     #[test]

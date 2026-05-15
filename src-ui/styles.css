@@ -1522,6 +1522,88 @@ input::placeholder {
   white-space: nowrap;
 }
 
+.dependency-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.dependency-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dependency-heading h4 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 13px;
+}
+
+.dependency-heading span,
+.muted-text {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.dependency-list {
+  display: grid;
+  gap: 8px;
+}
+
+.dependency-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(96px, 140px) minmax(110px, 200px);
+  gap: 10px;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.54);
+}
+
+.dependency-row strong,
+.dependency-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dependency-row.is-planned {
+  border-color: rgba(56, 189, 248, 0.42);
+}
+
+.dependency-row.is-installed {
+  border-color: rgba(34, 197, 94, 0.38);
+}
+
+.dependency-row.is-warning {
+  border-color: rgba(245, 158, 11, 0.48);
+}
+
+.dependency-row.is-muted {
+  opacity: 0.78;
+}
+
+.dependency-optional {
+  color: var(--muted);
+}
+
+.dependency-optional summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.dependency-optional .dependency-list {
+  margin-top: 8px;
+}
+
 .empty-state {
   padding: 28px;
   color: var(--muted);
@@ -1757,6 +1839,7 @@ input::placeholder {
   .addon-card,
   .meta-grid,
   .summary,
+  .dependency-row,
   .settings-grid {
     grid-template-columns: 1fr;
   }
