@@ -274,6 +274,26 @@ export interface RemoveInstalledAddonResponse {
   message: string;
 }
 
+export interface ClearSavedVariablesResponse {
+  addon_folder: string;
+  saved_variables_dir: string;
+  deleted_count: number;
+  deleted_files: string[];
+  missing_files: string[];
+  status: "deleted" | "missing_saved_variables_folder" | "no_files_found";
+  message: string;
+}
+
+export interface ManualBackupResponse {
+  backup_path: string;
+  backup_name: string;
+  copied_addons: boolean;
+  copied_saved_variables: boolean;
+  saved_variables_missing: boolean;
+  total_files: number;
+  total_bytes: number;
+}
+
 export interface UpdateAllResult {
   target: PlannedAction;
   remote_details: AddonDetails;

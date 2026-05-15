@@ -3,6 +3,7 @@ use std::path::{Component, Path};
 use thiserror::Error;
 
 pub mod apply;
+pub mod backup;
 pub mod plan;
 pub mod remote;
 pub mod remove;

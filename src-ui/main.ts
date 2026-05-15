@@ -14,11 +14,13 @@ import type {
   BrowseRemoteAddonsResponse,
   CachedImageResponse,
   CheckAddonsResponse,
+  ClearSavedVariablesResponse,
   HttpCacheStatsResponse,
   ImportExistingAddonsResponse,
   InstallRemoteAddonResponse,
   InstalledAddonsResponse,
   LocalAddon,
+  ManualBackupResponse,
   MatchResult,
   PlannedAction,
   PlanRemoteInstallResponse,
@@ -37,7 +39,8 @@ type DetailsTab = "info" | "changelog";
 type InstalledFilter = "all" | "update" | "unknown" | "current";
 type InstalledSort = "name" | "updated" | "downloads" | "status";
 type SearchMode = "most_downloaded" | "recent";
-type IconName = "check" | "external" | "folder" | "rotate" | "target";
+type IconName = "check" | "external" | "folder" | "installed" | "rotate" | "search" | "settings" | "target";
+type AddonContextAction = "uninstall" | "clear-savedvariables" | "open-folder";
 type OperationKind =
   | "general"
   | "startup"
@@ -51,6 +54,8 @@ type OperationKind =
   | "update-plan"
   | "update-apply"
   | "remove-apply"
+  | "savedvariables-clear"
+  | "manual-backup"
   | "update-all-plan"
   | "update-all-apply";
 
@@ -61,6 +66,7 @@ interface AppState {
   operation: OperationKind | null;
   operationTarget: string | null;
   error: string | null;
+  success: string | null;
   warning: string | null;
   installed: InstalledAddonsResponse | null;
   searchQuery: string;
@@ -92,7 +98,13 @@ interface AppState {
   singleUpdateResult: SingleUpdateApplyResponse | null;
   removeResult: RemoveInstalledAddonResponse | null;
   removeConfirmLocal: LocalAddon | null;
-  removeSavedVariables: boolean;
+  clearSavedVariablesResult: ClearSavedVariablesResponse | null;
+  clearSavedVariablesConfirmLocal: LocalAddon | null;
+  manualBackupConfirmOpen: boolean;
+  manualBackupIncludeSavedVariables: boolean;
+  manualBackupResult: ManualBackupResponse | null;
+  manualBackupError: string | null;
+  addonContextMenu: AddonContextMenuState | null;
   updateAllPlan: PlanUpdateAllResponse | null;
   updateAllResult: ApplyUpdateAllResponse | null;
   settings: AppSettings | null;
@@ -112,6 +124,12 @@ interface InstalledViewModel {
   match: MatchResult | null;
 }
 
+interface AddonContextMenuState {
+  folderName: string;
+  x: number;
+  y: number;
+}
+
 interface CategoryMeta {
   name: string;
   x: number;
@@ -125,6 +143,7 @@ const state: AppState = {
   operation: null,
   operationTarget: null,
   error: null,
+  success: null,
   warning: null,
   installed: null,
   searchQuery: "",
@@ -156,7 +175,13 @@ const state: AppState = {
   singleUpdateResult: null,
   removeResult: null,
   removeConfirmLocal: null,
-  removeSavedVariables: false,
+  clearSavedVariablesResult: null,
+  clearSavedVariablesConfirmLocal: null,
+  manualBackupConfirmOpen: false,
+  manualBackupIncludeSavedVariables: false,
+  manualBackupResult: null,
+  manualBackupError: null,
+  addonContextMenu: null,
   updateAllPlan: null,
   updateAllResult: null,
   settings: null,
@@ -178,9 +203,37 @@ if (!appRoot) {
 }
 
 const app = appRoot;
+const ADDON_CONTEXT_MENU_WIDTH = 224;
+const ADDON_CONTEXT_MENU_HEIGHT = 132;
+const CONTEXT_MENU_MARGIN = 8;
+
+document.addEventListener("contextmenu", handleGlobalContextMenu);
+document.addEventListener("pointerdown", (event) => {
+  if (!state.addonContextMenu) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest(".addon-context-menu")) return;
+  closeAddonContextMenu();
+});
+window.addEventListener("blur", () => closeAddonContextMenu());
+window.addEventListener("resize", () => closeAddonContextMenu());
 
 window.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (state.addonContextMenu) {
+    event.preventDefault();
+    closeAddonContextMenu();
+    return;
+  }
+  if (state.clearSavedVariablesConfirmLocal && !guardedOperationRunning()) {
+    event.preventDefault();
+    cancelClearSavedVariables();
+    return;
+  }
+  if (state.manualBackupConfirmOpen && !guardedOperationRunning()) {
+    event.preventDefault();
+    cancelManualBackup();
+    return;
+  }
   if (state.removeConfirmLocal && !guardedOperationRunning()) {
     event.preventDefault();
     cancelRemoveAddon();
@@ -222,10 +275,14 @@ function render() {
       </aside>
       <section class="content">
         ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
+        ${state.success ? `<div class="banner success compact-banner">${escapeHtml(state.success)}</div>` : ""}
         ${state.warning ? `<div class="banner warning">${escapeHtml(state.warning)}</div>` : ""}
         ${renderCurrentTab()}
         ${renderDetailsModal()}
         ${renderRemoveConfirmationModal()}
+        ${renderClearSavedVariablesConfirmationModal()}
+        ${renderManualBackupConfirmationModal()}
+        ${renderAddonContextMenu()}
       </section>
     </main>
   `;
@@ -297,20 +354,74 @@ function renderRemoveConfirmationModal() {
       <section class="modal-panel remove-confirmation-panel" role="dialog" aria-modal="true" aria-labelledby="remove-addon-title">
         <div class="modal-icon danger-icon">${icon("target")}</div>
         <div class="modal-content">
-          <h2 id="remove-addon-title">Remove addon?</h2>
-          <p>This will delete the addon folder from AddOns.</p>
+          <h2 id="remove-addon-title">Uninstall addon?</h2>
+          <p>This will delete the addon folder from AddOns. SavedVariables will not be touched.</p>
           <p class="modal-path" title="${escapeAttr(local.folder_name)}">${escapeHtml(local.folder_name)}</p>
-          <label class="checkbox-line remove-savedvariables-option">
-            <input id="remove-savedvariables" type="checkbox" ${state.removeSavedVariables ? "checked" : ""} ${disabledAttr()} />
-            <span>Also delete SavedVariables for this addon</span>
-          </label>
-          <p class="helper-text">SavedVariables store addon settings and character/account data. Leave this unchecked to keep your settings.</p>
         </div>
         <div class="modal-actions">
           <button class="secondary" id="cancel-remove-addon" ${disabledAttr()}>Cancel</button>
-          <button class="danger" id="confirm-remove-addon" ${disabledAttr()}>${loadingButtonContent("Remove addon", "Removing...", "remove-apply")}</button>
+          <button class="danger" id="confirm-remove-addon" ${disabledAttr()}>${loadingButtonContent("Uninstall", "Uninstalling...", "remove-apply")}</button>
         </div>
       </section>
+    </div>
+  `;
+}
+
+function renderClearSavedVariablesConfirmationModal() {
+  const local = state.clearSavedVariablesConfirmLocal;
+  if (!local) return "";
+  return `
+    <div class="modal-backdrop remove-confirmation" role="presentation">
+      <section class="modal-panel remove-confirmation-panel" role="dialog" aria-modal="true" aria-labelledby="clear-savedvariables-title">
+        <div class="modal-icon danger-icon">${icon("target")}</div>
+        <div class="modal-content">
+          <h2 id="clear-savedvariables-title">Clear SavedVariables?</h2>
+          <p>This will delete this addon’s SavedVariables files. The addon folder will remain installed.</p>
+          <p class="modal-path" title="${escapeAttr(local.folder_name)}">${escapeHtml(local.folder_name)}</p>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary" id="cancel-clear-savedvariables" ${disabledAttr()}>Cancel</button>
+          <button class="danger" id="confirm-clear-savedvariables" ${disabledAttr()}>${loadingButtonContent("Clear SavedVariables", "Clearing...", "savedvariables-clear")}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderManualBackupConfirmationModal() {
+  if (!state.manualBackupConfirmOpen) return "";
+  return `
+    <div class="modal-backdrop remove-confirmation" role="presentation">
+      <section class="modal-panel remove-confirmation-panel" role="dialog" aria-modal="true" aria-labelledby="manual-backup-title">
+        <div class="modal-icon">${icon("folder")}</div>
+        <div class="modal-content">
+          <h2 id="manual-backup-title">Create backup?</h2>
+          <p>This will copy your AddOns folder to the selected backup folder.</p>
+          <div class="modal-option">
+            <label class="checkbox-line" for="manual-backup-savedvariables">
+              <input id="manual-backup-savedvariables" type="checkbox" ${state.manualBackupIncludeSavedVariables ? "checked" : ""} ${disabledAttr()} />
+              <span>Include SavedVariables</span>
+            </label>
+            <p class="setting-helper">SavedVariables contain addon settings and account/character data.</p>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary" id="cancel-manual-backup" ${disabledAttr()}>Cancel</button>
+          <button class="primary" id="confirm-manual-backup" ${disabledAttr()}>${loadingButtonContent("Create backup", "Creating backup...", "manual-backup")}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderAddonContextMenu() {
+  const menu = state.addonContextMenu;
+  if (!menu) return "";
+  return `
+    <div class="addon-context-menu" role="menu" aria-label="Addon actions" style="left: ${menu.x}px; top: ${menu.y}px;">
+      <button type="button" role="menuitem" data-addon-context-action="uninstall">Uninstall</button>
+      <button type="button" role="menuitem" data-addon-context-action="clear-savedvariables">Clear SavedVariables</button>
+      <button type="button" role="menuitem" data-addon-context-action="open-folder">Open in folder</button>
     </div>
   `;
 }
@@ -322,7 +433,12 @@ function renderCurrentTab() {
 }
 
 function tabButton(tab: Tab, label: string) {
-  return `<button class="nav-button ${state.tab === tab ? "active" : ""}" data-tab="${tab}">${escapeHtml(label)}</button>`;
+  const icons: Record<Tab, IconName> = {
+    installed: "installed",
+    search: "search",
+    settings: "settings",
+  };
+  return `<button class="nav-button ${state.tab === tab ? "active" : ""} ${tab === "settings" ? "settings-nav-button" : ""}" data-tab="${tab}">${icon(icons[tab])}<span>${escapeHtml(label)}</span></button>`;
 }
 
 function brandMark() {
@@ -393,7 +509,7 @@ function renderInstalledCard(item: InstalledViewModel) {
   const author = addon.author ?? remote?.author_name ?? null;
   const statusNote = installedStatusNote(status);
   return `
-    <article class="addon-card clickable ${cardStatusClass(status.kind)}" data-installed-folder="${escapeAttr(addon.folder_name)}">
+    <article class="addon-card clickable ${cardStatusClass(status.kind)}" data-installed-folder="${escapeAttr(addon.folder_name)}" data-addon-context-menu="true">
       ${CategoryIcon(category)}
       <div class="addon-main">
         <div class="addon-title-row">
@@ -495,7 +611,7 @@ function renderSearchCard(addon: AddonSummary) {
         <div class="addon-title-row">
           <div>
             <h3>${renderEsoText(addon.name ?? "Unnamed addon")}</h3>
-            <p>${escapeHtml(addon.author_name ? `by ${plainEsoText(addon.author_name)}` : "Author unknown")} &middot; ${escapeHtml(category.name)}</p>
+            <p>${escapeHtml(addon.author_name ? `by ${plainEsoText(addon.author_name)}` : "Author unknown")}</p>
           </div>
         </div>
         <div class="meta-grid">
@@ -683,7 +799,7 @@ function renderDetailsFooterActions() {
     return `<button class="primary" id="close-details-footer" ${guardedOperationRunning() ? "disabled" : ""}>Close</button>`;
   }
   const removeAddon = state.selectedLocal
-    ? `<button class="danger" id="remove-addon" ${disabledAttr()}>${loadingButtonContent("Remove addon", "Removing...", "remove-apply")}</button>`
+    ? `<button class="danger" id="remove-addon" ${disabledAttr()}>${loadingButtonContent("Uninstall", "Uninstalling...", "remove-apply")}</button>`
     : "";
   return `
     ${removeAddon}
@@ -727,7 +843,7 @@ function renderInstallUpdateFooterAction() {
 function selectedDetailsStatusNote() {
   const local = state.selectedLocal;
   const match = state.selectedMatch;
-  if (state.removeResult?.removed_addon) return "Addon removed";
+  if (state.removeResult?.removed_addon) return "Addon uninstalled";
   if (!local) {
     if (isOperation("install-apply")) return "Installing...";
     if (state.installPlan && !state.installResult) return "Install preview ready";
@@ -760,44 +876,111 @@ function renderSettings() {
   const settings = state.settings;
   const addonsMissing = Boolean(settings?.addons_dir_override) && state.addonsPathExists === false;
   return `
-    ${pageHeader("Settings", "Desktop defaults for install and update actions.", `
+    ${pageHeader("Settings", "Choose where Scribe manages addons and how downloads are handled.", `
       <div class="toolbar-actions">
         <button class="secondary icon-button" id="reset-settings" ${disabledAttr()}>${loadingButtonContent(`${icon("rotate")} Reset`, "Loading...", "settings")}</button>
         <button class="primary icon-button" id="save-settings" ${disabledAttr()}>${loadingButtonContent(`${icon("check")} Save`, "Loading...", "settings")}</button>
       </div>
     `)}
     ${addonsMissing ? `<div class="banner error">Configured AddOns path does not exist: ${escapeHtml(settings?.addons_dir_override ?? "")}</div>` : ""}
-    <div class="banner info">Blank paths use auto-detection or built-in defaults. Backup and download directories are created only when an install or update writes files there.</div>
+    <div class="banner info">Leave folders blank to let Scribe choose automatically. Folders are created only when needed.</div>
     <section class="settings-grid">
-      ${settingField("AddOns path override", "settings-addons-dir", settings?.addons_dir_override ?? "", true)}
-      ${settingField("Backup directory override", "settings-backup-dir", settings?.backup_dir_override ?? "", true)}
-      ${settingField("Download directory", "settings-download-dir", settings?.download_dir ?? "", true)}
-      ${settingCheckbox("Keep downloads default", "settings-keep-downloads", settings?.keep_downloads_default ?? false)}
-      ${settingCheckbox("Include unknown updates default", "settings-include-unknown", settings?.include_unknown_updates_default ?? false)}
+      <section class="panel settings-card">
+        <div class="settings-card-heading">
+          <h3>Addon folders</h3>
+        </div>
+        <div class="settings-card-body">
+          ${settingField("AddOns folder", "settings-addons-dir", settings?.addons_dir_override ?? "", {
+            browse: true,
+            helper: "Where ESO loads your addons from.",
+            placeholder: "Auto-detect AddOns folder",
+          })}
+          ${settingField("Backup folder", "settings-backup-dir", settings?.backup_dir_override ?? "", {
+            browse: true,
+            helper: settings?.backup_dir_override ? undefined : "Choose a backup folder to enable manual backups.",
+            placeholder: "Choose backup folder",
+          })}
+          ${renderManualBackupSettings()}
+        </div>
+      </section>
+      <section class="panel settings-card">
+        <div class="settings-card-heading">
+          <h3>Downloads and updates</h3>
+        </div>
+        <div class="settings-card-body">
+          ${settingField("Download folder", "settings-download-dir", settings?.download_dir ?? "", {
+            browse: true,
+            helper: "Where downloaded ZIP files are saved when downloads are kept.",
+            placeholder: "Use default download folder",
+          })}
+          ${settingCheckbox(
+            "Keep downloaded ZIP files",
+            "settings-keep-downloads",
+            settings?.keep_downloads_default ?? false,
+            "Useful if you want to reinstall addons without downloading again.",
+          )}
+          ${settingCheckbox(
+            "Show uncertain updates",
+            "settings-include-unknown",
+            settings?.include_unknown_updates_default ?? false,
+            "Shows addons where Scribe cannot confidently compare versions.",
+          )}
+        </div>
+      </section>
+      ${renderHttpCacheSettings()}
     </section>
-    ${renderHttpCacheSettings()}
+  `;
+}
+
+function renderManualBackupSettings() {
+  if (!state.settings?.backup_dir_override) return "";
+  return `
+    <div class="backup-actions">
+      <button class="secondary icon-button" id="create-manual-backup" ${disabledAttr()}>${loadingButtonContent(`${icon("folder")} Create backup`, "Creating backup...", "manual-backup")}</button>
+    </div>
+    ${renderManualBackupStatus()}
+  `;
+}
+
+function renderManualBackupStatus() {
+  if (state.manualBackupError) {
+    return `
+      <p class="backup-status backup-status-error">
+        <span>${escapeHtml(state.manualBackupError)}</span>
+        ${state.manualBackupResult ? `<button class="backup-inline-action" id="open-created-backup-folder" title="Open backup folder" ${disabledAttr()}>Open</button>` : ""}
+      </p>
+    `;
+  }
+  if (!state.manualBackupResult) return "";
+
+  return `
+    <p class="backup-status backup-status-success">
+      ${icon("check")}
+      <span>Backup created</span>
+      <span aria-hidden="true">&middot;</span>
+      <button class="backup-inline-action" id="open-created-backup-folder" title="Open backup folder" ${disabledAttr()}>Open</button>
+    </p>
   `;
 }
 
 function renderHttpCacheSettings() {
   const stats = state.httpCacheStats;
   return `
-    <section class="panel settings-section">
-      <div class="panel-heading">
+    <section class="panel settings-card settings-cache-card">
+      <div class="settings-card-heading">
         <div>
-          <h3>HTTP cache</h3>
-          <p>Remote API responses and addon images cached locally.</p>
+          <h3>Cache</h3>
+          <p>Cached addon data and images make browsing faster.</p>
         </div>
         <div class="toolbar-actions">
-          <button class="secondary" id="refresh-http-cache-stats" ${disabledAttr()}>${loadingButtonContent("Refresh", "Loading...", "cache")}</button>
           <button class="danger" id="clear-http-cache" ${disabledAttr()}>${loadingButtonContent("Clear cache", "Clearing...", "cache")}</button>
         </div>
       </div>
-      <div class="meta-grid">
-        ${metaItem("Cache size", stats?.size_display ?? (state.httpCacheStatsLoaded ? "0 B" : "Loading..."))}
-        ${metaItem("Entries", stats?.entry_count ?? (state.httpCacheStatsLoaded ? 0 : null))}
-        ${metaItem("Cache path", stats?.cache_dir ?? null)}
+      <div class="cache-summary">
+        <span>Cache size</span>
+        <strong>${escapeHtml(stats?.size_display ?? (state.httpCacheStatsLoaded ? "0 B" : "Loading..."))}</strong>
       </div>
+      <p class="setting-helper">Clearing the cache will not remove installed addons or settings.</p>
     </section>
   `;
 }
@@ -1047,8 +1230,8 @@ function renderRemoveResult() {
 
   return renderCompactResultPanel({
     kind: result.removed_addon ? "success" : "warning",
-    title: result.removed_addon ? "Addon removed" : "Remove finished without file changes",
-    message: result.message,
+    title: result.removed_addon ? "Addon uninstalled" : "Uninstall finished without file changes",
+    message: result.removed_addon && !result.removed_saved_variables ? "Addon uninstalled. SavedVariables were kept." : result.message,
     detailsTitle: result.saved_variables_deleted_count > 0 ? "Deleted SavedVariables" : undefined,
     details:
       result.saved_variables_deleted_count > 0
@@ -1198,11 +1381,14 @@ function renderInstalledItems(items: { target_folder: string | null; action: str
 }
 
 function bindCommonEvents() {
+  bindAddonContextMenuEvents();
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       state.tab = button.dataset.tab as Tab;
       state.error = null;
+      state.success = null;
       state.warning = null;
+      closeAddonContextMenu(false);
       render();
       if (state.tab === "search") {
         ensureSearchLoaded();
@@ -1229,6 +1415,23 @@ function bindInitialSetupEvents() {
     render();
   });
   document.querySelector<HTMLButtonElement>("#confirm-initial-import")?.addEventListener("click", confirmInitialImport);
+}
+
+function bindAddonContextMenuEvents() {
+  document.querySelectorAll<HTMLButtonElement>("[data-addon-context-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      runAddonContextAction(button.dataset.addonContextAction as AddonContextAction);
+    });
+  });
+}
+
+function handleCardClick(card: HTMLElement) {
+  closeAddonContextMenu(false);
+  if (card.dataset.addonId) {
+    loadDetails(card.dataset.addonId);
+    return;
+  }
+  if (card.dataset.installedFolder) openInstalledDetails(card.dataset.installedFolder);
 }
 
 function bindTabEvents() {
@@ -1276,10 +1479,7 @@ function bindTabEvents() {
   });
   document.querySelector<HTMLButtonElement>("#run-search")?.addEventListener("click", runSearch);
   document.querySelectorAll<HTMLElement>(".clickable").forEach((card) => {
-    card.addEventListener("click", () => {
-      if (card.dataset.installedFolder) openInstalledDetails(card.dataset.installedFolder);
-      if (card.dataset.addonId) loadDetails(card.dataset.addonId);
-    });
+    card.addEventListener("click", () => handleCardClick(card));
   });
   document.querySelectorAll<HTMLElement>("button, a, input, select, summary").forEach((element) => {
     element.addEventListener("click", (event) => event.stopPropagation());
@@ -1316,9 +1516,15 @@ function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#remove-addon")?.addEventListener("click", removeAddon);
   document.querySelector<HTMLButtonElement>("#cancel-remove-addon")?.addEventListener("click", cancelRemoveAddon);
   document.querySelector<HTMLButtonElement>("#confirm-remove-addon")?.addEventListener("click", confirmRemoveAddon);
-  document.querySelector<HTMLInputElement>("#remove-savedvariables")?.addEventListener("change", (event) => {
-    state.removeSavedVariables = (event.currentTarget as HTMLInputElement).checked;
+  document.querySelector<HTMLButtonElement>("#cancel-clear-savedvariables")?.addEventListener("click", cancelClearSavedVariables);
+  document.querySelector<HTMLButtonElement>("#confirm-clear-savedvariables")?.addEventListener("click", confirmClearSavedVariables);
+  document.querySelector<HTMLButtonElement>("#create-manual-backup")?.addEventListener("click", requestManualBackup);
+  document.querySelector<HTMLButtonElement>("#cancel-manual-backup")?.addEventListener("click", cancelManualBackup);
+  document.querySelector<HTMLButtonElement>("#confirm-manual-backup")?.addEventListener("click", confirmManualBackup);
+  document.querySelector<HTMLInputElement>("#manual-backup-savedvariables")?.addEventListener("change", (event) => {
+    state.manualBackupIncludeSavedVariables = (event.currentTarget as HTMLInputElement).checked;
   });
+  document.querySelector<HTMLButtonElement>("#open-created-backup-folder")?.addEventListener("click", openCreatedBackupFolder);
   document.querySelector<HTMLButtonElement>("#refresh-installed-after-install")?.addEventListener("click", () => loadInstalled(true));
   document.querySelector<HTMLButtonElement>("#apply-update-all")?.addEventListener("click", applyUpdateAll);
   document.querySelectorAll<HTMLButtonElement>("[data-plan-update-target]").forEach((button) => {
@@ -1330,7 +1536,6 @@ function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#confirm-update")?.addEventListener("click", confirmUpdate);
   document.querySelector<HTMLButtonElement>("#save-settings")?.addEventListener("click", saveSettings);
   document.querySelector<HTMLButtonElement>("#reset-settings")?.addEventListener("click", resetSettings);
-  document.querySelector<HTMLButtonElement>("#refresh-http-cache-stats")?.addEventListener("click", loadHttpCacheStats);
   document.querySelector<HTMLButtonElement>("#clear-http-cache")?.addEventListener("click", clearHttpCache);
   document.querySelector<HTMLInputElement>("#settings-addons-dir")?.addEventListener("input", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-backup-dir")?.addEventListener("input", syncSettingsDraft);
@@ -1348,16 +1553,107 @@ function bindTabEvents() {
   }
 }
 
+function handleGlobalContextMenu(event: MouseEvent) {
+  event.preventDefault();
+
+  const target = event.target;
+  if (!(target instanceof Element)) {
+    closeAddonContextMenu();
+    return;
+  }
+
+  if (target.closest(".addon-context-menu")) return;
+
+  if (target.closest("button, a, input, select, textarea, [contenteditable='true']")) {
+    closeAddonContextMenu();
+    return;
+  }
+
+  const card = target.closest<HTMLElement>("[data-addon-context-menu='true'][data-installed-folder]");
+  if (!card?.dataset.installedFolder) {
+    closeAddonContextMenu();
+    return;
+  }
+
+  event.stopPropagation();
+  showAddonContextMenu(card.dataset.installedFolder, event.clientX, event.clientY);
+}
+
+function showAddonContextMenu(folderName: string, x: number, y: number) {
+  const local = installedLocalByFolder(folderName);
+  if (!local) {
+    closeAddonContextMenu();
+    return;
+  }
+
+  const position = clampedContextMenuPosition(x, y);
+  state.addonContextMenu = {
+    folderName: local.folder_name,
+    x: position.x,
+    y: position.y,
+  };
+  render();
+}
+
+function closeAddonContextMenu(renderNow = true) {
+  if (!state.addonContextMenu) return;
+  state.addonContextMenu = null;
+  if (renderNow) render();
+}
+
+function clampedContextMenuPosition(x: number, y: number) {
+  const maxX = Math.max(CONTEXT_MENU_MARGIN, window.innerWidth - ADDON_CONTEXT_MENU_WIDTH - CONTEXT_MENU_MARGIN);
+  const maxY = Math.max(CONTEXT_MENU_MARGIN, window.innerHeight - ADDON_CONTEXT_MENU_HEIGHT - CONTEXT_MENU_MARGIN);
+  return {
+    x: Math.min(Math.max(x, CONTEXT_MENU_MARGIN), maxX),
+    y: Math.min(Math.max(y, CONTEXT_MENU_MARGIN), maxY),
+  };
+}
+
+function runAddonContextAction(action: AddonContextAction) {
+  const menu = state.addonContextMenu;
+  if (!menu) return;
+  const local = installedLocalByFolder(menu.folderName);
+  state.addonContextMenu = null;
+
+  if (!local) {
+    state.error = "Addon is no longer installed.";
+    render();
+    return;
+  }
+
+  if (action === "uninstall") {
+    requestUninstallAddon(local);
+    return;
+  }
+  if (action === "clear-savedvariables") {
+    requestClearSavedVariables(local);
+    return;
+  }
+  void openAddonFolder(local);
+}
+
 async function withLoading(task: () => Promise<void>, operation: OperationKind = "general", operationTarget: string | null = null) {
   state.loading = true;
   state.operation = operation;
   state.operationTarget = operationTarget;
   state.error = null;
+  state.success = null;
+  if (operation === "manual-backup") {
+    state.manualBackupError = null;
+  }
+  closeAddonContextMenu(false);
   render();
   try {
     await task();
   } catch (error) {
-    state.error = error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (operation === "manual-backup") {
+      state.manualBackupConfirmOpen = false;
+      state.manualBackupError = message;
+    } else {
+      state.error = message;
+    }
   } finally {
     state.loading = false;
     state.operation = null;
@@ -1375,10 +1671,7 @@ function renderInstalledListOnly() {
 
 function bindCardEventsOnly() {
   document.querySelectorAll<HTMLElement>(".clickable").forEach((card) => {
-    card.addEventListener("click", () => {
-      if (card.dataset.installedFolder) openInstalledDetails(card.dataset.installedFolder);
-      if (card.dataset.addonId) loadDetails(card.dataset.addonId);
-    });
+    card.addEventListener("click", () => handleCardClick(card));
   });
   document.querySelectorAll<HTMLElement>(".addon-card button, .addon-card a").forEach((element) => {
     element.addEventListener("click", (event) => event.stopPropagation());
@@ -1548,6 +1841,10 @@ function openInstalledDetails(folderName: string) {
   }
 }
 
+function installedLocalByFolder(folderName: string) {
+  return state.installed?.addons.find((addon) => addon.folder_name.toLowerCase() === folderName.toLowerCase()) ?? null;
+}
+
 function requestCloseDetails() {
   if (guardedOperationRunning()) return;
   closeDetails();
@@ -1567,7 +1864,7 @@ function closeDetails() {
   state.singleUpdateResult = null;
   state.removeResult = null;
   state.removeConfirmLocal = null;
-  state.removeSavedVariables = false;
+  state.clearSavedVariablesConfirmLocal = null;
   render();
 }
 
@@ -1708,15 +2005,18 @@ function confirmUpdate() {
 function removeAddon() {
   const local = state.selectedLocal;
   if (!local) return;
+  requestUninstallAddon(local);
+}
+
+function requestUninstallAddon(local: LocalAddon) {
   state.removeConfirmLocal = local;
-  state.removeSavedVariables = false;
+  state.clearSavedVariablesConfirmLocal = null;
   render();
 }
 
 function cancelRemoveAddon() {
   if (guardedOperationRunning()) return;
   state.removeConfirmLocal = null;
-  state.removeSavedVariables = false;
   render();
 }
 
@@ -1732,14 +2032,111 @@ function confirmRemoveAddon() {
     state.removeResult = await invoke<RemoveInstalledAddonResponse>("remove_installed_addon", {
       folderName: local.folder_name,
       path: effectiveAddonsPath(),
-      removeSavedVariables: state.removeSavedVariables,
+      removeSavedVariables: false,
     });
     state.removeConfirmLocal = null;
-    state.removeSavedVariables = false;
+    state.success = "Addon uninstalled. SavedVariables were kept.";
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: effectiveAddonsPath() });
     state.path = state.installed.addons_dir;
     syncInstalledStateAfterRemove(state.removeResult);
   }, "remove-apply");
+}
+
+function requestClearSavedVariables(local: LocalAddon) {
+  state.clearSavedVariablesConfirmLocal = local;
+  state.removeConfirmLocal = null;
+  render();
+}
+
+function cancelClearSavedVariables() {
+  if (guardedOperationRunning()) return;
+  state.clearSavedVariablesConfirmLocal = null;
+  render();
+}
+
+function confirmClearSavedVariables() {
+  const local = state.clearSavedVariablesConfirmLocal;
+  if (!local) return;
+  state.clearSavedVariablesResult = null;
+  return withLoading(async () => {
+    const result = await invoke<ClearSavedVariablesResponse>("clear_saved_variables", {
+      folderName: local.folder_name,
+      path: effectiveAddonsPath(),
+    });
+    state.clearSavedVariablesResult = result;
+    state.clearSavedVariablesConfirmLocal = null;
+    state.success = result.deleted_count > 0 ? "SavedVariables cleared." : "No SavedVariables files were found.";
+  }, "savedvariables-clear");
+}
+
+function requestManualBackup() {
+  if (!state.settings?.backup_dir_override) {
+    state.manualBackupError = "Choose a backup folder to enable manual backups.";
+    render();
+    return;
+  }
+  state.manualBackupError = null;
+  state.manualBackupConfirmOpen = true;
+  state.manualBackupIncludeSavedVariables = false;
+  render();
+}
+
+function cancelManualBackup() {
+  if (guardedOperationRunning()) return;
+  state.manualBackupConfirmOpen = false;
+  render();
+}
+
+function confirmManualBackup() {
+  const backupDir = state.settings?.backup_dir_override;
+  if (!backupDir) {
+    state.manualBackupError = "Choose a backup folder to enable manual backups.";
+    state.manualBackupConfirmOpen = false;
+    render();
+    return;
+  }
+
+  state.manualBackupResult = null;
+  state.manualBackupError = null;
+  return withLoading(async () => {
+    const result = await invoke<ManualBackupResponse>("create_manual_backup", {
+      addonsPath: effectiveAddonsPath(),
+      backupDir,
+      includeSavedVariables: state.manualBackupIncludeSavedVariables,
+    });
+    state.manualBackupResult = result;
+    state.manualBackupError = null;
+    state.manualBackupConfirmOpen = false;
+  }, "manual-backup");
+}
+
+async function openCreatedBackupFolder() {
+  const result = state.manualBackupResult;
+  if (!result) return;
+  state.error = null;
+  state.manualBackupError = null;
+  render();
+  try {
+    await invoke("open_folder", { path: result.backup_path });
+  } catch (error) {
+    state.manualBackupError = `Could not open backup folder. ${error instanceof Error ? error.message : String(error)}`;
+    render();
+  }
+}
+
+async function openAddonFolder(local: LocalAddon) {
+  state.error = null;
+  state.success = null;
+  render();
+  try {
+    await invoke("open_addon_folder", {
+      folderName: local.folder_name,
+      path: effectiveAddonsPath(),
+    });
+  } catch (error) {
+    state.error = `Could not open addon folder. ${error instanceof Error ? error.message : String(error)}`;
+    render();
+  }
 }
 
 function syncInstalledStateAfterInstall(result: InstallRemoteAddonResponse) {
@@ -2296,7 +2693,17 @@ function hasDetailsOpen() {
 function guardedOperationRunning() {
   return Boolean(
     state.operation &&
-      ["install-plan", "install-apply", "update-plan", "update-apply", "remove-apply", "update-all-plan", "update-all-apply"].includes(
+      [
+        "install-plan",
+        "install-apply",
+        "update-plan",
+        "update-apply",
+        "remove-apply",
+        "savedvariables-clear",
+        "manual-backup",
+        "update-all-plan",
+        "update-all-apply",
+      ].includes(
         state.operation,
       ),
   );
@@ -2312,9 +2719,6 @@ function selectedImageUrls() {
     ...(state.selectedDetails?.image_urls ?? []),
     ...(state.selectedMatch?.remote?.image_urls ?? []),
     ...(state.selectedSummary?.image_urls ?? []),
-    ...(state.selectedDetails?.thumbnail_urls ?? []),
-    ...(state.selectedMatch?.remote?.thumbnail_urls ?? []),
-    ...(state.selectedSummary?.thumbnail_urls ?? []),
   ];
   return uniqueSafeUrls(urls).slice(0, 8);
 }
@@ -2422,7 +2826,16 @@ function updateIncludeUnknownDefault() {
 }
 
 function syncSettingsDraft() {
+  const previousAddonsDir = state.settings?.addons_dir_override ?? null;
+  const previousBackupDir = state.settings?.backup_dir_override ?? null;
   state.settings = readSettingsDraft();
+  if (
+    (state.settings.addons_dir_override ?? null) !== previousAddonsDir ||
+    (state.settings.backup_dir_override ?? null) !== previousBackupDir
+  ) {
+    state.manualBackupResult = null;
+    state.manualBackupError = null;
+  }
   state.addonsPathExists = null;
 }
 
@@ -2534,27 +2947,38 @@ function clearHttpCache() {
   return withLoading(async () => {
     state.httpCacheStats = await invoke<HttpCacheStatsResponse>("clear_http_cache");
     state.httpCacheStatsLoaded = true;
+    state.success = "Cache cleared.";
   }, "cache");
 }
 
-function settingField(label: string, id: string, value: string, browse = false) {
+function settingField(
+  label: string,
+  id: string,
+  value: string,
+  options: { browse?: boolean; helper?: string; placeholder?: string } = {},
+) {
+  const browse = options.browse ?? false;
   return `
     <div class="field setting-item">
       <label for="${escapeAttr(id)}">${escapeHtml(label)}</label>
+      ${options.helper ? `<p class="setting-helper">${escapeHtml(options.helper)}</p>` : ""}
       <div class="${browse ? "field-with-action" : ""}">
-        <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="Leave blank for default" ${disabledAttr()} />
+        <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="${escapeAttr(options.placeholder ?? "Leave blank for default")}" ${disabledAttr()} />
         ${browse ? `<button class="secondary icon-button browse-button" data-browse-target="${escapeAttr(id)}" title="Browse for ${escapeAttr(label)}" ${disabledAttr()}>${icon("folder")} Browse</button>` : ""}
       </div>
     </div>
   `;
 }
 
-function settingCheckbox(label: string, id: string, value: boolean) {
+function settingCheckbox(label: string, id: string, value: boolean, helper: string) {
   return `
-    <label class="checkbox-line setting-check" for="${escapeAttr(id)}">
-      <input type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} ${disabledAttr()} />
-      <span>${escapeHtml(label)}</span>
-    </label>
+    <div class="setting-check">
+      <label class="checkbox-line" for="${escapeAttr(id)}">
+        <input type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} ${disabledAttr()} />
+        <span>${escapeHtml(label)}</span>
+      </label>
+      <p class="setting-helper">${escapeHtml(helper)}</p>
+    </div>
   `;
 }
 
@@ -2588,7 +3012,10 @@ function icon(name: IconName) {
     check: '<path d="M20 6 9 17l-5-5"/>',
     external: '<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
     folder: '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z"/><path d="M2 10h20"/>',
+    installed: '<path d="m21 8-9-5-9 5 9 5 9-5Z"/><path d="m3 8 9 5 9-5"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
     rotate: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v6h6"/>',
+    search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+    settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.37a1.7 1.7 0 0 0-1 .58 1.7 1.7 0 0 0-.4 1.08V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-.4-1.08 1.7 1.7 0 0 0-1-.58 1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 3.63 15a1.7 1.7 0 0 0-.58-1 1.7 1.7 0 0 0-1.08-.4H2a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.08-.4 1.7 1.7 0 0 0 .58-1 1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8 4.63a1.7 1.7 0 0 0 1-.58 1.7 1.7 0 0 0 .4-1.08V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 .4 1.08 1.7 1.7 0 0 0 1 .58 1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 20.37 9a1.7 1.7 0 0 0 .58 1 1.7 1.7 0 0 0 1.08.4H22a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.08.4 1.7 1.7 0 0 0-.58 1Z"/>',
     target: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
   };
   return `<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]}</svg>`;

@@ -10,9 +10,12 @@ use eso_addon_manager::cache::{HttpCache, ResourceKind};
 use eso_addon_manager::install::apply::{
     self, InstallActionPerformed, InstallResult, InstalledItem,
 };
+use eso_addon_manager::install::backup::{self, ManualBackupResult};
 use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanAction, InstallPlanItem};
 use eso_addon_manager::install::remote;
-use eso_addon_manager::install::remove::{self, RemoveAddonResult};
+use eso_addon_manager::install::remove::{
+    self, ClearSavedVariablesResult, RemoveAddonResult,
+};
 use eso_addon_manager::install::update;
 use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
@@ -296,6 +299,28 @@ struct RemoveInstalledAddonResponse {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ClearSavedVariablesResponse {
+    addon_folder: String,
+    saved_variables_dir: String,
+    deleted_count: usize,
+    deleted_files: Vec<String>,
+    missing_files: Vec<String>,
+    status: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ManualBackupResponse {
+    backup_path: String,
+    backup_name: String,
+    copied_addons: bool,
+    copied_saved_variables: bool,
+    saved_variables_missing: bool,
+    total_files: u64,
+    total_bytes: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct InstalledMetadata {
@@ -501,6 +526,36 @@ async fn remove_installed_addon(
     remove_installed_metadata(&addons_dir, &result.addon_folder).map_err(to_string_error)?;
 
     Ok(remove_installed_addon_response(&result))
+}
+
+#[tauri::command]
+async fn clear_saved_variables(
+    folder_name: String,
+    path: Option<String>,
+) -> Result<ClearSavedVariablesResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let result =
+        remove::clear_saved_variables(&addons_dir, &folder_name).map_err(to_string_error)?;
+
+    Ok(clear_saved_variables_response(&result))
+}
+
+#[tauri::command]
+async fn create_manual_backup(
+    addons_path: Option<String>,
+    backup_dir: String,
+    include_saved_variables: bool,
+) -> Result<ManualBackupResponse, String> {
+    let addons_dir = resolve_addons_dir(addons_path.as_deref()).map_err(to_string_error)?;
+    let backup_dir = required_path(&backup_dir, "backup folder").map_err(to_string_error)?;
+    let result = backup::create_manual_backup(
+        &addons_dir,
+        &backup_dir,
+        include_saved_variables,
+    )
+    .map_err(to_string_error)?;
+
+    Ok(manual_backup_response(&result))
 }
 
 #[tauri::command]
@@ -745,6 +800,27 @@ async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), Str
     let url = allowed_external_url(&url).map_err(to_string_error)?;
     app.opener()
         .open_url(url.as_str(), None::<&str>)
+        .map_err(to_string_error)
+}
+
+#[tauri::command]
+async fn open_addon_folder(
+    app: tauri::AppHandle,
+    folder_name: String,
+    path: Option<String>,
+) -> Result<(), String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let target = resolve_addon_folder_for_open(&addons_dir, &folder_name).map_err(to_string_error)?;
+    app.opener()
+        .open_path(path_string(&target), None::<&str>)
+        .map_err(to_string_error)
+}
+
+#[tauri::command]
+async fn open_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let target = resolve_folder_for_open(&path).map_err(to_string_error)?;
+    app.opener()
+        .open_path(path_string(&target), None::<&str>)
         .map_err(to_string_error)
 }
 
@@ -1167,11 +1243,15 @@ fn main() {
             import_existing_addons_as_current,
             get_installed_addons,
             remove_installed_addon,
+            clear_saved_variables,
+            create_manual_backup,
             search_remote_addons,
             browse_remote_addons,
             get_remote_addon_details,
             get_remote_addon_details_with_local_state,
             open_external_url,
+            open_addon_folder,
+            open_folder,
             check_addons,
             plan_updates,
             plan_update_all,
@@ -1252,6 +1332,15 @@ fn normalize_optional_path(value: Option<String>) -> Option<String> {
 
 fn optional_path(value: Option<String>) -> Option<PathBuf> {
     normalize_optional_path(value).map(PathBuf::from)
+}
+
+fn required_path(value: &str, label: &str) -> anyhow::Result<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(anyhow::anyhow!("{label} is required"))
+    } else {
+        Ok(PathBuf::from(trimmed))
+    }
 }
 
 fn resolve_addons_dir(path: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -2365,6 +2454,38 @@ fn remove_installed_addon_response(result: &RemoveAddonResult) -> RemoveInstalle
     }
 }
 
+fn clear_saved_variables_response(result: &ClearSavedVariablesResult) -> ClearSavedVariablesResponse {
+    ClearSavedVariablesResponse {
+        addon_folder: result.addon_folder.clone(),
+        saved_variables_dir: path_string(&result.saved_variables_dir),
+        deleted_count: result.deleted_count,
+        deleted_files: result.deleted_files.clone(),
+        missing_files: result.missing_files.clone(),
+        status: result.status.as_str().to_owned(),
+        message: if result.deleted_count > 0 {
+            "SavedVariables cleared.".to_owned()
+        } else {
+            "No SavedVariables files were found.".to_owned()
+        },
+    }
+}
+
+fn manual_backup_response(result: &ManualBackupResult) -> ManualBackupResponse {
+    ManualBackupResponse {
+        backup_path: path_string(&result.backup_path),
+        backup_name: result
+            .backup_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path_string(&result.backup_path)),
+        copied_addons: result.copied_addons,
+        copied_saved_variables: result.copied_saved_variables,
+        saved_variables_missing: result.saved_variables_missing,
+        total_files: result.total_files,
+        total_bytes: result.total_bytes,
+    }
+}
+
 async fn keep_remote_download(
     client: &ApiClient,
     addon_id: &str,
@@ -2533,6 +2654,43 @@ fn allowed_external_url(value: &str) -> anyhow::Result<String> {
     Ok(parsed.into())
 }
 
+fn resolve_addon_folder_for_open(addons_dir: &Path, folder_name: &str) -> anyhow::Result<PathBuf> {
+    let addon = remove::resolve_installed_addon(addons_dir, folder_name)?;
+    let target = addons_dir.join(&addon.folder_name);
+    let addons_root = fs::canonicalize(addons_dir)?;
+    let target = fs::canonicalize(&target)
+        .map_err(|_| anyhow::anyhow!("addon folder is missing: {}", target.display()))?;
+
+    if !target.starts_with(&addons_root) {
+        return Err(anyhow::anyhow!(
+            "addon target path escapes AddOns directory: {}",
+            target.display()
+        ));
+    }
+    if !target.is_dir() {
+        return Err(anyhow::anyhow!(
+            "addon folder is missing: {}",
+            target.display()
+        ));
+    }
+
+    Ok(target)
+}
+
+fn resolve_folder_for_open(path: &str) -> anyhow::Result<PathBuf> {
+    let target = required_path(path, "folder")?;
+    let target = fs::canonicalize(&target)
+        .map_err(|_| anyhow::anyhow!("folder is missing: {}", target.display()))?;
+    if !target.is_dir() {
+        return Err(anyhow::anyhow!(
+            "folder is not a directory: {}",
+            target.display()
+        ));
+    }
+
+    Ok(target)
+}
+
 fn format_mmoui_date(timestamp: i64) -> String {
     let seconds = if timestamp > 9_999_999_999 {
         timestamp / 1_000
@@ -2647,6 +2805,39 @@ mod tests {
         assert!(allowed_external_url("javascript:alert(1)").is_err());
         assert!(allowed_external_url("file:///C:/Windows/notepad.exe").is_err());
         assert!(allowed_external_url("mailto:someone@example.com").is_err());
+    }
+
+    #[test]
+    fn open_addon_folder_resolves_installed_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let addons_dir = dir.path().join("AddOns");
+        write_test_addon(&addons_dir, "ExampleAddon");
+
+        let target = resolve_addon_folder_for_open(&addons_dir, "ExampleAddon").unwrap();
+
+        assert_eq!(target, std::fs::canonicalize(addons_dir.join("ExampleAddon")).unwrap());
+    }
+
+    #[test]
+    fn open_addon_folder_validates_containment() {
+        let dir = tempfile::tempdir().unwrap();
+        let addons_dir = dir.path().join("AddOns");
+        write_test_addon(&addons_dir, "ExampleAddon");
+
+        let error = resolve_addon_folder_for_open(&addons_dir, "../ExampleAddon").unwrap_err();
+
+        assert!(error.to_string().contains("unsafe addon folder name"));
+    }
+
+    #[test]
+    fn open_folder_requires_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("backup.txt");
+        std::fs::write(&file, "not a folder").unwrap();
+
+        let error = resolve_folder_for_open(&path_string(&file)).unwrap_err();
+
+        assert!(error.to_string().contains("folder is not a directory"));
     }
 
     #[test]
@@ -3034,5 +3225,15 @@ mod tests {
             metadata,
             matches,
         }
+    }
+
+    fn write_test_addon(addons_dir: &Path, folder_name: &str) {
+        let folder = addons_dir.join(folder_name);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join(format!("{folder_name}.txt")),
+            "## Title: Example Addon\n## Version: 1\n",
+        )
+        .unwrap();
     }
 }

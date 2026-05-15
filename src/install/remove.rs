@@ -20,6 +20,33 @@ pub struct RemoveAddonResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClearSavedVariablesResult {
+    pub addon_folder: String,
+    pub saved_variables_dir: PathBuf,
+    pub deleted_count: usize,
+    pub deleted_files: Vec<String>,
+    pub missing_files: Vec<String>,
+    pub status: ClearSavedVariablesStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearSavedVariablesStatus {
+    Deleted,
+    MissingSavedVariablesFolder,
+    NoFilesFound,
+}
+
+impl ClearSavedVariablesStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deleted => "deleted",
+            Self::MissingSavedVariablesFolder => "missing_saved_variables_folder",
+            Self::NoFilesFound => "no_files_found",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RemoveAddonError {
     #[error("unsafe addon folder name rejected: {0}")]
@@ -52,31 +79,7 @@ pub fn remove_installed_addon(
     folder_name: &str,
     remove_saved_variables: bool,
 ) -> Result<RemoveAddonResult, RemoveAddonError> {
-    let requested = folder_name.trim();
-    validate_single_component(requested)
-        .map_err(|_| RemoveAddonError::UnsafeFolderName(folder_name.to_owned()))?;
-
-    let installed_addons = local::scan_addons_dir(addons_dir)?;
-    let matches = installed_addons
-        .iter()
-        .filter(|addon| addon.folder_name.eq_ignore_ascii_case(requested))
-        .collect::<Vec<_>>();
-
-    let addon = match matches.as_slice() {
-        [] => return Err(RemoveAddonError::NoMatch(requested.to_owned())),
-        [addon] => *addon,
-        matches => {
-            let matches = matches
-                .iter()
-                .map(|addon| addon.folder_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(RemoveAddonError::Ambiguous {
-                folder_name: requested.to_owned(),
-                matches,
-            });
-        }
-    };
+    let addon = resolve_installed_addon(addons_dir, folder_name)?;
 
     let target = contained_target_path(addons_dir, &addon.folder_name)?;
     let metadata = fs::symlink_metadata(&target)
@@ -89,7 +92,7 @@ pub fn remove_installed_addon(
     }
     reject_symlinks_in_tree(&target)?;
     let saved_variables_plan = if remove_saved_variables {
-        plan_saved_variables_removal(addons_dir, addon)?
+        plan_saved_variables_removal(addons_dir, &addon, SavedVariablesCandidateSet::AddonRemoval)?
     } else {
         SavedVariablesRemovalPlan::default()
     };
@@ -112,6 +115,66 @@ pub fn remove_installed_addon(
             "Addon removed. SavedVariables were kept.".to_owned()
         },
     })
+}
+
+pub fn clear_saved_variables(
+    addons_dir: &Path,
+    folder_name: &str,
+) -> Result<ClearSavedVariablesResult, RemoveAddonError> {
+    let addon = resolve_installed_addon(addons_dir, folder_name)?;
+    let plan =
+        plan_saved_variables_removal(addons_dir, &addon, SavedVariablesCandidateSet::ClearOnly)?;
+    let saved_variables_dir = plan.saved_variables_dir.clone();
+    let saved_variables_dir_missing = plan.saved_variables_dir_missing;
+    let result = apply_saved_variables_removal(plan)?;
+    let deleted_count = result.deleted_files.len();
+    let status = if deleted_count > 0 {
+        ClearSavedVariablesStatus::Deleted
+    } else if saved_variables_dir_missing {
+        ClearSavedVariablesStatus::MissingSavedVariablesFolder
+    } else {
+        ClearSavedVariablesStatus::NoFilesFound
+    };
+
+    Ok(ClearSavedVariablesResult {
+        addon_folder: addon.folder_name,
+        saved_variables_dir,
+        deleted_count,
+        deleted_files: result.deleted_files,
+        missing_files: result.missing_files,
+        status,
+    })
+}
+
+pub fn resolve_installed_addon(
+    addons_dir: &Path,
+    folder_name: &str,
+) -> Result<local::LocalAddon, RemoveAddonError> {
+    let requested = folder_name.trim();
+    validate_single_component(requested)
+        .map_err(|_| RemoveAddonError::UnsafeFolderName(folder_name.to_owned()))?;
+
+    let installed_addons = local::scan_addons_dir(addons_dir)?;
+    let matches = installed_addons
+        .into_iter()
+        .filter(|addon| addon.folder_name.eq_ignore_ascii_case(requested))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [] => Err(RemoveAddonError::NoMatch(requested.to_owned())),
+        [addon] => Ok(addon.clone()),
+        matches => {
+            let matches = matches
+                .iter()
+                .map(|addon| addon.folder_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(RemoveAddonError::Ambiguous {
+                folder_name: requested.to_owned(),
+                matches,
+            })
+        }
+    }
 }
 
 fn reject_symlinks_in_tree(path: &Path) -> Result<(), RemoveAddonError> {
@@ -157,6 +220,8 @@ fn validate_single_component(value: &str) -> Result<(), ()> {
 
 #[derive(Debug, Default)]
 struct SavedVariablesRemovalPlan {
+    saved_variables_dir: PathBuf,
+    saved_variables_dir_missing: bool,
     existing_files: Vec<(String, PathBuf)>,
     missing_files: Vec<String>,
 }
@@ -167,18 +232,38 @@ struct SavedVariablesRemovalResult {
     missing_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SavedVariablesCandidateSet {
+    AddonRemoval,
+    ClearOnly,
+}
+
 fn plan_saved_variables_removal(
     addons_dir: &Path,
     addon: &local::LocalAddon,
+    candidate_set: SavedVariablesCandidateSet,
 ) -> Result<SavedVariablesRemovalPlan, RemoveAddonError> {
     let saved_variables_dir = addons_dir
         .parent()
         .map(|parent| parent.join("SavedVariables"))
         .unwrap_or_else(|| PathBuf::from("SavedVariables"));
-    let file_names = saved_variables_file_names(addon);
-    let mut plan = SavedVariablesRemovalPlan::default();
+    let file_names = saved_variables_file_names(addon, candidate_set);
+    let mut plan = SavedVariablesRemovalPlan {
+        saved_variables_dir: saved_variables_dir.clone(),
+        ..SavedVariablesRemovalPlan::default()
+    };
 
     if !saved_variables_dir.exists() {
+        plan.saved_variables_dir_missing = true;
+        plan.missing_files = file_names.into_iter().collect();
+        return Ok(plan);
+    }
+
+    let metadata = fs::symlink_metadata(&saved_variables_dir)?;
+    if metadata.file_type().is_symlink() {
+        return Err(RemoveAddonError::Symlink(saved_variables_dir));
+    }
+    if !metadata.is_dir() {
         plan.missing_files = file_names.into_iter().collect();
         return Ok(plan);
     }
@@ -216,16 +301,21 @@ fn apply_saved_variables_removal(
     Ok(result)
 }
 
-fn saved_variables_file_names(addon: &local::LocalAddon) -> BTreeSet<String> {
+fn saved_variables_file_names(
+    addon: &local::LocalAddon,
+    candidate_set: SavedVariablesCandidateSet,
+) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
 
     add_saved_variable_file_names(&mut names, &addon.folder_name);
-    if let Some(title) = addon
-        .title
-        .as_deref()
-        .and_then(sanitize_saved_variables_title)
-    {
-        add_saved_variable_file_names(&mut names, &title);
+    if matches!(candidate_set, SavedVariablesCandidateSet::AddonRemoval) {
+        if let Some(title) = addon
+            .title
+            .as_deref()
+            .and_then(sanitize_saved_variables_title)
+        {
+            add_saved_variable_file_names(&mut names, &title);
+        }
     }
     for value in addon
         .saved_variables
@@ -301,7 +391,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::install::remove::{remove_installed_addon, RemoveAddonError};
+    use crate::install::remove::{
+        clear_saved_variables, remove_installed_addon, ClearSavedVariablesStatus, RemoveAddonError,
+    };
 
     fn write_addon(addons_dir: &Path, folder_name: &str) {
         write_addon_manifest(
@@ -452,6 +544,91 @@ mod tests {
         assert!(result.removed_saved_variables);
         assert_eq!(result.saved_variables_deleted_count, 0);
         assert!(!addons_dir.join("SampleAddon").exists());
+    }
+
+    #[test]
+    fn clear_saved_variables_deletes_declared_and_folder_files() {
+        let dir = tempdir().unwrap();
+        let addons_dir = dir.path().join("AddOns");
+        let saved_variables = dir.path().join("SavedVariables");
+        write_addon_manifest(
+            &addons_dir,
+            "SampleAddon",
+            "## Title: Sample Addon\n## SavedVariables: AccountSettings OtherAccountSettings\n## SavedVariablesPerCharacter: CharacterSettings\n",
+        );
+        fs::create_dir_all(&saved_variables).unwrap();
+        fs::write(saved_variables.join("SampleAddon.lua"), "folder").unwrap();
+        fs::write(saved_variables.join("SampleAddon.lua.bak"), "folder backup").unwrap();
+        fs::write(saved_variables.join("AccountSettings.lua"), "account").unwrap();
+        fs::write(
+            saved_variables.join("OtherAccountSettings.lua.bak"),
+            "other account backup",
+        )
+        .unwrap();
+        fs::write(saved_variables.join("CharacterSettings.lua"), "character").unwrap();
+
+        let result = clear_saved_variables(&addons_dir, "SampleAddon").unwrap();
+
+        assert_eq!(result.addon_folder, "SampleAddon");
+        assert_eq!(result.status, ClearSavedVariablesStatus::Deleted);
+        assert_eq!(result.deleted_count, 5);
+        assert!(addons_dir.join("SampleAddon").exists());
+        assert!(!saved_variables.join("SampleAddon.lua").exists());
+        assert!(!saved_variables.join("SampleAddon.lua.bak").exists());
+        assert!(!saved_variables.join("AccountSettings.lua").exists());
+        assert!(!saved_variables
+            .join("OtherAccountSettings.lua.bak")
+            .exists());
+        assert!(!saved_variables.join("CharacterSettings.lua").exists());
+    }
+
+    #[test]
+    fn clear_saved_variables_does_not_delete_unrelated_files_or_directories() {
+        let dir = tempdir().unwrap();
+        let addons_dir = dir.path().join("AddOns");
+        let saved_variables = dir.path().join("SavedVariables");
+        write_addon_manifest(
+            &addons_dir,
+            "SampleAddon",
+            "## Title: Sample Addon\n## SavedVariables: AccountSettings\n",
+        );
+        fs::create_dir_all(&saved_variables).unwrap();
+        fs::write(saved_variables.join("AccountSettings.lua"), "account").unwrap();
+        fs::write(saved_variables.join("Sample_Addon.lua"), "title").unwrap();
+        fs::write(saved_variables.join("AccountSettings.lua.tmp"), "temp").unwrap();
+        fs::write(saved_variables.join("Unrelated.lua"), "keep").unwrap();
+        fs::create_dir_all(saved_variables.join("SampleAddon.lua")).unwrap();
+
+        let result = clear_saved_variables(&addons_dir, "SampleAddon").unwrap();
+
+        assert_eq!(result.deleted_count, 1);
+        assert!(!saved_variables.join("AccountSettings.lua").exists());
+        assert!(saved_variables.join("Sample_Addon.lua").is_file());
+        assert!(saved_variables.join("AccountSettings.lua.tmp").is_file());
+        assert!(saved_variables.join("Unrelated.lua").is_file());
+        assert!(saved_variables.join("SampleAddon.lua").is_dir());
+        assert!(addons_dir.join("SampleAddon").exists());
+    }
+
+    #[test]
+    fn clear_saved_variables_handles_missing_saved_variables_folder() {
+        let dir = tempdir().unwrap();
+        let addons_dir = dir.path().join("AddOns");
+        write_addon_manifest(
+            &addons_dir,
+            "SampleAddon",
+            "## SavedVariables: AccountSettings\n",
+        );
+
+        let result = clear_saved_variables(&addons_dir, "SampleAddon").unwrap();
+
+        assert_eq!(
+            result.status,
+            ClearSavedVariablesStatus::MissingSavedVariablesFolder
+        );
+        assert_eq!(result.deleted_count, 0);
+        assert!(result.deleted_files.is_empty());
+        assert!(addons_dir.join("SampleAddon").exists());
     }
 
     #[test]
