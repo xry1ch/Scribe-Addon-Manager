@@ -5,6 +5,7 @@ use thiserror::Error;
 pub mod apply;
 pub mod plan;
 pub mod remote;
+pub mod remove;
 pub mod update;
 pub mod update_all;
 pub mod zip_safety;

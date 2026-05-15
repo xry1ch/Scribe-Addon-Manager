@@ -168,6 +168,8 @@ mod tests {
             api_versions: Vec::new(),
             depends_on: Vec::new(),
             optional_depends_on: Vec::new(),
+            saved_variables: Vec::new(),
+            saved_variables_per_character: Vec::new(),
             is_library: None,
             author: None,
             description: None,

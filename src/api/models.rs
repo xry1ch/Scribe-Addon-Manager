@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -141,6 +142,64 @@ pub struct AddonSummary {
     pub _extra: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CategorySummary {
+    #[serde(rename = "UICATID", default, deserialize_with = "de::optional_string")]
+    pub id: Option<String>,
+
+    #[serde(
+        rename = "UICATTitle",
+        default,
+        deserialize_with = "de::optional_string"
+    )]
+    pub name: Option<String>,
+
+    #[serde(
+        rename = "UICATParentID",
+        default,
+        deserialize_with = "de::optional_string"
+    )]
+    pub parent_id: Option<String>,
+
+    #[serde(default, flatten)]
+    pub _extra: BTreeMap<String, Value>,
+}
+
+impl CategorySummary {
+    pub fn id(&self) -> Option<String> {
+        self.id.clone().or_else(|| {
+            extra_string(
+                &self._extra,
+                &["CategoryID", "CategoryId", "ID", "id", "category_id"],
+            )
+        })
+    }
+
+    pub fn name(&self) -> Option<String> {
+        self.name.clone().or_else(|| {
+            extra_string(
+                &self._extra,
+                &["CategoryName", "Name", "Title", "name", "category_name"],
+            )
+        })
+    }
+
+    pub fn parent_id(&self) -> Option<String> {
+        self.parent_id.clone().or_else(|| {
+            extra_string(
+                &self._extra,
+                &[
+                    "CategoryParentID",
+                    "CategoryParentId",
+                    "ParentID",
+                    "ParentId",
+                    "parent_id",
+                ],
+            )
+        })
+    }
+}
+
 impl AddonSummary {
     pub fn searchable_text(&self) -> String {
         [
@@ -212,6 +271,26 @@ impl AddonSummary {
                 "MonthlyDownloadCount",
                 "downloadsMonthly",
             ],
+        )
+    }
+
+    pub fn image_urls(&self) -> Vec<String> {
+        extra_url_vec(
+            &self._extra,
+            &[
+                "UIIMGs",
+                "UIImage",
+                "UIScreenshot",
+                "UIScreenshots",
+                "UIIcon",
+            ],
+        )
+    }
+
+    pub fn thumbnail_urls(&self) -> Vec<String> {
+        extra_url_vec(
+            &self._extra,
+            &["UIIMG_Thumbs", "UIThumbnail", "UIThumb", "UIIcon"],
         )
     }
 }
@@ -342,6 +421,26 @@ impl AddonDetails {
             ],
         )
     }
+
+    pub fn image_urls(&self) -> Vec<String> {
+        extra_url_vec(
+            &self._extra,
+            &[
+                "UIIMGs",
+                "UIImage",
+                "UIScreenshot",
+                "UIScreenshots",
+                "UIIcon",
+            ],
+        )
+    }
+
+    pub fn thumbnail_urls(&self) -> Vec<String> {
+        extra_url_vec(
+            &self._extra,
+            &["UIIMG_Thumbs", "UIThumbnail", "UIThumb", "UIIcon"],
+        )
+    }
 }
 
 fn extra_string(extra: &BTreeMap<String, Value>, keys: &[&str]) -> Option<String> {
@@ -365,6 +464,48 @@ fn extra_i64(extra: &BTreeMap<String, Value>, keys: &[&str]) -> Option<i64> {
             _ => None,
         })
     })
+}
+
+fn extra_url_vec(extra: &BTreeMap<String, Value>, keys: &[&str]) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    for key in keys {
+        if let Some(value) = extra.get(*key) {
+            collect_urls(value, &mut urls);
+        }
+    }
+
+    urls
+}
+
+fn collect_urls(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_urls(item, urls);
+            }
+        }
+        Value::String(value) => {
+            let value = value.trim();
+            if is_safe_http_url(value) && !urls.iter().any(|url| url == value) {
+                urls.push(value.to_owned());
+            }
+        }
+        Value::Object(map) => {
+            for key in ["url", "URL", "src", "href"] {
+                if let Some(value) = map.get(key) {
+                    collect_urls(value, urls);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_safe_http_url(value: &str) -> bool {
+    Url::parse(value)
+        .ok()
+        .is_some_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 mod de {
@@ -455,7 +596,7 @@ mod de {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddonDetails, AddonSummary};
+    use super::{AddonDetails, AddonSummary, CategorySummary};
 
     #[test]
     fn addon_summary_reads_current_esoui_category_fields() {
@@ -465,7 +606,9 @@ mod tests {
             "UIName": "NirnSteelUI",
             "UIDownloadTotal": "341",
             "UIDownloadMonthly": "169",
-            "UIDir": ["NirnsteelUI"]
+            "UIDir": ["NirnsteelUI"],
+            "UIIMGs": ["https://cdn-eso.mmoui.com/preview/pvw1.jpg", "javascript:alert(1)"],
+            "UIIMG_Thumbs": ["https://cdn-eso.mmoui.com/preview/tiny/pvw1.jpg"]
         }))
         .expect("valid summary");
 
@@ -473,6 +616,14 @@ mod tests {
         assert_eq!(summary.downloads(), Some(341));
         assert_eq!(summary.monthly_downloads(), Some(169));
         assert_eq!(summary.directories, vec!["NirnsteelUI"]);
+        assert_eq!(
+            summary.image_urls(),
+            vec!["https://cdn-eso.mmoui.com/preview/pvw1.jpg"]
+        );
+        assert_eq!(
+            summary.thumbnail_urls(),
+            vec!["https://cdn-eso.mmoui.com/preview/tiny/pvw1.jpg"]
+        );
     }
 
     #[test]
@@ -482,12 +633,32 @@ mod tests {
             "UICATID": "17",
             "UIName": "NirnSteelUI",
             "UIDownloadTotal": "341",
-            "UIDownloadMonthly": "169"
+            "UIDownloadMonthly": "169",
+            "UIImage": "https://cdn-eso.mmoui.com/preview/pvw2.png",
+            "UIScreenshot": "file:///not-allowed.png"
         }))
         .expect("valid details");
 
         assert_eq!(details.category_id().as_deref(), Some("17"));
         assert_eq!(details.downloads(), Some(341));
         assert_eq!(details.monthly_downloads(), Some(169));
+        assert_eq!(
+            details.image_urls(),
+            vec!["https://cdn-eso.mmoui.com/preview/pvw2.png"]
+        );
+    }
+
+    #[test]
+    fn category_summary_reads_current_esoui_fields() {
+        let category: CategorySummary = serde_json::from_value(serde_json::json!({
+            "UICATID": "17",
+            "UICATTitle": "Graphic UI Mods",
+            "UICATParentID": "0"
+        }))
+        .expect("valid category");
+
+        assert_eq!(category.id().as_deref(), Some("17"));
+        assert_eq!(category.name().as_deref(), Some("Graphic UI Mods"));
+        assert_eq!(category.parent_id().as_deref(), Some("0"));
     }
 }

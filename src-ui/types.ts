@@ -6,6 +6,9 @@ export interface LocalAddon {
   display_version: string | null;
   api_versions: string[];
   depends_on: string[];
+  saved_variables: string[];
+  saved_variables_per_character: string[];
+  description: string | null;
   is_library: boolean | null;
   valid_manifest: boolean;
 }
@@ -28,11 +31,34 @@ export interface AddonSummary {
   category_name: string | null;
   downloads: number | null;
   monthly_downloads: number | null;
+  image_urls: string[];
+  thumbnail_urls: string[];
+  installed: boolean;
+  installed_local: LocalAddon | null;
+  installed_match: MatchResult | null;
 }
 
 export interface SearchResponse {
   query: string;
   limit: number;
+  results: AddonSummary[];
+}
+
+export interface RemoteCategory {
+  id: string;
+  name: string;
+  parent_id: string | null;
+}
+
+export interface BrowseRemoteAddonsResponse {
+  mode: string;
+  query: string;
+  category_id: string | null;
+  limit: number;
+  categories: RemoteCategory[];
+  category_warning: string | null;
+  local_warning: string | null;
+  cache_warning: string | null;
   results: AddonSummary[];
 }
 
@@ -52,6 +78,17 @@ export interface AddonDetails {
   category_name: string | null;
   downloads: number | null;
   monthly_downloads: number | null;
+  image_urls: string[];
+  thumbnail_urls: string[];
+}
+
+export interface RemoteAddonDetailsWithLocalStateResponse {
+  details: AddonDetails;
+  installed: boolean;
+  local: LocalAddon | null;
+  match_result: MatchResult | null;
+  local_warning: string | null;
+  cache_warning: string | null;
 }
 
 export interface RemoteCandidate {
@@ -67,6 +104,8 @@ export interface RemoteCandidate {
   category_name: string | null;
   downloads: number | null;
   monthly_downloads: number | null;
+  image_urls: string[];
+  thumbnail_urls: string[];
 }
 
 export interface MatchResult {
@@ -82,6 +121,7 @@ export interface CheckAddonsResponse {
   addons_dir: string;
   remote_addons_loaded: number;
   matches: MatchResult[];
+  cache_warning: string | null;
 }
 
 export interface PlannedAction {
@@ -111,6 +151,7 @@ export interface PlanUpdatesResponse {
     ambiguous: number;
     libraries: number;
   };
+  cache_warning: string | null;
 }
 
 export interface UpdateAllAction extends PlannedAction {
@@ -222,6 +263,17 @@ export interface SingleUpdateApplyResponse {
   items: InstallResultItem[];
 }
 
+export interface RemoveInstalledAddonResponse {
+  removed_addon: boolean;
+  removed_saved_variables: boolean;
+  saved_variables_deleted_count: number;
+  saved_variables_deleted_files: string[];
+  saved_variables_missing_files: string[];
+  addon_folder: string;
+  original_path: string;
+  message: string;
+}
+
 export interface UpdateAllResult {
   target: PlannedAction;
   remote_details: AddonDetails;
@@ -282,4 +334,20 @@ export interface AppSettingsInput {
   download_dir: string | null;
   keep_downloads_default: boolean;
   include_unknown_updates_default: boolean;
+}
+
+export interface HttpCacheStatsResponse {
+  cache_dir: string;
+  entry_count: number;
+  byte_size: number;
+  size_display: string;
+}
+
+export interface CachedImageResponse {
+  url: string;
+  data_url: string;
+  content_type: string;
+  from_cache: boolean;
+  stale: boolean;
+  cache_warning: string | null;
 }

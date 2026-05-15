@@ -311,7 +311,7 @@ pub async fn details(client: &ApiClient, addon_id: &str, json_output: bool) -> R
 }
 
 pub async fn download(client: &ApiClient, addon_id: &str, output: &Path) -> Result<()> {
-    let details = client.eso_file_details(addon_id).await?;
+    let details = client.eso_file_details_fresh(addon_id).await?;
     let download_url = details
         .download_url
         .as_deref()
@@ -418,7 +418,11 @@ pub async fn check(
 
     let local_addons = local::scan_addons_dir(&path)
         .with_context(|| format!("failed to scan AddOns directory {}", path.display()))?;
-    let remote_addons = client.eso_file_list().await?;
+    let remote_addons = if refresh {
+        client.eso_file_list_refresh().await?
+    } else {
+        client.eso_file_list().await?
+    };
     let mut results = match_remote::match_installed_addons(&local_addons, &remote_addons);
 
     results.sort_by_key(|result| result.local.folder_name.to_lowercase());
@@ -463,7 +467,11 @@ pub async fn plan_update(
 
     let local_addons = local::scan_addons_dir(&path)
         .with_context(|| format!("failed to scan AddOns directory {}", path.display()))?;
-    let remote_addons = client.eso_file_list().await?;
+    let remote_addons = if refresh {
+        client.eso_file_list_refresh().await?
+    } else {
+        client.eso_file_list().await?
+    };
     let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
 
@@ -474,7 +482,11 @@ pub async fn plan_update(
     let detail_uids = update_plan::detail_request_uids_for(&matches, include_unknown);
     let mut plan = update_plan::build_update_plan(&matches, include_unknown);
     for uid in detail_uids {
-        let details = client.eso_file_details(&uid).await?;
+        let details = if refresh {
+            client.eso_file_details_fresh(&uid).await?
+        } else {
+            client.eso_file_details(&uid).await?
+        };
         plan.attach_details(&uid, details);
     }
 
@@ -522,7 +534,11 @@ pub async fn update_all(
 
     let mut local_addons = local::scan_addons_dir(&addons_dir)
         .with_context(|| format!("failed to scan AddOns directory {}", addons_dir.display()))?;
-    let remote_addons = client.eso_file_list().await?;
+    let remote_addons = if refresh {
+        client.eso_file_list_refresh().await?
+    } else {
+        client.eso_file_list().await?
+    };
     let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
 
@@ -676,7 +692,7 @@ async fn update_all_one(
     download_dir: Option<&Path>,
     quiet: bool,
 ) -> Result<InstallResult> {
-    let details = client.eso_file_details(remote_uid).await?;
+    let details = client.eso_file_details_fresh(remote_uid).await?;
     let install_plan = prepare_remote_install_plan(
         client,
         &details,
@@ -798,7 +814,7 @@ pub async fn install_remote(
     download_dir: Option<&Path>,
     json_output: bool,
 ) -> Result<()> {
-    let details = client.eso_file_details(addon_id).await?;
+    let details = client.eso_file_details_fresh(addon_id).await?;
     if !json_output {
         print_remote_install_metadata(&details);
     }
@@ -951,7 +967,7 @@ pub async fn update_one(
         .as_ref()
         .and_then(|remote| remote.uid.as_deref())
         .ok_or_else(|| anyhow!("selected addon has no clean remote UID"))?;
-    let details = client.eso_file_details(remote_uid).await?;
+    let details = client.eso_file_details_fresh(remote_uid).await?;
     if !json_output {
         print_remote_install_metadata(&details);
     }
@@ -1098,6 +1114,8 @@ fn local_addon_json(addon: &LocalAddon) -> Value {
         "api_versions": addon.api_versions,
         "depends_on": addon.depends_on,
         "optional_depends_on": addon.optional_depends_on,
+        "saved_variables": addon.saved_variables,
+        "saved_variables_per_character": addon.saved_variables_per_character,
         "is_library": addon.is_library,
         "author": addon.author,
         "description": addon.description,
@@ -2014,6 +2032,8 @@ mod tests {
             api_versions: Vec::new(),
             depends_on: Vec::new(),
             optional_depends_on: Vec::new(),
+            saved_variables: Vec::new(),
+            saved_variables_per_character: Vec::new(),
             is_library: None,
             author: None,
             description: None,
@@ -2039,6 +2059,8 @@ mod tests {
                 category_name: None,
                 downloads: None,
                 monthly_downloads: None,
+                image_urls: Vec::new(),
+                thumbnail_urls: Vec::new(),
                 tier: 1,
                 score: 100,
                 reason: "test".to_owned(),
@@ -2057,6 +2079,8 @@ mod tests {
                 category_name: None,
                 downloads: None,
                 monthly_downloads: None,
+                image_urls: Vec::new(),
+                thumbnail_urls: Vec::new(),
                 tier: 1,
                 score: 100,
                 reason: "test".to_owned(),

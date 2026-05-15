@@ -25,6 +25,8 @@ pub struct LocalAddon {
     pub api_versions: Vec<String>,
     pub depends_on: Vec<String>,
     pub optional_depends_on: Vec<String>,
+    pub saved_variables: Vec<String>,
+    pub saved_variables_per_character: Vec<String>,
     pub is_library: Option<bool>,
     pub author: Option<String>,
     pub description: Option<String>,
@@ -39,6 +41,8 @@ pub struct ManifestInfo {
     pub api_versions: Vec<String>,
     pub depends_on: Vec<String>,
     pub optional_depends_on: Vec<String>,
+    pub saved_variables: Vec<String>,
+    pub saved_variables_per_character: Vec<String>,
     pub is_library: Option<bool>,
     pub author: Option<String>,
     pub description: Option<String>,
@@ -131,6 +135,8 @@ fn scan_addon_folder(folder_path: &Path) -> std::io::Result<LocalAddon> {
         api_versions: parsed.api_versions,
         depends_on: parsed.depends_on,
         optional_depends_on: parsed.optional_depends_on,
+        saved_variables: parsed.saved_variables,
+        saved_variables_per_character: parsed.saved_variables_per_character,
         is_library: parsed.is_library,
         author: parsed.author,
         description: parsed.description,
@@ -203,6 +209,10 @@ pub fn parse_manifest_text(text: &str) -> ManifestInfo {
                     .optional_depends_on
                     .extend(split_dependency_values(&value));
             }
+            "savedvariables" => manifest.saved_variables.extend(split_values(&value)),
+            "savedvariablespercharacter" => manifest
+                .saved_variables_per_character
+                .extend(split_values(&value)),
             "islibrary" => manifest.is_library = parse_bool(&value),
             "author" => manifest.author = Some(value),
             "description" => manifest.description = Some(value),
@@ -336,5 +346,24 @@ Plain text
 
         assert_eq!(true_manifest.is_library, Some(true));
         assert_eq!(false_manifest.is_library, Some(false));
+    }
+
+    #[test]
+    fn parses_saved_variables_fields() {
+        let manifest = parse_manifest_text(
+            r#"
+## SavedVariables: AccountSettings OtherAccountSettings
+## SavedVariablesPerCharacter: CharacterSettings, OtherCharacterSettings
+"#,
+        );
+
+        assert_eq!(
+            manifest.saved_variables,
+            vec!["AccountSettings", "OtherAccountSettings"]
+        );
+        assert_eq!(
+            manifest.saved_variables_per_character,
+            vec!["CharacterSettings", "OtherCharacterSettings"]
+        );
     }
 }

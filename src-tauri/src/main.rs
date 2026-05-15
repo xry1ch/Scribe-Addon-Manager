@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use eso_addon_manager::api::models::{AddonDetails, AddonSummary};
+use eso_addon_manager::api::models::{AddonDetails, AddonSummary, CategorySummary};
 use eso_addon_manager::api::ApiClient;
+use eso_addon_manager::cache::{HttpCache, ResourceKind};
 use eso_addon_manager::install::apply::{
     self, InstallActionPerformed, InstallResult, InstalledItem,
 };
 use eso_addon_manager::install::plan::{self, InstallPlan, InstallPlanAction, InstallPlanItem};
 use eso_addon_manager::install::remote;
+use eso_addon_manager::install::remove::{self, RemoveAddonResult};
 use eso_addon_manager::install::update;
 use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
@@ -24,6 +26,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Debug, Serialize)]
 struct InstalledAddonsResponse {
@@ -39,7 +42,7 @@ struct AddonPathCandidateDto {
     contains_addons: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LocalAddonDto {
     folder_name: String,
     folder_path: String,
@@ -51,6 +54,8 @@ struct LocalAddonDto {
     api_versions: Vec<String>,
     depends_on: Vec<String>,
     optional_depends_on: Vec<String>,
+    saved_variables: Vec<String>,
+    saved_variables_per_character: Vec<String>,
     is_library: Option<bool>,
     author: Option<String>,
     description: Option<String>,
@@ -62,6 +67,26 @@ struct SearchResponse {
     query: String,
     limit: usize,
     results: Vec<AddonSummaryDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseRemoteAddonsResponse {
+    mode: String,
+    query: String,
+    category_id: Option<String>,
+    limit: usize,
+    categories: Vec<RemoteCategoryDto>,
+    category_warning: Option<String>,
+    local_warning: Option<String>,
+    cache_warning: Option<String>,
+    results: Vec<AddonSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RemoteCategoryDto {
+    id: String,
+    name: String,
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +104,21 @@ struct AddonSummaryDto {
     category_name: Option<String>,
     downloads: Option<i64>,
     monthly_downloads: Option<i64>,
+    image_urls: Vec<String>,
+    thumbnail_urls: Vec<String>,
+    installed: bool,
+    installed_local: Option<LocalAddonDto>,
+    installed_match: Option<MatchResultDto>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteAddonDetailsWithLocalStateResponse {
+    details: AddonDetailsDto,
+    installed: bool,
+    local: Option<LocalAddonDto>,
+    match_result: Option<MatchResultDto>,
+    local_warning: Option<String>,
+    cache_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +139,8 @@ struct AddonDetailsDto {
     category_name: Option<String>,
     downloads: Option<i64>,
     monthly_downloads: Option<i64>,
+    image_urls: Vec<String>,
+    thumbnail_urls: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +148,7 @@ struct CheckAddonsResponse {
     addons_dir: String,
     remote_addons_loaded: usize,
     matches: Vec<MatchResultDto>,
+    cache_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -135,6 +178,8 @@ struct RemoteCandidateDto {
     category_name: Option<String>,
     downloads: Option<i64>,
     monthly_downloads: Option<i64>,
+    image_urls: Vec<String>,
+    thumbnail_urls: Vec<String>,
     tier: u8,
     score: usize,
     reason: String,
@@ -148,6 +193,7 @@ struct PlanUpdatesResponse {
     matches: Vec<MatchResultDto>,
     actions: Vec<PlannedActionDto>,
     summary: UpdatePlanSummaryDto,
+    cache_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +282,18 @@ struct InstalledItemDto {
     backup_folder: Option<String>,
     action: String,
     message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoveInstalledAddonResponse {
+    removed_addon: bool,
+    removed_saved_variables: bool,
+    saved_variables_deleted_count: usize,
+    saved_variables_deleted_files: Vec<String>,
+    saved_variables_missing_files: Vec<String>,
+    addon_folder: String,
+    original_path: String,
+    message: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -373,9 +431,33 @@ struct AppStartupInfo {
     detected_addons_dir: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct HttpCacheStatsResponse {
+    cache_dir: String,
+    entry_count: usize,
+    byte_size: u64,
+    size_display: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CachedImageResponse {
+    url: String,
+    data_url: String,
+    content_type: String,
+    from_cache: bool,
+    stale: bool,
+    cache_warning: Option<String>,
+}
+
 struct PreparedRemoteInstall {
     details: AddonDetails,
     plan: InstallPlan,
+}
+
+struct RemoteLocalState {
+    local_addons: Vec<LocalAddon>,
+    metadata: InstalledMetadata,
+    matches: Vec<MatchResult>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +483,24 @@ async fn get_installed_addons(path: Option<String>) -> Result<InstalledAddonsRes
         candidates,
         addons: addons.iter().map(local_addon_dto).collect(),
     })
+}
+
+#[tauri::command]
+async fn remove_installed_addon(
+    folder_name: String,
+    path: Option<String>,
+    remove_saved_variables: bool,
+) -> Result<RemoveInstalledAddonResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let result = remove::remove_installed_addon(
+        &addons_dir,
+        &folder_name,
+        remove_saved_variables,
+    )
+    .map_err(to_string_error)?;
+    remove_installed_metadata(&addons_dir, &result.addon_folder).map_err(to_string_error)?;
+
+    Ok(remove_installed_addon_response(&result))
 }
 
 #[tauri::command]
@@ -436,6 +536,56 @@ async fn save_app_settings(
 async fn reset_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
     let path = settings_path(&app).map_err(to_string_error)?;
     reset_app_settings_at_path(&path).map_err(to_string_error)
+}
+
+#[tauri::command]
+fn get_http_cache_stats() -> Result<HttpCacheStatsResponse, String> {
+    let cache = HttpCache::new().map_err(to_string_error)?;
+    let stats = cache.stats().map_err(to_string_error)?;
+    Ok(HttpCacheStatsResponse {
+        cache_dir: path_string(&stats.cache_dir),
+        entry_count: stats.entry_count,
+        byte_size: stats.byte_size,
+        size_display: format_bytes(stats.byte_size),
+    })
+}
+
+#[tauri::command]
+fn clear_http_cache() -> Result<HttpCacheStatsResponse, String> {
+    let cache = HttpCache::new().map_err(to_string_error)?;
+    cache.clear().map_err(to_string_error)?;
+    let stats = cache.stats().map_err(to_string_error)?;
+    Ok(HttpCacheStatsResponse {
+        cache_dir: path_string(&stats.cache_dir),
+        entry_count: stats.entry_count,
+        byte_size: stats.byte_size,
+        size_display: format_bytes(stats.byte_size),
+    })
+}
+
+#[tauri::command]
+async fn cache_remote_image(url: String) -> Result<CachedImageResponse, String> {
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let response = client
+        .cached_bytes(&url, ResourceKind::Image)
+        .await
+        .map_err(to_string_error)?;
+    let content_type = image_content_type(response.content_type.as_deref(), &url)
+        .ok_or_else(|| "remote resource is not a supported image".to_owned())?;
+    let data_url = format!(
+        "data:{};base64,{}",
+        content_type,
+        base64_encode(&response.bytes)
+    );
+
+    Ok(CachedImageResponse {
+        url,
+        data_url,
+        content_type,
+        from_cache: response.from_cache,
+        stale: response.stale,
+        cache_warning: client.cache_warning_message(),
+    })
 }
 
 #[tauri::command]
@@ -486,6 +636,69 @@ async fn search_remote_addons(
 }
 
 #[tauri::command]
+async fn browse_remote_addons(
+    mode: String,
+    category_id: Option<String>,
+    query: Option<String>,
+    limit: Option<usize>,
+    path: Option<String>,
+    refresh: Option<bool>,
+) -> Result<BrowseRemoteAddonsResponse, String> {
+    let mode = BrowseMode::from_str(&mode).map_err(to_string_error)?;
+    let limit = limit.unwrap_or(25).clamp(1, 100);
+    let query = query.unwrap_or_default();
+    let category_id = normalize_optional_filter(category_id);
+    let refresh = refresh.unwrap_or(false);
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let addons = if refresh {
+        client
+            .eso_file_list_refresh()
+            .await
+            .map_err(to_string_error)?
+    } else {
+        client.eso_file_list().await.map_err(to_string_error)?
+    };
+    let (categories, category_warning) = match if refresh {
+        client.eso_category_list_refresh().await
+    } else {
+        client.eso_category_list().await
+    } {
+        Ok(categories) => (category_dtos(&categories), None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("Category list could not be loaded. {error}")),
+        ),
+    };
+    let local_state = remote_local_state(path.as_deref(), &addons);
+    let local_warning = local_state
+        .as_ref()
+        .err()
+        .map(|error| format!("Installed addons could not be checked. {error}"));
+    let local_state = local_state.ok();
+    let results = browse_remote_results(
+        &addons,
+        &categories,
+        local_state.as_ref(),
+        mode,
+        category_id.as_deref(),
+        query.as_str(),
+        limit,
+    );
+
+    Ok(BrowseRemoteAddonsResponse {
+        mode: mode.as_str().to_owned(),
+        query: query.trim().to_owned(),
+        category_id,
+        limit,
+        categories,
+        category_warning,
+        local_warning,
+        cache_warning: client.cache_warning_message(),
+        results,
+    })
+}
+
+#[tauri::command]
 async fn get_remote_addon_details(addon_id: String) -> Result<AddonDetailsDto, String> {
     let client = ApiClient::new().map_err(to_string_error)?;
     let details = client
@@ -496,6 +709,46 @@ async fn get_remote_addon_details(addon_id: String) -> Result<AddonDetailsDto, S
 }
 
 #[tauri::command]
+async fn get_remote_addon_details_with_local_state(
+    addon_id: String,
+    path: Option<String>,
+) -> Result<RemoteAddonDetailsWithLocalStateResponse, String> {
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let details = client
+        .eso_file_details(&addon_id)
+        .await
+        .map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let local_state = remote_local_state(path.as_deref(), &remote_addons);
+    let local_warning = local_state
+        .as_ref()
+        .err()
+        .map(|error| format!("Installed addons could not be checked. {error}"));
+    let match_result = local_state.ok().and_then(|state| {
+        remote_addon_match(addon_id.as_str(), &remote_addons, &state)
+            .map(|result| match_result_dto(&result, &state.metadata))
+    });
+    let local = match_result.as_ref().map(|result| result.local.clone());
+
+    Ok(RemoteAddonDetailsWithLocalStateResponse {
+        details: addon_details_dto(&details),
+        installed: match_result.is_some(),
+        local,
+        match_result,
+        local_warning,
+        cache_warning: client.cache_warning_message(),
+    })
+}
+
+#[tauri::command]
+async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let url = allowed_external_url(&url).map_err(to_string_error)?;
+    app.opener()
+        .open_url(url.as_str(), None::<&str>)
+        .map_err(to_string_error)
+}
+
+#[tauri::command]
 async fn check_addons(path: Option<String>) -> Result<CheckAddonsResponse, String> {
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
@@ -503,7 +756,8 @@ async fn check_addons(path: Option<String>) -> Result<CheckAddonsResponse, Strin
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
     let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
-    let metadata = ensure_first_run_baseline_complete(&addons_dir, &matches).map_err(to_string_error)?;
+    let metadata =
+        ensure_first_run_baseline_complete(&addons_dir, &matches).map_err(to_string_error)?;
 
     Ok(CheckAddonsResponse {
         addons_dir: path_string(&addons_dir),
@@ -512,6 +766,7 @@ async fn check_addons(path: Option<String>) -> Result<CheckAddonsResponse, Strin
             .iter()
             .map(|result| match_result_dto(result, &metadata))
             .collect(),
+        cache_warning: client.cache_warning_message(),
     })
 }
 
@@ -519,17 +774,27 @@ async fn check_addons(path: Option<String>) -> Result<CheckAddonsResponse, Strin
 async fn plan_updates(
     path: Option<String>,
     include_unknown: Option<bool>,
+    refresh: Option<bool>,
 ) -> Result<PlanUpdatesResponse, String> {
     let include_unknown = include_unknown.unwrap_or(false);
+    let refresh = refresh.unwrap_or(false);
     let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
-    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let remote_addons = if refresh {
+        client
+            .eso_file_list_refresh()
+            .await
+            .map_err(to_string_error)?
+    } else {
+        client.eso_file_list().await.map_err(to_string_error)?
+    };
     let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
     let plan = update_plan::build_update_plan(&matches, include_unknown);
     let summary = plan.summary();
-    let metadata = ensure_first_run_baseline_complete(&addons_dir, &matches).map_err(to_string_error)?;
+    let metadata =
+        ensure_first_run_baseline_complete(&addons_dir, &matches).map_err(to_string_error)?;
 
     Ok(PlanUpdatesResponse {
         addons_dir: path_string(&addons_dir),
@@ -553,6 +818,7 @@ async fn plan_updates(
             ambiguous: summary.ambiguous,
             libraries: summary.libraries,
         },
+        cache_warning: client.cache_warning_message(),
     })
 }
 
@@ -709,6 +975,49 @@ async fn install_remote_addon(
 }
 
 #[tauri::command]
+async fn install_remote_addon_new_only(
+    addon_id: String,
+    path: Option<String>,
+    backup_dir: Option<String>,
+    keep_download: Option<bool>,
+    download_dir: Option<String>,
+) -> Result<InstallRemoteAddonResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let backup_dir = optional_path(backup_dir);
+    let download_dir = optional_path(download_dir);
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let prepared = prepare_remote_install_plan(&client, &addon_id, &addons_dir).await?;
+    validate_new_only_install_plan(&prepared.plan)?;
+
+    if keep_download.unwrap_or(false) {
+        keep_remote_download(
+            &client,
+            &addon_id,
+            &prepared.details,
+            download_dir.as_deref(),
+        )
+        .await?;
+    }
+
+    let result =
+        apply::apply_install_plan(&prepared.plan, backup_dir.as_deref()).map_err(to_string_error)?;
+    record_installed_metadata(
+        &addons_dir,
+        &prepared.details,
+        &addon_id,
+        &result,
+        "remote-install",
+    )
+    .map_err(to_string_error)?;
+    Ok(install_remote_addon_response(
+        &prepared.details,
+        &addons_dir,
+        &prepared.plan,
+        &result,
+    ))
+}
+
+#[tauri::command]
 async fn plan_single_update(
     target: String,
     path: Option<String>,
@@ -845,22 +1154,31 @@ async fn apply_single_update(
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_startup_info,
             get_app_settings,
             save_app_settings,
             reset_app_settings,
+            get_http_cache_stats,
+            clear_http_cache,
+            cache_remote_image,
             path_exists,
             import_existing_addons_as_current,
             get_installed_addons,
+            remove_installed_addon,
             search_remote_addons,
+            browse_remote_addons,
             get_remote_addon_details,
+            get_remote_addon_details_with_local_state,
+            open_external_url,
             check_addons,
             plan_updates,
             plan_update_all,
             apply_update_all,
             plan_remote_install,
             install_remote_addon,
+            install_remote_addon_new_only,
             plan_single_update,
             apply_single_update
         ])
@@ -967,11 +1285,170 @@ fn local_addon_dto(addon: &LocalAddon) -> LocalAddonDto {
         api_versions: addon.api_versions.clone(),
         depends_on: addon.depends_on.clone(),
         optional_depends_on: addon.optional_depends_on.clone(),
+        saved_variables: addon.saved_variables.clone(),
+        saved_variables_per_character: addon.saved_variables_per_character.clone(),
         is_library: addon.is_library,
         author: addon.author.clone(),
         description: addon.description.clone(),
         valid_manifest: addon.valid_manifest,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowseMode {
+    MostDownloaded,
+    Recent,
+}
+
+impl BrowseMode {
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "most_downloaded" => Ok(Self::MostDownloaded),
+            "recent" => Ok(Self::Recent),
+            other => Err(anyhow::anyhow!(
+                "unsupported browse mode '{other}', expected 'most_downloaded' or 'recent'"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MostDownloaded => "most_downloaded",
+            Self::Recent => "recent",
+        }
+    }
+}
+
+fn browse_remote_results(
+    addons: &[AddonSummary],
+    categories: &[RemoteCategoryDto],
+    local_state: Option<&RemoteLocalState>,
+    mode: BrowseMode,
+    category_id: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> Vec<AddonSummaryDto> {
+    let needle = query.trim().to_lowercase();
+    let mut results = addons
+        .iter()
+        .filter(|addon| {
+            addon_matches_category(addon, category_id, categories)
+                && (needle.is_empty() || addon.searchable_text().contains(&needle))
+        })
+        .collect::<Vec<_>>();
+
+    results.sort_by(|left, right| compare_remote_addons(left, right, mode));
+    results
+        .into_iter()
+        .take(limit)
+        .map(|addon| addon_summary_dto_with_local_state(addon, addons, local_state))
+        .collect()
+}
+
+fn compare_remote_addons(left: &AddonSummary, right: &AddonSummary, mode: BrowseMode) -> std::cmp::Ordering {
+    let primary = match mode {
+        BrowseMode::MostDownloaded => right
+            .downloads()
+            .unwrap_or(-1)
+            .cmp(&left.downloads().unwrap_or(-1)),
+        BrowseMode::Recent => right.date.unwrap_or(0).cmp(&left.date.unwrap_or(0)),
+    };
+
+    primary
+        .then_with(|| right.date.unwrap_or(0).cmp(&left.date.unwrap_or(0)))
+        .then_with(|| {
+            right.downloads()
+                .unwrap_or(-1)
+                .cmp(&left.downloads().unwrap_or(-1))
+        })
+        .then_with(|| {
+            display_remote_name(left)
+                .to_lowercase()
+                .cmp(&display_remote_name(right).to_lowercase())
+        })
+}
+
+fn display_remote_name(addon: &AddonSummary) -> &str {
+    addon.name.as_deref().unwrap_or("")
+}
+
+fn addon_matches_category(
+    addon: &AddonSummary,
+    category_id: Option<&str>,
+    categories: &[RemoteCategoryDto],
+) -> bool {
+    let Some(category_id) = category_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    if addon
+        .category_id()
+        .as_deref()
+        .is_some_and(|id| id.trim() == category_id)
+    {
+        return true;
+    }
+
+    let Some(selected_name) = categories
+        .iter()
+        .find(|category| category.id == category_id)
+        .map(|category| normalize_category_name(&category.name))
+    else {
+        return false;
+    };
+
+    addon
+        .category_name()
+        .as_deref()
+        .is_some_and(|name| normalize_category_name(name) == selected_name)
+}
+
+fn normalize_optional_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_category_name(value: &str) -> String {
+    value
+        .to_lowercase()
+        .replace('&', "and")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn category_dtos(categories: &[CategorySummary]) -> Vec<RemoteCategoryDto> {
+    let mut output = categories
+        .iter()
+        .filter_map(category_dto)
+        .collect::<Vec<_>>();
+    output.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    output
+}
+
+fn category_dto(category: &CategorySummary) -> Option<RemoteCategoryDto> {
+    let id = category.id()?;
+    let name = category.name()?;
+    Some(RemoteCategoryDto {
+        id,
+        name,
+        parent_id: category.parent_id(),
+    })
 }
 
 fn addon_summary_dto(addon: &AddonSummary) -> AddonSummaryDto {
@@ -989,6 +1466,137 @@ fn addon_summary_dto(addon: &AddonSummary) -> AddonSummaryDto {
         category_name: addon.category_name(),
         downloads: addon.downloads(),
         monthly_downloads: addon.monthly_downloads(),
+        image_urls: addon.image_urls(),
+        thumbnail_urls: addon.thumbnail_urls(),
+        installed: false,
+        installed_local: None,
+        installed_match: None,
+    }
+}
+
+fn addon_summary_dto_with_local_state(
+    addon: &AddonSummary,
+    remote_addons: &[AddonSummary],
+    local_state: Option<&RemoteLocalState>,
+) -> AddonSummaryDto {
+    let mut dto = addon_summary_dto(addon);
+    let Some(addon_id) = addon.uid.as_deref() else {
+        return dto;
+    };
+    let Some(local_state) = local_state else {
+        return dto;
+    };
+    if let Some(result) = remote_addon_match(addon_id, remote_addons, local_state) {
+        dto.installed = true;
+        dto.installed_local = Some(local_addon_dto(&result.local));
+        dto.installed_match = Some(match_result_dto(&result, &local_state.metadata));
+    }
+    dto
+}
+
+fn remote_local_state(path: Option<&str>, remote_addons: &[AddonSummary]) -> anyhow::Result<RemoteLocalState> {
+    let addons_dir = resolve_addons_dir(path)?;
+    let local_addons = local::scan_addons_dir(&addons_dir)?;
+    let metadata = load_installed_metadata(&addons_dir);
+    let matches = match_remote::match_installed_addons(&local_addons, remote_addons);
+
+    Ok(RemoteLocalState {
+        local_addons,
+        metadata,
+        matches,
+    })
+}
+
+fn remote_addon_match(
+    addon_id: &str,
+    remote_addons: &[AddonSummary],
+    local_state: &RemoteLocalState,
+) -> Option<MatchResult> {
+    let remote = remote_addons
+        .iter()
+        .find(|remote| remote.uid.as_deref() == Some(addon_id))?;
+
+    metadata_remote_match(addon_id, remote, local_state).or_else(|| {
+        local_state
+            .matches
+            .iter()
+            .find(|result| {
+                result
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.uid.as_deref())
+                    == Some(addon_id)
+            })
+            .cloned()
+    })
+}
+
+fn metadata_remote_match(
+    addon_id: &str,
+    remote: &AddonSummary,
+    local_state: &RemoteLocalState,
+) -> Option<MatchResult> {
+    local_state
+        .metadata
+        .addons
+        .iter()
+        .find(|(_, metadata)| metadata.remote_uid.as_deref() == Some(addon_id))
+        .and_then(|(folder_name, _)| {
+            local_state
+                .local_addons
+                .iter()
+                .find(|local| local.folder_name == *folder_name && local.valid_manifest)
+        })
+        .map(|local| MatchResult {
+            local: local.clone(),
+            status: match_status_for_remote(local, remote),
+            remote: Some(remote_candidate_from_summary(
+                remote,
+                0,
+                120,
+                "metadata-remote-uid",
+            )),
+            candidates: Vec::new(),
+            debug_candidates: Vec::new(),
+        })
+}
+
+fn match_status_for_remote(local: &LocalAddon, remote: &AddonSummary) -> match_remote::MatchStatus {
+    let local_version = local.addon_version.as_deref().or(local.version.as_deref());
+    let remote_version = remote.version.as_deref();
+
+    match compare_versions(local_version, remote_version) {
+        VersionComparison::RemoteNewer => match_remote::MatchStatus::PossibleUpdate,
+        VersionComparison::Same => match_remote::MatchStatus::Matched,
+        VersionComparison::LocalNewer => match_remote::MatchStatus::LocalNewer,
+        VersionComparison::Unknown => match_remote::MatchStatus::UnknownUpdate,
+    }
+}
+
+fn remote_candidate_from_summary(
+    remote: &AddonSummary,
+    tier: u8,
+    score: usize,
+    reason: &str,
+) -> RemoteCandidate {
+    RemoteCandidate {
+        uid: remote.uid.clone(),
+        name: remote.name.clone(),
+        author_name: remote.author_name.clone(),
+        version: remote.version.clone(),
+        updated: remote.date,
+        file_info_url: remote.file_info_url.clone(),
+        summary: remote.summary.clone(),
+        directories: remote.directories.clone(),
+        category_id: remote.category_id(),
+        category_name: remote.category_name(),
+        downloads: remote.downloads(),
+        monthly_downloads: remote.monthly_downloads(),
+        image_urls: remote.image_urls(),
+        thumbnail_urls: remote.thumbnail_urls(),
+        tier,
+        score,
+        reason: reason.to_owned(),
     }
 }
 
@@ -1010,6 +1618,8 @@ fn addon_details_dto(details: &AddonDetails) -> AddonDetailsDto {
         category_name: details.category_name(),
         downloads: details.downloads(),
         monthly_downloads: details.monthly_downloads(),
+        image_urls: details.image_urls(),
+        thumbnail_urls: details.thumbnail_urls(),
     }
 }
 
@@ -1046,6 +1656,8 @@ fn remote_candidate_dto(candidate: &RemoteCandidate) -> RemoteCandidateDto {
         category_name: candidate.category_name.clone(),
         downloads: candidate.downloads,
         monthly_downloads: candidate.monthly_downloads,
+        image_urls: candidate.image_urls.clone(),
+        thumbnail_urls: candidate.thumbnail_urls.clone(),
         tier: candidate.tier,
         score: candidate.score,
         reason: candidate.reason.clone(),
@@ -1409,6 +2021,25 @@ fn install_plan_item_dto(item: &InstallPlanItem) -> InstallPlanItemDto {
     }
 }
 
+fn validate_new_only_install_plan(plan: &InstallPlan) -> Result<(), String> {
+    if plan.items.is_empty() {
+        return Err("install plan has no valid addon folders to install".to_owned());
+    }
+
+    if plan
+        .items
+        .iter()
+        .all(|item| matches!(item.action, InstallPlanAction::WouldInstallNew))
+    {
+        return Ok(());
+    }
+
+    Err(
+        "install preview requires confirmation because the package would replace existing folders or contains skipped/invalid addon folders"
+            .to_owned(),
+    )
+}
+
 async fn prepare_remote_install_plan(
     client: &ApiClient,
     addon_id: &str,
@@ -1417,7 +2048,7 @@ async fn prepare_remote_install_plan(
     let installed_addons =
         scan_installed_addons_for_install(addons_dir).map_err(to_string_error)?;
     let details = client
-        .eso_file_details(addon_id)
+        .eso_file_details_fresh(addon_id)
         .await
         .map_err(to_string_error)?;
     let download_url = remote::download_url(&details).map_err(to_string_error)?;
@@ -1532,6 +2163,22 @@ fn save_installed_metadata(
         fs::create_dir_all(parent)?;
     }
     fs::write(path, serde_json::to_string_pretty(metadata)?)?;
+    Ok(())
+}
+
+fn remove_installed_metadata(addons_dir: &std::path::Path, folder_name: &str) -> anyhow::Result<()> {
+    let mut metadata = load_installed_metadata(addons_dir);
+    let matching_key = metadata
+        .addons
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(folder_name))
+        .cloned();
+
+    if let Some(key) = matching_key {
+        metadata.addons.remove(&key);
+        save_installed_metadata(addons_dir, &metadata)?;
+    }
+
     Ok(())
 }
 
@@ -1705,6 +2352,19 @@ fn installed_item_dto(item: &InstalledItem) -> InstalledItemDto {
     }
 }
 
+fn remove_installed_addon_response(result: &RemoveAddonResult) -> RemoveInstalledAddonResponse {
+    RemoveInstalledAddonResponse {
+        removed_addon: result.removed_addon,
+        removed_saved_variables: result.removed_saved_variables,
+        saved_variables_deleted_count: result.saved_variables_deleted_count,
+        saved_variables_deleted_files: result.saved_variables_deleted_files.clone(),
+        saved_variables_missing_files: result.saved_variables_missing_files.clone(),
+        addon_folder: result.addon_folder.clone(),
+        original_path: path_string(&result.original_path),
+        message: result.message.clone(),
+    }
+}
+
 async fn keep_remote_download(
     client: &ApiClient,
     addon_id: &str,
@@ -1797,8 +2457,80 @@ fn scan_installed_addons_for_install(
     Ok(local::scan_addons_dir(addons_dir)?)
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_index])
+    }
+}
+
+fn image_content_type(content_type: Option<&str>, url: &str) -> Option<String> {
+    if let Some(content_type) = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| value.starts_with("image/"))
+    {
+        return Some(content_type.to_owned());
+    }
+
+    let url_path = tauri::Url::parse(url).ok()?.path().to_lowercase();
+    if url_path.ends_with(".png") {
+        Some("image/png".to_owned())
+    } else if url_path.ends_with(".jpg") || url_path.ends_with(".jpeg") {
+        Some("image/jpeg".to_owned())
+    } else if url_path.ends_with(".gif") {
+        Some("image/gif".to_owned())
+    } else if url_path.ends_with(".webp") {
+        Some("image/webp".to_owned())
+    } else {
+        None
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        let combined = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+        output.push(TABLE[((combined >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((combined >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((combined >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(combined & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 fn path_string(path: &std::path::Path) -> String {
     path.display().to_string()
+}
+
+fn allowed_external_url(value: &str) -> anyhow::Result<String> {
+    let parsed = tauri::Url::parse(value.trim())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(anyhow::anyhow!(
+            "only http:// and https:// URLs can be opened"
+        ));
+    }
+    Ok(parsed.into())
 }
 
 fn format_mmoui_date(timestamp: i64) -> String {
@@ -1906,6 +2638,15 @@ mod tests {
 
         assert!(!content.contains("force"));
         assert!(!content.contains("reinstall"));
+    }
+
+    #[test]
+    fn external_url_allows_only_http_and_https() {
+        assert!(allowed_external_url("https://www.esoui.com/downloads/info7.html").is_ok());
+        assert!(allowed_external_url("http://www.esoui.com/downloads/info7.html").is_ok());
+        assert!(allowed_external_url("javascript:alert(1)").is_err());
+        assert!(allowed_external_url("file:///C:/Windows/notepad.exe").is_err());
+        assert!(allowed_external_url("mailto:someone@example.com").is_err());
     }
 
     #[test]
@@ -2059,6 +2800,145 @@ mod tests {
         assert_eq!(current.confidence, "current");
     }
 
+    #[test]
+    fn browse_most_downloaded_sorts_descending_and_limits() {
+        let addons = vec![
+            test_addon_summary("1", "Low", "10", 100, "17", "Graphic UI Mods"),
+            test_addon_summary("2", "High", "50", 90, "17", "Graphic UI Mods"),
+            test_addon_summary("3", "Mid", "25", 110, "17", "Graphic UI Mods"),
+        ];
+
+        let results = browse_remote_results(&addons, &[], None, BrowseMode::MostDownloaded, None, "", 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].uid.as_deref(), Some("2"));
+        assert_eq!(results[1].uid.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn browse_recent_sorts_by_updated_date_and_filters_query() {
+        let addons = vec![
+            test_addon_summary_with_summary(
+                "1",
+                "Older",
+                "10",
+                100,
+                "17",
+                "Graphic UI Mods",
+                "compass tools",
+            ),
+            test_addon_summary_with_summary(
+                "2",
+                "Newest",
+                "50",
+                300,
+                "17",
+                "Graphic UI Mods",
+                "combat display",
+            ),
+            test_addon_summary_with_summary(
+                "3",
+                "Newer",
+                "25",
+                200,
+                "17",
+                "Graphic UI Mods",
+                "combat feedback",
+            ),
+        ];
+
+        let results = browse_remote_results(&addons, &[], None, BrowseMode::Recent, None, "combat", 25);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].uid.as_deref(), Some("2"));
+        assert_eq!(results[1].uid.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn browse_category_filter_uses_id_and_name_fallback() {
+        let categories = vec![RemoteCategoryDto {
+            id: "17".to_owned(),
+            name: "Graphic UI Mods".to_owned(),
+            parent_id: None,
+        }];
+        let addons = vec![
+            test_addon_summary("1", "Direct", "10", 100, "17", "Different name"),
+            test_addon_summary("2", "Fallback", "20", 110, "", "Graphic UI Mods"),
+            test_addon_summary("3", "Other", "30", 120, "25", "Combat Mods"),
+        ];
+
+        let results = browse_remote_results(
+            &addons,
+            &categories,
+            None,
+            BrowseMode::MostDownloaded,
+            Some("17"),
+            "",
+            25,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].uid.as_deref(), Some("2"));
+        assert_eq!(results[1].uid.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn remote_addon_match_prefers_stored_remote_uid() {
+        let local_addons = vec![test_local_addon("DifferentFolder", true, false)];
+        let remote_addons = vec![test_addon_summary(
+            "42",
+            "Different Remote Name",
+            "10",
+            100,
+            "17",
+            "Graphic UI Mods",
+        )];
+        let mut metadata = InstalledMetadata::default();
+        metadata.addons.insert(
+            "DifferentFolder".to_owned(),
+            InstalledAddonMetadata {
+                remote_uid: Some("42".to_owned()),
+                remote_version: Some("1.0.0".to_owned()),
+                remote_date: Some(100),
+                downloaded_filename: None,
+                md5: None,
+                installed_timestamp: "2026-01-01T00:00:00Z".to_owned(),
+                source: "install".to_owned(),
+            },
+        );
+        let state = test_remote_local_state(local_addons, metadata, &remote_addons);
+
+        let result = remote_addon_match("42", &remote_addons, &state).expect("installed match");
+
+        assert_eq!(result.local.folder_name, "DifferentFolder");
+        assert_eq!(
+            result.remote.as_ref().map(|remote| remote.reason.as_str()),
+            Some("metadata-remote-uid")
+        );
+    }
+
+    #[test]
+    fn remote_addon_match_falls_back_to_manifest_title_and_folder() {
+        let local_addons = vec![test_local_addon("HARDCORE", true, false)];
+        let remote_addons = vec![test_addon_summary(
+            "9001",
+            "HARDCORE",
+            "10",
+            100,
+            "25",
+            "Combat Mods",
+        )];
+        let state = test_remote_local_state(local_addons, InstalledMetadata::default(), &remote_addons);
+
+        let result = remote_addon_match("9001", &remote_addons, &state).expect("installed match");
+
+        assert_eq!(result.local.folder_name, "HARDCORE");
+        assert_eq!(
+            result.remote.as_ref().and_then(|remote| remote.uid.as_deref()),
+            Some("9001")
+        );
+    }
+
     fn test_local_addon(folder_name: &str, valid_manifest: bool, is_library: bool) -> LocalAddon {
         LocalAddon {
             folder_name: folder_name.to_owned(),
@@ -2070,6 +2950,8 @@ mod tests {
             api_versions: Vec::new(),
             depends_on: Vec::new(),
             optional_depends_on: Vec::new(),
+            saved_variables: Vec::new(),
+            saved_variables_per_character: Vec::new(),
             is_library: Some(is_library),
             author: None,
             description: None,
@@ -2091,9 +2973,66 @@ mod tests {
             category_name: None,
             downloads: None,
             monthly_downloads: None,
+            image_urls: Vec::new(),
+            thumbnail_urls: Vec::new(),
             tier: 1,
             score: 100,
             reason: "test".to_owned(),
+        }
+    }
+
+    fn test_addon_summary(
+        uid: &str,
+        name: &str,
+        downloads: &str,
+        date: i64,
+        category_id: &str,
+        category_name: &str,
+    ) -> AddonSummary {
+        test_addon_summary_with_summary(
+            uid,
+            name,
+            downloads,
+            date,
+            category_id,
+            category_name,
+            "",
+        )
+    }
+
+    fn test_addon_summary_with_summary(
+        uid: &str,
+        name: &str,
+        downloads: &str,
+        date: i64,
+        category_id: &str,
+        category_name: &str,
+        summary: &str,
+    ) -> AddonSummary {
+        serde_json::from_value(serde_json::json!({
+            "UID": uid,
+            "UIName": name,
+            "UIAuthorName": "Author",
+            "UIVersion": "1.0.0",
+            "UISummary": summary,
+            "UIDate": date,
+            "UIDownloadTotal": downloads,
+            "UICATID": category_id,
+            "UICATTitle": category_name
+        }))
+        .expect("valid addon summary")
+    }
+
+    fn test_remote_local_state(
+        local_addons: Vec<LocalAddon>,
+        metadata: InstalledMetadata,
+        remote_addons: &[AddonSummary],
+    ) -> RemoteLocalState {
+        let matches = match_remote::match_installed_addons(&local_addons, remote_addons);
+        RemoteLocalState {
+            local_addons,
+            metadata,
+            matches,
         }
     }
 }
