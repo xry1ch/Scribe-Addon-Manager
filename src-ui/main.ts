@@ -82,6 +82,9 @@ interface AppState {
   installedFilter: InstalledFilter;
   installedSort: InstalledSort;
   searchLimit: number;
+  searchPageSize: number;
+  visibleSearchCount: number;
+  totalSearchMatches: number;
   searchResults: AddonSummary[];
   selectedSummary: AddonSummary | null;
   selectedDetails: AddonDetails | null;
@@ -159,6 +162,9 @@ const state: AppState = {
   installedFilter: "all",
   installedSort: "status",
   searchLimit: 25,
+  searchPageSize: 25,
+  visibleSearchCount: 25,
+  totalSearchMatches: 0,
   searchResults: [],
   selectedSummary: null,
   selectedDetails: null,
@@ -207,6 +213,10 @@ const app = appRoot;
 const ADDON_CONTEXT_MENU_WIDTH = 224;
 const ADDON_CONTEXT_MENU_HEIGHT = 132;
 const CONTEXT_MENU_MARGIN = 8;
+const SEARCH_SCROLL_THRESHOLD_PX = 300;
+
+let searchScrollContainer: HTMLElement | null = null;
+let searchScrollHandler: (() => void) | null = null;
 
 document.addEventListener("contextmenu", handleGlobalContextMenu);
 document.addEventListener("pointerdown", (event) => {
@@ -252,6 +262,8 @@ window.addEventListener("keydown", (event) => {
 });
 
 function render() {
+  unbindSearchScrollListener();
+
   if (state.needsInitialSetup) {
     app.innerHTML = renderInitialSetup();
     bindInitialSetupEvents();
@@ -543,17 +555,12 @@ function installedSubtitle(addon: LocalAddon, author: string | null, category: s
 }
 
 function renderSearch() {
-  const hasQuery = state.searchAppliedQuery.trim().length > 0;
+  const hasQuery = isTypedSearchActive();
   const hasCategoryFilter = state.searchCategoryId.trim().length > 0;
   const showSearchSkeleton = isSearchLoading() || (!state.searchLoaded && !state.error);
-  const resultTitle = hasQuery
-    ? `Search results for "${state.searchAppliedQuery.trim()}"`
-    : state.searchMode === "recent"
-      ? "Recent addons"
-      : "Most downloaded addons";
   return `
     ${pageHeader("Search", "Discover addons from remote metadata.", "")}
-    <section class="control-panel search-controls">
+    <section class="control-panel search-controls ${hasQuery ? "typed-search-controls" : ""}">
       <div class="field search-mode-field">
         <span>Mode</span>
         <div class="chip-row search-mode-buttons" role="group" aria-label="Search mode">
@@ -575,27 +582,77 @@ function renderSearch() {
           ${state.remoteCategories.map((category) => `<option value="${escapeAttr(category.id)}" ${state.searchCategoryId === category.id ? "selected" : ""}>${escapeHtml(category.name)}</option>`).join("")}
         </select>
       </label>
-      <label class="field limit-field">
-        <span>Limit</span>
-        <select id="search-limit" ${disabledAttr()}>
-          ${[10, 25, 50, 100].map((value) => `<option value="${value}" ${state.searchLimit === value ? "selected" : ""}>${value}</option>`).join("")}
-        </select>
-      </label>
+      ${hasQuery ? "" : renderSearchLimitControl()}
     </section>
     ${state.searchCategoryWarning ? `<div class="banner warning compact-banner">${escapeHtml(state.searchCategoryWarning)}</div>` : ""}
-    ${state.searchLoaded || showSearchSkeleton ? `<p class="result-caption">${escapeHtml(resultTitle)}${hasCategoryFilter ? ` - ${escapeHtml(selectedCategoryName())}` : ""}</p>` : ""}
-    <section class="addon-list">
-      ${
-        showSearchSkeleton
-          ? renderSkeletonCards(6)
-          : !state.searchLoaded
-            ? emptyState("Remote addons unavailable", "Resolve the error above, then refresh Search.")
-            : state.searchResults.length === 0
-              ? emptyState("No matching addons", "No remote addons matched the current mode, category, and search filters.")
-            : state.searchResults.map(renderSearchCard).join("")
-      }
-    </section>
+    ${state.searchLoaded || showSearchSkeleton ? renderSearchResultSummary(showSearchSkeleton, hasCategoryFilter) : ""}
+    <section class="addon-list" id="search-list">${renderSearchList(showSearchSkeleton)}</section>
+    ${renderSearchIncrementStatus(showSearchSkeleton)}
   `;
+}
+
+function renderSearchLimitControl() {
+  return `
+    <label class="field limit-field">
+      <span>Limit</span>
+      <select id="search-limit" ${disabledAttr()}>
+        ${[10, 25, 50, 100].map((value) => `<option value="${value}" ${state.searchLimit === value ? "selected" : ""}>${value}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function renderSearchResultSummary(showSearchSkeleton: boolean, hasCategoryFilter = state.searchCategoryId.trim().length > 0) {
+  const resultTitle = searchResultTitle();
+  const categorySuffix = hasCategoryFilter ? ` - ${selectedCategoryName()}` : "";
+
+  if (isTypedSearchActive()) {
+    const subtext = showSearchSkeleton
+      ? "Loading results..."
+      : `Showing ${visibleSearchResults().length} of ${state.totalSearchMatches} results${categorySuffix}`;
+    return `
+      <div class="result-caption search-result-summary" id="search-result-summary">
+        <strong>${escapeHtml(resultTitle)}</strong>
+        <span>${escapeHtml(subtext)}</span>
+      </div>
+    `;
+  }
+
+  return `<p class="result-caption" id="search-result-summary">${escapeHtml(resultTitle)}${escapeHtml(categorySuffix)}</p>`;
+}
+
+function searchResultTitle() {
+  if (isTypedSearchActive()) return `Search results for "${state.searchAppliedQuery.trim()}"`;
+  return state.searchMode === "recent" ? "Recent addons" : "Most downloaded addons";
+}
+
+function renderSearchList(showSearchSkeleton: boolean) {
+  if (showSearchSkeleton) return renderSkeletonCards(6);
+  if (!state.searchLoaded) return emptyState("Remote addons unavailable", "Resolve the error above, then refresh Search.");
+  if (state.searchResults.length === 0) return emptyState("No matching addons", "No remote addons matched the current mode, category, and search filters.");
+  return visibleSearchResults().map(renderSearchCard).join("");
+}
+
+function renderSearchIncrementStatus(showSearchSkeleton: boolean) {
+  if (!isTypedSearchActive() || showSearchSkeleton || !state.searchLoaded || state.searchResults.length === 0) return "";
+  return `<p class="search-load-status" id="search-load-status">${hasMoreSearchResults() ? "Scroll to load more" : "All results shown"}</p>`;
+}
+
+function isTypedSearchActive() {
+  return state.searchAppliedQuery.trim().length > 0;
+}
+
+function visibleSearchResults() {
+  if (!isTypedSearchActive()) return state.searchResults;
+  return state.searchResults.slice(0, Math.min(state.visibleSearchCount, state.searchResults.length));
+}
+
+function hasMoreSearchResults() {
+  return isTypedSearchActive() && state.visibleSearchCount < state.totalSearchMatches;
+}
+
+function resetSearchPagination() {
+  state.visibleSearchCount = state.searchPageSize;
 }
 
 function searchModeButton(mode: SearchMode, label: string) {
@@ -1602,10 +1659,6 @@ function bindTabEvents() {
   document.querySelector<HTMLInputElement>("#search-query")?.addEventListener("input", (event) => {
     const value = (event.currentTarget as HTMLInputElement).value;
     state.searchQuery = value;
-    if (!value.trim() && state.searchAppliedQuery) {
-      state.searchAppliedQuery = "";
-      void loadSearchResults();
-    }
   });
   document.querySelector<HTMLInputElement>("#search-query")?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -1615,15 +1668,18 @@ function bindTabEvents() {
   });
   document.querySelector<HTMLSelectElement>("#search-limit")?.addEventListener("change", (event) => {
     state.searchLimit = Number((event.currentTarget as HTMLSelectElement).value);
+    resetSearchPagination();
     void loadSearchResults();
   });
   document.querySelector<HTMLSelectElement>("#search-category")?.addEventListener("change", (event) => {
     state.searchCategoryId = (event.currentTarget as HTMLSelectElement).value;
+    resetSearchPagination();
     void loadSearchResults();
   });
   document.querySelectorAll<HTMLButtonElement>("[data-search-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       state.searchMode = button.dataset.searchMode as SearchMode;
+      resetSearchPagination();
       void loadSearchResults();
     });
   });
@@ -1697,6 +1753,7 @@ function bindTabEvents() {
   });
   if (state.tab === "search") {
     ensureSearchLoaded();
+    bindSearchScrollLoading();
   }
   if (state.tab === "settings") {
     ensureHttpCacheStatsLoaded();
@@ -1834,6 +1891,67 @@ function bindCardEventsOnly() {
   });
 }
 
+function renderSearchResultsOnly() {
+  const summary = document.querySelector<HTMLElement>("#search-result-summary");
+  if (summary) {
+    summary.outerHTML = renderSearchResultSummary(false);
+  }
+
+  const list = document.querySelector<HTMLElement>("#search-list");
+  if (!list) return;
+  list.innerHTML = renderSearchList(false);
+
+  const status = document.querySelector<HTMLElement>("#search-load-status");
+  const statusHtml = renderSearchIncrementStatus(false);
+  if (status) {
+    if (statusHtml) {
+      status.outerHTML = statusHtml;
+    } else {
+      status.remove();
+    }
+  } else if (statusHtml) {
+    list.insertAdjacentHTML("afterend", statusHtml);
+  }
+
+  bindCardEventsOnly();
+  bindSearchScrollLoading();
+}
+
+function bindSearchScrollLoading() {
+  unbindSearchScrollListener();
+  if (state.tab !== "search" || !state.searchLoaded || !hasMoreSearchResults() || isSearchLoading()) return;
+
+  const container = document.querySelector<HTMLElement>(".content");
+  if (!container) return;
+
+  const handler = () => {
+    if (state.tab !== "search" || !state.searchLoaded || !hasMoreSearchResults() || isSearchLoading()) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (distanceFromBottom > SEARCH_SCROLL_THRESHOLD_PX) return;
+    loadMoreSearchResults();
+  };
+
+  container.addEventListener("scroll", handler, { passive: true });
+  searchScrollContainer = container;
+  searchScrollHandler = handler;
+}
+
+function unbindSearchScrollListener() {
+  if (searchScrollContainer && searchScrollHandler) {
+    searchScrollContainer.removeEventListener("scroll", searchScrollHandler);
+  }
+  searchScrollContainer = null;
+  searchScrollHandler = null;
+}
+
+function loadMoreSearchResults() {
+  if (!hasMoreSearchResults()) return;
+  const nextVisibleCount = Math.min(state.visibleSearchCount + state.searchPageSize, state.totalSearchMatches);
+  if (nextVisibleCount === state.visibleSearchCount) return;
+  state.visibleSearchCount = nextVisibleCount;
+  renderSearchResultsOnly();
+}
+
 async function browseInitialSetupFolder() {
   const selected = await browseForFolder(state.setupAddonsPath || state.detectedAddonsPath);
   if (!selected) return;
@@ -1902,6 +2020,7 @@ async function refreshInstalledData(refresh = false) {
 
 function runSearch() {
   state.searchAppliedQuery = state.searchQuery.trim();
+  resetSearchPagination();
   return loadSearchResults(true);
 }
 
@@ -1912,6 +2031,7 @@ function ensureSearchLoaded() {
 
 function loadSearchResults(refresh = false) {
   state.searchLoadAttempted = true;
+  resetSearchPagination();
   return withLoading(async () => {
     const response = await invoke<BrowseRemoteAddonsResponse>("browse_remote_addons", {
       mode: state.searchMode,
@@ -1924,8 +2044,11 @@ function loadSearchResults(refresh = false) {
     state.searchMode = response.mode === "recent" ? "recent" : "most_downloaded";
     state.searchAppliedQuery = response.query;
     state.searchCategoryId = response.category_id ?? "";
-    state.searchLimit = response.limit;
+    if (!state.searchAppliedQuery) {
+      state.searchLimit = response.limit;
+    }
     state.searchResults = response.results;
+    state.totalSearchMatches = response.results.length;
     state.remoteCategories = response.categories;
     state.searchCategoryWarning = [response.cache_warning, response.category_warning, response.local_warning].filter(Boolean).join(" ");
     state.searchLoaded = true;

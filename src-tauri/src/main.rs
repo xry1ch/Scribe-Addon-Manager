@@ -741,6 +741,11 @@ async fn browse_remote_addons(
     let mode = BrowseMode::from_str(&mode).map_err(to_string_error)?;
     let limit = limit.unwrap_or(25).clamp(1, 100);
     let query = query.unwrap_or_default();
+    let result_limit = if query.trim().is_empty() {
+        Some(limit)
+    } else {
+        None
+    };
     let category_id = normalize_optional_filter(category_id);
     let refresh = refresh.unwrap_or(false);
     let client = ApiClient::new().map_err(to_string_error)?;
@@ -776,7 +781,7 @@ async fn browse_remote_addons(
         mode,
         category_id.as_deref(),
         query.as_str(),
-        limit,
+        result_limit,
     );
 
     Ok(BrowseRemoteAddonsResponse {
@@ -1452,7 +1457,7 @@ fn browse_remote_results(
     mode: BrowseMode,
     category_id: Option<&str>,
     query: &str,
-    limit: usize,
+    limit: Option<usize>,
 ) -> Vec<AddonSummaryDto> {
     let needle = query.trim().to_lowercase();
     let mut results = addons
@@ -1464,9 +1469,14 @@ fn browse_remote_results(
         .collect::<Vec<_>>();
 
     results.sort_by(|left, right| compare_remote_addons(left, right, mode));
+    let results = if let Some(limit) = limit {
+        results.into_iter().take(limit).collect::<Vec<_>>()
+    } else {
+        results
+    };
+
     results
         .into_iter()
-        .take(limit)
         .map(|addon| addon_summary_dto_with_local_state(addon, addons, local_state))
         .collect()
 }
@@ -3274,8 +3284,15 @@ mod tests {
             test_addon_summary("3", "Mid", "25", 110, "17", "Graphic UI Mods"),
         ];
 
-        let results =
-            browse_remote_results(&addons, &[], None, BrowseMode::MostDownloaded, None, "", 2);
+        let results = browse_remote_results(
+            &addons,
+            &[],
+            None,
+            BrowseMode::MostDownloaded,
+            None,
+            "",
+            Some(2),
+        );
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].uid.as_deref(), Some("2"));
@@ -3314,12 +3331,60 @@ mod tests {
             ),
         ];
 
-        let results =
-            browse_remote_results(&addons, &[], None, BrowseMode::Recent, None, "combat", 25);
+        let results = browse_remote_results(
+            &addons,
+            &[],
+            None,
+            BrowseMode::Recent,
+            None,
+            "combat",
+            Some(25),
+        );
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].uid.as_deref(), Some("2"));
         assert_eq!(results[1].uid.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn browse_query_can_return_all_matches_without_limit() {
+        let addons = vec![
+            test_addon_summary_with_summary(
+                "1",
+                "Older",
+                "10",
+                100,
+                "17",
+                "Graphic UI Mods",
+                "combat tools",
+            ),
+            test_addon_summary_with_summary(
+                "2",
+                "Newest",
+                "50",
+                300,
+                "17",
+                "Graphic UI Mods",
+                "combat display",
+            ),
+            test_addon_summary_with_summary(
+                "3",
+                "Newer",
+                "25",
+                200,
+                "17",
+                "Graphic UI Mods",
+                "combat feedback",
+            ),
+        ];
+
+        let results =
+            browse_remote_results(&addons, &[], None, BrowseMode::Recent, None, "combat", None);
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].uid.as_deref(), Some("2"));
+        assert_eq!(results[1].uid.as_deref(), Some("3"));
+        assert_eq!(results[2].uid.as_deref(), Some("1"));
     }
 
     #[test]
@@ -3342,7 +3407,7 @@ mod tests {
             BrowseMode::MostDownloaded,
             Some("17"),
             "",
-            25,
+            Some(25),
         );
 
         assert_eq!(results.len(), 2);

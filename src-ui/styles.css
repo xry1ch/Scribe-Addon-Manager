@@ -469,6 +469,13 @@ select:disabled {
     minmax(90px, 120px);
 }
 
+.control-panel.search-controls.typed-search-controls {
+  grid-template-columns:
+    minmax(220px, 260px)
+    minmax(260px, 1fr)
+    minmax(180px, 320px);
+}
+
 .search-controls .field {
   min-width: 0;
 }
@@ -489,6 +496,28 @@ select:disabled {
   color: var(--muted-strong);
   font-size: 13px;
   font-weight: 800;
+}
+
+.search-result-summary {
+  display: grid;
+  gap: 3px;
+}
+
+.search-result-summary strong {
+  color: var(--text-strong);
+  font-size: 15px;
+}
+
+.search-result-summary span,
+.search-load-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.search-load-status {
+  margin: 14px 0 0;
+  text-align: center;
 }
 
 .control-panel.stacked {
@@ -552,6 +581,10 @@ input::placeholder {
     grid-template-columns: minmax(0, 1fr) minmax(90px, 140px);
   }
 
+  .control-panel.search-controls.typed-search-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .search-mode-field,
   .search-query-field {
     grid-column: 1 / -1;
@@ -559,6 +592,10 @@ input::placeholder {
 
   .category-field {
     grid-column: 1;
+  }
+
+  .typed-search-controls .category-field {
+    grid-column: 1 / -1;
   }
 
   .limit-field {
@@ -1410,11 +1447,13 @@ input::placeholder {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .settings-card {
   display: grid;
+  grid-template-rows: auto 1fr;
+  align-self: stretch;
   gap: 16px;
   margin-top: 0;
 }
@@ -1443,6 +1482,7 @@ input::placeholder {
 
 .settings-card-body {
   display: grid;
+  align-content: start;
   gap: 16px;
 }
 
