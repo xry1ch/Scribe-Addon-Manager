@@ -1,4 +1,5 @@
 use crate::api::models::AddonSummary;
+use crate::local::metadata::{InstalledAddonMetadata, InstalledMetadata};
 use crate::local::version::{compare_versions, VersionComparison};
 use crate::local::LocalAddon;
 
@@ -61,13 +62,31 @@ pub fn match_installed_addons(
     local_addons: &[LocalAddon],
     remote_addons: &[AddonSummary],
 ) -> Vec<MatchResult> {
+    let metadata = InstalledMetadata::default();
+    match_installed_addons_with_metadata(local_addons, remote_addons, &metadata)
+}
+
+pub fn match_installed_addons_with_metadata(
+    local_addons: &[LocalAddon],
+    remote_addons: &[AddonSummary],
+    metadata: &InstalledMetadata,
+) -> Vec<MatchResult> {
     local_addons
         .iter()
-        .map(|local| match_one(local, remote_addons))
+        .map(|local| match_one_with_metadata(local, remote_addons, metadata))
         .collect()
 }
 
+#[cfg(test)]
 fn match_one(local: &LocalAddon, remote_addons: &[AddonSummary]) -> MatchResult {
+    match_one_with_metadata(local, remote_addons, &InstalledMetadata::default())
+}
+
+fn match_one_with_metadata(
+    local: &LocalAddon,
+    remote_addons: &[AddonSummary],
+    metadata: &InstalledMetadata,
+) -> MatchResult {
     if !local.valid_manifest {
         return MatchResult {
             local: local.clone(),
@@ -76,6 +95,12 @@ fn match_one(local: &LocalAddon, remote_addons: &[AddonSummary]) -> MatchResult 
             candidates: Vec::new(),
             debug_candidates: Vec::new(),
         };
+    }
+
+    if let Some(stored) = metadata.addon_for_folder(&local.folder_name) {
+        if let Some(result) = metadata_match(local, stored, remote_addons) {
+            return result;
+        }
     }
 
     let mut candidates = scored_candidates(local, remote_addons);
@@ -139,6 +164,125 @@ fn match_one(local: &LocalAddon, remote_addons: &[AddonSummary]) -> MatchResult 
         remote: Some(best),
         candidates: Vec::new(),
         debug_candidates,
+    }
+}
+
+fn metadata_match(
+    local: &LocalAddon,
+    metadata: &InstalledAddonMetadata,
+    remote_addons: &[AddonSummary],
+) -> Option<MatchResult> {
+    if let Some(remote_uid) = metadata
+        .remote_uid
+        .as_deref()
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty())
+    {
+        let Some(remote) = remote_addons
+            .iter()
+            .find(|remote| remote.uid.as_deref() == Some(remote_uid))
+        else {
+            return Some(MatchResult {
+                local: local.clone(),
+                status: MatchStatus::NoMatch,
+                remote: None,
+                candidates: Vec::new(),
+                debug_candidates: Vec::new(),
+            });
+        };
+
+        return Some(MatchResult {
+            local: local.clone(),
+            status: version_status(local, remote),
+            remote: Some(remote_candidate_from_summary(
+                remote,
+                0,
+                130,
+                "metadata-remote-uid",
+            )),
+            candidates: Vec::new(),
+            debug_candidates: Vec::new(),
+        });
+    }
+
+    metadata_remote_url_match(local, metadata, remote_addons)
+        .or_else(|| metadata_remote_name_match(local, metadata, remote_addons))
+}
+
+fn metadata_remote_url_match(
+    local: &LocalAddon,
+    metadata: &InstalledAddonMetadata,
+    remote_addons: &[AddonSummary],
+) -> Option<MatchResult> {
+    let info_url = metadata
+        .remote_info_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())?;
+    let candidates = remote_addons
+        .iter()
+        .filter(|remote| {
+            remote
+                .file_info_url
+                .as_deref()
+                .is_some_and(|remote_url| remote_url.trim().eq_ignore_ascii_case(info_url))
+        })
+        .map(|remote| remote_candidate_from_summary(remote, 0, 125, "metadata-remote-info-url"))
+        .collect::<Vec<_>>();
+
+    metadata_candidates_result(local, remote_addons, candidates)
+}
+
+fn metadata_remote_name_match(
+    local: &LocalAddon,
+    metadata: &InstalledAddonMetadata,
+    remote_addons: &[AddonSummary],
+) -> Option<MatchResult> {
+    let remote_name = metadata
+        .remote_name
+        .as_deref()
+        .map(normalize_identity)
+        .filter(|name| !name.is_empty())?;
+    let candidates = remote_addons
+        .iter()
+        .filter(|remote| {
+            remote
+                .name
+                .as_deref()
+                .is_some_and(|name| normalize_identity(name) == remote_name)
+        })
+        .map(|remote| remote_candidate_from_summary(remote, 0, 120, "metadata-remote-name"))
+        .collect::<Vec<_>>();
+
+    metadata_candidates_result(local, remote_addons, candidates)
+}
+
+fn metadata_candidates_result(
+    local: &LocalAddon,
+    remote_addons: &[AddonSummary],
+    candidates: Vec<RemoteCandidate>,
+) -> Option<MatchResult> {
+    match candidates.as_slice() {
+        [] => None,
+        [candidate] => {
+            let remote = remote_addons
+                .iter()
+                .find(|remote| remote.uid == candidate.uid && remote.name == candidate.name)?;
+            Some(MatchResult {
+                local: local.clone(),
+                status: version_status(local, remote),
+                remote: Some(candidate.clone()),
+                candidates: Vec::new(),
+                debug_candidates: Vec::new(),
+            })
+        }
+        _ => Some(MatchResult {
+            local: local.clone(),
+            status: MatchStatus::Ambiguous,
+            remote: None,
+            candidates,
+            debug_candidates: Vec::new(),
+        }),
     }
 }
 
@@ -207,7 +351,16 @@ fn candidate_match(
         return None;
     };
 
-    Some(RemoteCandidate {
+    Some(remote_candidate_from_summary(remote, tier, score, reason))
+}
+
+fn remote_candidate_from_summary(
+    remote: &AddonSummary,
+    tier: u8,
+    score: usize,
+    reason: &str,
+) -> RemoteCandidate {
+    RemoteCandidate {
         uid: remote.uid.clone(),
         name: remote.name.clone(),
         author_name: remote.author_name.clone(),
@@ -225,7 +378,7 @@ fn candidate_match(
         tier,
         score,
         reason: reason.to_owned(),
-    })
+    }
 }
 
 fn contains_either(left: &str, right: &str) -> bool {
@@ -301,6 +454,7 @@ mod tests {
 
     use crate::api::models::AddonSummary;
     use crate::local::match_remote::{match_one, MatchStatus};
+    use crate::local::metadata::{InstalledAddonMetadata, InstalledMetadata};
     use crate::local::LocalAddon;
 
     fn local(folder_name: &str, title: Option<&str>, addon_version: Option<&str>) -> LocalAddon {
@@ -341,6 +495,29 @@ mod tests {
         }
     }
 
+    fn metadata(folder_name: &str, remote_uid: Option<&str>) -> InstalledMetadata {
+        let mut metadata = InstalledMetadata::default();
+        metadata.addons.insert(
+            folder_name.to_owned(),
+            InstalledAddonMetadata {
+                folder_name: folder_name.to_owned(),
+                remote_uid: remote_uid.map(ToOwned::to_owned),
+                installed_at: "1".to_owned(),
+                installed_by: "remote-install".to_owned(),
+                ..InstalledAddonMetadata::default()
+            },
+        );
+        metadata
+    }
+
+    fn match_with_metadata(
+        local: &LocalAddon,
+        remote_addons: &[AddonSummary],
+        metadata: &InstalledMetadata,
+    ) -> crate::local::match_remote::MatchResult {
+        super::match_one_with_metadata(local, remote_addons, metadata)
+    }
+
     #[test]
     fn exact_folder_match() {
         let result = match_one(
@@ -350,6 +527,90 @@ mod tests {
 
         assert_eq!(result.status, MatchStatus::Matched);
         assert_eq!(result.remote.unwrap().uid.as_deref(), Some("128"));
+    }
+
+    #[test]
+    fn metadata_uid_match_beats_exact_folder_match() {
+        let local = local("SkyShards", Some("SkyShards"), Some("1"));
+        let metadata = metadata("SkyShards", Some("42"));
+
+        let result = match_with_metadata(
+            &local,
+            &[
+                remote("128", "SkyShards", "1", &["SkyShards"]),
+                remote("42", "Remote Truth", "1", &["DifferentFolder"]),
+            ],
+            &metadata,
+        );
+
+        let remote = result.remote.unwrap();
+        assert_eq!(remote.uid.as_deref(), Some("42"));
+        assert_eq!(remote.name.as_deref(), Some("Remote Truth"));
+        assert_eq!(remote.reason, "metadata-remote-uid");
+    }
+
+    #[test]
+    fn metadata_uid_prevents_ambiguous_match() {
+        let local = local("Foo", Some("Foo"), Some("1"));
+        let metadata = metadata("Foo", Some("2"));
+
+        let result = match_with_metadata(
+            &local,
+            &[
+                remote("1", "Foo", "1", &["FooOne"]),
+                remote("2", "Foo", "1", &["FooTwo"]),
+            ],
+            &metadata,
+        );
+
+        assert_ne!(result.status, MatchStatus::Ambiguous);
+        assert_eq!(result.remote.unwrap().uid.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn metadata_remote_name_matches_when_uid_is_missing() {
+        let local = local("DolgubonsLazyWritCreator", Some("Writ Creator"), Some("1"));
+        let mut metadata = metadata("DolgubonsLazyWritCreator", None);
+        metadata
+            .addons
+            .get_mut("DolgubonsLazyWritCreator")
+            .unwrap()
+            .remote_name = Some("Dolgubon's Lazy Writ Crafter".to_owned());
+
+        let result = match_with_metadata(
+            &local,
+            &[remote(
+                "112",
+                "Dolgubon's Lazy Writ Crafter",
+                "1",
+                &["DolgubonsLazyWritCrafter"],
+            )],
+            &metadata,
+        );
+
+        let remote = result.remote.unwrap();
+        assert_eq!(remote.uid.as_deref(), Some("112"));
+        assert_eq!(remote.name.as_deref(), Some("Dolgubon's Lazy Writ Crafter"));
+        assert_eq!(remote.reason, "metadata-remote-name");
+    }
+
+    #[test]
+    fn stale_metadata_uid_does_not_fall_back_to_ambiguous_fuzzy_match() {
+        let local = local("Foo", Some("Foo"), Some("1"));
+        let metadata = metadata("Foo", Some("99"));
+
+        let result = match_with_metadata(
+            &local,
+            &[
+                remote("1", "Foo", "1", &["FooOne"]),
+                remote("2", "Foo", "1", &["FooTwo"]),
+            ],
+            &metadata,
+        );
+
+        assert_eq!(result.status, MatchStatus::NoMatch);
+        assert!(result.remote.is_none());
+        assert!(result.candidates.is_empty());
     }
 
     #[test]

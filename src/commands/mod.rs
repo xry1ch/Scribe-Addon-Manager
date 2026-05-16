@@ -20,6 +20,7 @@ use crate::install::update;
 use crate::install::update_all as update_all_core;
 use crate::install::zip_safety::{self, ExtractedZip, ZipInspection};
 use crate::local::match_remote::{self, MatchResult};
+use crate::local::metadata as manager_metadata;
 use crate::local::update_plan::{self, PlannedActionKind, PlannedAddonAction, UpdatePlan};
 use crate::local::{self, LocalAddon};
 
@@ -442,7 +443,12 @@ pub async fn check(
     } else {
         client.eso_file_list().await?
     };
-    let mut results = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = manager_metadata::load_installed_metadata_or_default(&path);
+    let mut results = match_remote::match_installed_addons_with_metadata(
+        &local_addons,
+        &remote_addons,
+        &metadata,
+    );
 
     results.sort_by_key(|result| result.local.folder_name.to_lowercase());
     if let Some(limit) = limit {
@@ -491,7 +497,12 @@ pub async fn plan_update(
     } else {
         client.eso_file_list().await?
     };
-    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = manager_metadata::load_installed_metadata_or_default(&path);
+    let mut matches = match_remote::match_installed_addons_with_metadata(
+        &local_addons,
+        &remote_addons,
+        &metadata,
+    );
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
 
     if let Some(limit) = limit {
@@ -558,7 +569,12 @@ pub async fn update_all(
     } else {
         client.eso_file_list().await?
     };
-    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = manager_metadata::load_installed_metadata_or_default(&addons_dir);
+    let mut matches = match_remote::match_installed_addons_with_metadata(
+        &local_addons,
+        &remote_addons,
+        &metadata,
+    );
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
 
     if let Some(limit) = limit {
@@ -725,7 +741,11 @@ async fn update_all_one(
     .await?;
     validate_single_update_plan(&prepared.main_plan, &target.local_folder)?;
 
-    Ok(apply_prepared_install(&prepared, backup_dir)?)
+    Ok(apply_prepared_install(
+        &prepared,
+        backup_dir,
+        manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
+    )?)
 }
 
 pub fn inspect_zip(zip_path: &Path, json_output: bool) -> Result<()> {
@@ -806,6 +826,7 @@ pub fn install_zip(
 
     if json_output {
         let result = apply::apply_install_plan(&plan, backup_dir)?;
+        manager_metadata::record_zip_install_metadata(&addons_dir, &plan, &result)?;
         return print_json_value(json!({
             "zip_path": path_string(zip_path),
             "addons_dir": path_string(&addons_dir),
@@ -818,6 +839,7 @@ pub fn install_zip(
 
     print_install_plan(&plan, false);
     let result = apply::apply_install_plan(&plan, backup_dir)?;
+    manager_metadata::record_zip_install_metadata(&addons_dir, &plan, &result)?;
     println!();
     print_install_result(&result);
     Ok(())
@@ -879,7 +901,11 @@ pub async fn install_remote(
     }
 
     if json_output {
-        let result = apply_prepared_install(&prepared, backup_dir)?;
+        let result = apply_prepared_install(
+            &prepared,
+            backup_dir,
+            manager_metadata::INSTALLED_BY_REMOTE_INSTALL,
+        )?;
         return print_json_value(json!({
             "addon_id": addon_id,
             "remote": prepared.details,
@@ -896,7 +922,11 @@ pub async fn install_remote(
     print_dependency_plan(&prepared.dependency_plan);
     println!();
     print_install_plan(&prepared.main_plan, false);
-    let result = apply_prepared_install(&prepared, backup_dir)?;
+    let result = apply_prepared_install(
+        &prepared,
+        backup_dir,
+        manager_metadata::INSTALLED_BY_REMOTE_INSTALL,
+    )?;
     println!();
     print_install_result(&result);
     Ok(())
@@ -921,7 +951,12 @@ pub async fn update_one(
     let local_addons = local::scan_addons_dir(&addons_dir)
         .with_context(|| format!("failed to scan AddOns directory {}", addons_dir.display()))?;
     let remote_addons = client.eso_file_list().await?;
-    let matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = manager_metadata::load_installed_metadata_or_default(&addons_dir);
+    let matches = match_remote::match_installed_addons_with_metadata(
+        &local_addons,
+        &remote_addons,
+        &metadata,
+    );
     let selected = update::resolve_update_request(&matches, request)?;
     let decision = update::update_decision(selected, force);
 
@@ -1005,7 +1040,11 @@ pub async fn update_one(
     }
 
     if json_output {
-        let result = apply_prepared_install(&prepared, backup_dir)?;
+        let result = apply_prepared_install(
+            &prepared,
+            backup_dir,
+            manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
+        )?;
         return print_json_value(json!({
             "request": request,
             "addons_dir": path_string(&addons_dir),
@@ -1022,7 +1061,11 @@ pub async fn update_one(
     print_dependency_plan(&prepared.dependency_plan);
     println!();
     print_install_plan(&prepared.main_plan, false);
-    let result = apply_prepared_install(&prepared, backup_dir)?;
+    let result = apply_prepared_install(
+        &prepared,
+        backup_dir,
+        manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
+    )?;
     println!();
     print_install_result(&result);
     Ok(())
@@ -1039,6 +1082,8 @@ async fn prepare_remote_install_plan(
     quiet: bool,
 ) -> Result<PreparedRemoteInstall> {
     let remote_addons = client.eso_file_list().await?;
+    let installed_metadata = manager_metadata::load_installed_metadata_or_default(addons_dir);
+    let installed_remotes = manager_metadata::installed_remote_addons(&installed_metadata);
     let (main_plan, extracted, download_path) = prepare_remote_package(
         client,
         details,
@@ -1063,7 +1108,7 @@ async fn prepare_remote_install_plan(
             &main_source,
             installed_addons,
             &remote_addons,
-            &[],
+            &installed_remotes,
             &remote_sources,
             DEFAULT_MAX_DEPENDENCY_DEPTH,
         );
@@ -1184,6 +1229,7 @@ async fn prepare_remote_package(
 fn apply_prepared_install(
     prepared: &PreparedRemoteInstall,
     backup_dir: Option<&Path>,
+    installed_by: &str,
 ) -> Result<InstallResult> {
     if prepared
         .dependency_plan
@@ -1198,10 +1244,32 @@ fn apply_prepared_install(
 
     for dependency in &prepared.dependency_installs {
         let result = apply::apply_install_plan(&dependency.plan, backup_dir)?;
+        manager_metadata::record_remote_install_metadata(
+            &dependency.plan.addons_dir,
+            &dependency.plan,
+            &result,
+            manager_metadata::RemoteInstallMetadata {
+                details: &dependency.details,
+                remote_uid: &dependency.remote_uid,
+                installed_by: manager_metadata::INSTALLED_BY_DEPENDENCY_INSTALL,
+                source_addon_uid: Some(&prepared.dependency_plan.main_addon.uid),
+            },
+        )?;
         apply::merge_install_result(&mut aggregate, result);
     }
 
     let result = apply::apply_install_plan(&prepared.main_plan, backup_dir)?;
+    manager_metadata::record_remote_install_metadata(
+        &prepared.main_plan.addons_dir,
+        &prepared.main_plan,
+        &result,
+        manager_metadata::RemoteInstallMetadata {
+            details: &prepared.details,
+            remote_uid: &prepared.dependency_plan.main_addon.uid,
+            installed_by,
+            source_addon_uid: None,
+        },
+    )?;
     apply::merge_install_result(&mut aggregate, result);
 
     Ok(aggregate)

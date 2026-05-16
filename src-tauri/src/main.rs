@@ -22,6 +22,9 @@ use eso_addon_manager::install::update;
 use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
 use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
+use eso_addon_manager::local::metadata::{
+    self as manager_metadata, InstalledAddonMetadata, InstalledMetadata,
+};
 use eso_addon_manager::local::update_plan::{self, PlannedAddonAction};
 use eso_addon_manager::local::version::{compare_versions, VersionComparison};
 use eso_addon_manager::local::{self, AddonPathCandidate, LocalAddon};
@@ -328,24 +331,6 @@ struct ManualBackupResponse {
     saved_variables_missing: bool,
     total_files: u64,
     total_bytes: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-struct InstalledMetadata {
-    addons: BTreeMap<String, InstalledAddonMetadata>,
-    first_run_baseline_complete: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstalledAddonMetadata {
-    remote_uid: Option<String>,
-    remote_version: Option<String>,
-    remote_date: Option<i64>,
-    downloaded_filename: Option<String>,
-    md5: Option<String>,
-    installed_timestamp: String,
-    source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -783,7 +768,9 @@ async fn import_existing_addons_as_current(
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
-    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = load_installed_metadata(&addons_dir);
+    let mut matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
 
     import_existing_matches_as_current(&addons_dir, &matches).map_err(to_string_error)
@@ -960,7 +947,9 @@ async fn check_addons(path: Option<String>) -> Result<CheckAddonsResponse, Strin
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
-    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = load_installed_metadata(&addons_dir);
+    let mut matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
     let metadata =
         ensure_first_run_baseline_complete(&addons_dir, &matches).map_err(to_string_error)?;
@@ -995,7 +984,9 @@ async fn plan_updates(
     } else {
         client.eso_file_list().await.map_err(to_string_error)?
     };
-    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = load_installed_metadata(&addons_dir);
+    let mut matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
     let plan = update_plan::build_update_plan(&matches, include_unknown);
     let summary = plan.summary();
@@ -1092,7 +1083,7 @@ async fn apply_update_all(
             &prepared,
             remote_uid,
             backup_dir.as_deref(),
-            "update-all",
+            manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
         )
         .map_err(|error| format!("failed to update {}: {}", target.local_folder, error))?;
 
@@ -1167,7 +1158,7 @@ async fn install_remote_addon(
         &prepared,
         &addon_id,
         backup_dir.as_deref(),
-        "remote-install",
+        manager_metadata::INSTALLED_BY_REMOTE_INSTALL,
     )
     .map_err(to_string_error)?;
     Ok(install_remote_addon_response(
@@ -1208,7 +1199,7 @@ async fn install_remote_addon_new_only(
         &prepared,
         &addon_id,
         backup_dir.as_deref(),
-        "remote-install",
+        manager_metadata::INSTALLED_BY_REMOTE_INSTALL,
     )
     .map_err(to_string_error)?;
     Ok(install_remote_addon_response(
@@ -1230,7 +1221,9 @@ async fn plan_single_update(
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
-    let matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = load_installed_metadata(&addons_dir);
+    let matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
     let selected = update::resolve_update_request(&matches, &target).map_err(to_string_error)?;
     let decision = update::update_decision(selected, force);
 
@@ -1292,7 +1285,9 @@ async fn apply_single_update(
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
-    let matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = load_installed_metadata(&addons_dir);
+    let matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
     let selected = update::resolve_update_request(&matches, &target).map_err(to_string_error)?;
     let decision = update::update_decision(selected, force);
 
@@ -1340,7 +1335,7 @@ async fn apply_single_update(
         &prepared,
         remote_uid,
         backup_dir.as_deref(),
-        "update",
+        manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
     )
     .map_err(to_string_error)?;
     Ok(single_update_apply_response(
@@ -1941,7 +1936,8 @@ fn remote_local_state(
     let addons_dir = resolve_addons_dir(path)?;
     let local_addons = local::scan_addons_dir(&addons_dir)?;
     let metadata = load_installed_metadata(&addons_dir);
-    let matches = match_remote::match_installed_addons(&local_addons, remote_addons);
+    let matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, remote_addons, &metadata);
 
     Ok(RemoteLocalState {
         local_addons,
@@ -2151,9 +2147,17 @@ fn update_confidence_for_match(
     result: &MatchResult,
     metadata: &InstalledMetadata,
 ) -> UpdateConfidence {
-    let managed = metadata.addons.get(&result.local.folder_name);
+    let managed = metadata.addon_for_folder(&result.local.folder_name);
 
     let Some(remote) = result.remote.as_ref() else {
+        if managed.is_some_and(|managed| managed.remote_uid.is_some()) {
+            return UpdateConfidence {
+                confidence: "unknown",
+                reason: "Remote metadata unavailable",
+                managed: true,
+            };
+        }
+
         if let Some(managed) = managed.filter(|managed| is_first_run_baseline(managed)) {
             return first_run_baseline_confidence(managed);
         }
@@ -2198,11 +2202,11 @@ fn update_confidence_for_match(
     };
 
     if managed.remote_uid != remote.uid {
-        if is_first_run_baseline(managed) && managed.remote_uid.is_none() {
+        if managed.remote_uid.is_none() {
             return confidence_from_versions(
                 managed.remote_version.as_deref(),
                 remote.version.as_deref(),
-                managed.remote_date,
+                managed.remote_updated_date,
                 remote.updated,
                 true,
             );
@@ -2218,7 +2222,7 @@ fn update_confidence_for_match(
     confidence_from_versions(
         managed.remote_version.as_deref(),
         remote.version.as_deref(),
-        managed.remote_date,
+        managed.remote_updated_date,
         remote.updated,
         true,
     )
@@ -2228,25 +2232,23 @@ fn update_confidence_for_action(
     action: &PlannedAddonAction,
     metadata: &InstalledMetadata,
 ) -> Option<UpdateConfidence> {
-    let managed = metadata.addons.get(&action.local_folder);
+    let managed = metadata.addon_for_folder(&action.local_folder);
 
     match managed {
         Some(managed) if managed.remote_uid == action.remote_uid => Some(confidence_from_versions(
             managed.remote_version.as_deref(),
             action.remote_version.as_deref(),
-            managed.remote_date,
+            managed.remote_updated_date,
             action.remote_date,
             true,
         )),
-        Some(managed) if is_first_run_baseline(managed) && managed.remote_uid.is_none() => {
-            Some(confidence_from_versions(
-                managed.remote_version.as_deref(),
-                action.remote_version.as_deref(),
-                managed.remote_date,
-                action.remote_date,
-                true,
-            ))
-        }
+        Some(managed) if managed.remote_uid.is_none() => Some(confidence_from_versions(
+            managed.remote_version.as_deref(),
+            action.remote_version.as_deref(),
+            managed.remote_updated_date,
+            action.remote_date,
+            true,
+        )),
         Some(_) => Some(UpdateConfidence {
             confidence: "unknown",
             reason: "stored remote UID differs",
@@ -2278,7 +2280,7 @@ fn update_confidence_for_action(
 }
 
 fn is_first_run_baseline(managed: &InstalledAddonMetadata) -> bool {
-    managed.source == "first-run-import"
+    managed.installed_by == manager_metadata::INSTALLED_BY_FIRST_RUN_IMPORT
 }
 
 fn first_run_baseline_confidence(_managed: &InstalledAddonMetadata) -> UpdateConfidence {
@@ -2775,7 +2777,9 @@ async fn build_update_all_plan_for_ui(
     let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
     let client = ApiClient::new().map_err(to_string_error)?;
     let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
-    let mut matches = match_remote::match_installed_addons(&local_addons, &remote_addons);
+    let metadata = load_installed_metadata(&addons_dir);
+    let mut matches =
+        match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
     matches.sort_by_key(|result| result.local.folder_name.to_lowercase());
 
     if let Some(limit) = limit {
@@ -2798,38 +2802,14 @@ fn apply_reliable_update_filter(
     });
 }
 
-fn metadata_path(addons_dir: &std::path::Path) -> PathBuf {
-    addons_dir
-        .parent()
-        .unwrap_or(addons_dir)
-        .join(".scribe-addon-manager")
-        .join("installed.json")
-}
-
 fn load_installed_metadata(addons_dir: &std::path::Path) -> InstalledMetadata {
-    let path = metadata_path(addons_dir);
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
+    manager_metadata::load_installed_metadata_or_default(addons_dir)
 }
 
 fn installed_remote_addons(
     metadata: &InstalledMetadata,
 ) -> Vec<dependencies::InstalledRemoteAddon> {
-    metadata
-        .addons
-        .iter()
-        .filter_map(|(folder_name, metadata)| {
-            metadata
-                .remote_uid
-                .as_ref()
-                .map(|remote_uid| dependencies::InstalledRemoteAddon {
-                    folder_name: folder_name.clone(),
-                    remote_uid: remote_uid.clone(),
-                })
-        })
-        .collect()
+    manager_metadata::installed_remote_addons(metadata)
 }
 
 fn ensure_first_run_baseline_complete(
@@ -2868,31 +2848,19 @@ fn save_installed_metadata(
     addons_dir: &std::path::Path,
     metadata: &InstalledMetadata,
 ) -> anyhow::Result<()> {
-    let path = metadata_path(addons_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(metadata)?)?;
-    Ok(())
+    Ok(manager_metadata::save_installed_metadata(
+        addons_dir, metadata,
+    )?)
 }
 
 fn remove_installed_metadata(
     addons_dir: &std::path::Path,
     folder_name: &str,
 ) -> anyhow::Result<()> {
-    let mut metadata = load_installed_metadata(addons_dir);
-    let matching_key = metadata
-        .addons
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(folder_name))
-        .cloned();
-
-    if let Some(key) = matching_key {
-        metadata.addons.remove(&key);
-        save_installed_metadata(addons_dir, &metadata)?;
-    }
-
-    Ok(())
+    Ok(manager_metadata::remove_installed_metadata(
+        addons_dir,
+        folder_name,
+    )?)
 }
 
 fn current_timestamp_string() -> String {
@@ -2909,13 +2877,24 @@ fn first_run_metadata_for_match(
 ) -> InstalledAddonMetadata {
     let remote = result.remote.as_ref();
     InstalledAddonMetadata {
+        folder_name: result.local.folder_name.clone(),
         remote_uid: remote.and_then(|remote| normalize_optional_path(remote.uid.clone())),
+        remote_name: remote.and_then(|remote| normalize_optional_path(remote.name.clone())),
         remote_version: remote.and_then(|remote| normalize_optional_path(remote.version.clone())),
-        remote_date: remote.and_then(|remote| remote.updated),
-        downloaded_filename: None,
+        remote_updated_date: remote.and_then(|remote| remote.updated),
+        remote_info_url: remote.and_then(|remote| normalize_optional_path(remote.file_info_url.clone())),
+        remote_download_url: None,
+        file_name: None,
         md5: None,
-        installed_timestamp: installed_timestamp.to_owned(),
-        source: "first-run-import".to_owned(),
+        installed_at: installed_timestamp.to_owned(),
+        installed_by: manager_metadata::INSTALLED_BY_FIRST_RUN_IMPORT.to_owned(),
+        local_title: result.local.title.clone(),
+        local_version: result
+            .local
+            .addon_version
+            .clone()
+            .or_else(|| result.local.version.clone()),
+        source_addon_uid: None,
     }
 }
 
@@ -2962,51 +2941,24 @@ fn import_existing_matches_as_current(
 
 fn record_installed_metadata(
     addons_dir: &std::path::Path,
+    plan: &InstallPlan,
     details: &AddonDetails,
     remote_uid: &str,
     result: &InstallResult,
     source: &str,
+    source_addon_uid: Option<&str>,
 ) -> anyhow::Result<()> {
-    if !install_result_applied(result) {
-        return Ok(());
-    }
-
-    let mut metadata = load_installed_metadata(addons_dir);
-    let installed_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string();
-    let downloaded_filename = Some(remote::download_file_name(details, remote_uid));
-
-    for item in &result.items {
-        if matches!(item.action, InstallActionPerformed::Skipped) {
-            continue;
-        }
-
-        let Some(folder_name) = item
-            .target_folder
-            .as_ref()
-            .and_then(|path| path.file_name())
-        else {
-            continue;
-        };
-
-        metadata.addons.insert(
-            folder_name.to_string_lossy().to_string(),
-            InstalledAddonMetadata {
-                remote_uid: details.uid.clone().or_else(|| Some(remote_uid.to_owned())),
-                remote_version: details.version.clone(),
-                remote_date: details.date,
-                downloaded_filename: downloaded_filename.clone(),
-                md5: details.md5.clone(),
-                installed_timestamp: installed_timestamp.clone(),
-                source: source.to_owned(),
-            },
-        );
-    }
-
-    save_installed_metadata(addons_dir, &metadata)
+    Ok(manager_metadata::record_remote_install_metadata(
+        addons_dir,
+        plan,
+        result,
+        manager_metadata::RemoteInstallMetadata {
+            details,
+            remote_uid,
+            installed_by: source,
+            source_addon_uid,
+        },
+    )?)
 }
 
 fn apply_prepared_remote_install(
@@ -3027,10 +2979,12 @@ fn apply_prepared_remote_install(
             apply::apply_install_plan(&dependency.plan, backup_dir).map_err(to_string_error)?;
         record_installed_metadata(
             addons_dir,
+            &dependency.plan,
             &dependency.details,
             &dependency.remote_uid,
             &result,
-            "dependency-install",
+            manager_metadata::INSTALLED_BY_DEPENDENCY_INSTALL,
+            Some(main_remote_uid),
         )
         .map_err(to_string_error)?;
         apply::merge_install_result(&mut aggregate, result);
@@ -3040,10 +2994,12 @@ fn apply_prepared_remote_install(
         apply::apply_install_plan(&prepared.main_plan, backup_dir).map_err(to_string_error)?;
     record_installed_metadata(
         addons_dir,
+        &prepared.main_plan,
         &prepared.details,
         main_remote_uid,
         &result,
         source,
+        None,
     )
     .map_err(to_string_error)?;
     apply::merge_install_result(&mut aggregate, result);
@@ -3565,7 +3521,10 @@ mod tests {
         assert_eq!(result.imported, 1);
         assert_eq!(imported.remote_uid.as_deref(), Some("42"));
         assert_eq!(imported.remote_version.as_deref(), Some("2.0.0"));
-        assert_eq!(imported.source, "first-run-import");
+        assert_eq!(
+            imported.installed_by,
+            manager_metadata::INSTALLED_BY_FIRST_RUN_IMPORT
+        );
         assert!(metadata.first_run_baseline_complete);
     }
 
@@ -3593,7 +3552,7 @@ mod tests {
         assert_eq!(result.skipped_missing_remote_version, 0);
         assert_eq!(imported.remote_uid.as_deref(), Some("42"));
         assert_eq!(imported.remote_version, None);
-        assert_eq!(imported.remote_date, Some(1_700_000_000));
+        assert_eq!(imported.remote_updated_date, Some(1_700_000_000));
         assert!(metadata.first_run_baseline_complete);
     }
 
@@ -3633,7 +3592,10 @@ mod tests {
             let confidence = update_confidence_for_match(result, &metadata);
 
             assert_eq!(imported.remote_uid, None);
-            assert_eq!(imported.source, "first-run-import");
+            assert_eq!(
+                imported.installed_by,
+                manager_metadata::INSTALLED_BY_FIRST_RUN_IMPORT
+            );
             assert_eq!(confidence.confidence, "current");
         }
     }
@@ -3948,13 +3910,20 @@ mod tests {
         metadata.addons.insert(
             "DifferentFolder".to_owned(),
             InstalledAddonMetadata {
+                folder_name: "DifferentFolder".to_owned(),
                 remote_uid: Some("42".to_owned()),
+                remote_name: Some("Different Remote Name".to_owned()),
                 remote_version: Some("1.0.0".to_owned()),
-                remote_date: Some(100),
-                downloaded_filename: None,
+                remote_updated_date: Some(100),
+                remote_info_url: None,
+                remote_download_url: None,
+                file_name: None,
                 md5: None,
-                installed_timestamp: "2026-01-01T00:00:00Z".to_owned(),
-                source: "install".to_owned(),
+                installed_at: "2026-01-01T00:00:00Z".to_owned(),
+                installed_by: manager_metadata::INSTALLED_BY_REMOTE_INSTALL.to_owned(),
+                local_title: None,
+                local_version: None,
+                source_addon_uid: None,
             },
         );
         let state = test_remote_local_state(local_addons, metadata, &remote_addons);
@@ -3965,6 +3934,10 @@ mod tests {
         assert_eq!(
             result.remote.as_ref().map(|remote| remote.reason.as_str()),
             Some("metadata-remote-uid")
+        );
+        assert_eq!(
+            result.remote.as_ref().and_then(|remote| remote.name.as_deref()),
+            Some("Different Remote Name")
         );
     }
 
@@ -4075,7 +4048,8 @@ mod tests {
         metadata: InstalledMetadata,
         remote_addons: &[AddonSummary],
     ) -> RemoteLocalState {
-        let matches = match_remote::match_installed_addons(&local_addons, remote_addons);
+        let matches =
+            match_remote::match_installed_addons_with_metadata(&local_addons, remote_addons, &metadata);
         RemoteLocalState {
             local_addons,
             metadata,

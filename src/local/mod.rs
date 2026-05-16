@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use directories::UserDirs;
 
 pub mod match_remote;
+pub mod metadata;
 pub mod update_plan;
 pub mod version;
 

@@ -533,10 +533,10 @@ function renderInstalledCard(item: InstalledViewModel) {
   const addon = item.addon;
   const remote = item.match?.remote ?? null;
   const status = installedStatus(item.match, addon);
-  const title = addon.folder_name;
+  const title = remote?.name ?? addon.title ?? addon.folder_name;
   const category = categoryMeta(remote?.category_name ?? null, remote?.category_id ?? null, addon.is_library === true || remote?.is_library === true);
-  const author = addon.author ?? remote?.author_name ?? null;
-  const statusNote = installedStatusNote(status);
+  const author = remote?.author_name ?? addon.author ?? null;
+  const statusNote = installedStatusNote(status, item.match);
   return `
     <article class="addon-card clickable ${cardStatusClass(status.kind)}" data-installed-folder="${escapeAttr(addon.folder_name)}" data-addon-context-menu="true">
       ${CategoryIcon(category)}
@@ -739,7 +739,7 @@ function renderDetailsModal() {
     details?.category_id ?? match?.remote?.category_id ?? summary?.category_id ?? null,
     local?.is_library === true || details?.is_library === true || match?.remote?.is_library === true || summary?.is_library === true,
   );
-  const title = details?.name ?? local?.title ?? match?.remote?.name ?? summary?.name ?? local?.folder_name ?? "Addon Details";
+  const title = details?.name ?? match?.remote?.name ?? summary?.name ?? local?.title ?? local?.folder_name ?? "Addon Details";
   const author = details?.author_name ?? match?.remote?.author_name ?? summary?.author_name ?? local?.author ?? null;
   const installedVersion = local?.display_version ?? null;
   const remoteVersion = details?.version ?? match?.remote?.version ?? summary?.version ?? null;
@@ -1244,7 +1244,7 @@ function selectedDetailsStatusNote() {
   const status = installedStatus(match, local);
   const localName = plainEsoText(local.title?.trim() || local.folder_name);
   const version = local.display_version ? `, version ${local.display_version}` : "";
-  const statusNote = installedStatusNote(status);
+  const statusNote = installedStatusNote(status, match);
   return `Installed locally: ${localName} (${local.folder_name}${version})${statusNote ? ` - ${statusNote}` : ""}`;
 }
 
@@ -3180,7 +3180,7 @@ function compareInstalled(left: InstalledViewModel, right: InstalledViewModel) {
 }
 
 function displayName(item: InstalledViewModel) {
-  return plainEsoText(item.addon.title ?? item.addon.folder_name);
+  return plainEsoText(item.match?.remote?.name ?? item.addon.title ?? item.addon.folder_name);
 }
 
 function dateValue(value: string | null | undefined) {
@@ -3215,7 +3215,8 @@ function renderCardUpdateAction(match: MatchResult | null) {
   return "";
 }
 
-function installedStatusNote(status: { label: string; kind: string }) {
+function installedStatusNote(status: { label: string; kind: string }, match?: MatchResult | null) {
+  if (match?.update_reason === "Remote metadata unavailable") return "Remote metadata unavailable";
   if (status.kind === "reliable-update") return "Remote version differs";
   if (status.kind === "possible-update" || status.kind === "unknown") return "Version check uncertain";
   if (status.kind === "invalid") return "No valid manifest";
