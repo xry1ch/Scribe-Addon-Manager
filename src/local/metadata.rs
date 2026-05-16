@@ -19,6 +19,7 @@ pub const INSTALLED_BY_REMOTE_INSTALL: &str = "remote-install";
 pub const INSTALLED_BY_REMOTE_UPDATE: &str = "remote-update";
 pub const INSTALLED_BY_DEPENDENCY_INSTALL: &str = "dependency-install";
 pub const INSTALLED_BY_ZIP_INSTALL: &str = "zip-install";
+pub const INSTALLED_BY_IMPORTED_CURRENT: &str = "imported-current";
 pub const INSTALLED_BY_FIRST_RUN_IMPORT: &str = "first-run-import";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

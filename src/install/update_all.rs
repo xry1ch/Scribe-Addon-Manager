@@ -175,6 +175,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_input_returns_empty_update_all_plan() {
+        let plan = build_update_all_plan(&[], false);
+
+        assert!(plan.display_plan.actions.is_empty());
+        assert!(plan.targets.is_empty());
+    }
+
+    #[test]
     fn include_unknown_includes_unknown_update_candidates() {
         let plan = build_update_all_plan(
             &[

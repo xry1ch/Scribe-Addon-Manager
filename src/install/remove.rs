@@ -92,7 +92,7 @@ pub fn remove_installed_addon(
     }
     reject_symlinks_in_tree(&target)?;
     let saved_variables_plan = if remove_saved_variables {
-        plan_saved_variables_removal(addons_dir, &addon, SavedVariablesCandidateSet::AddonRemoval)?
+        plan_saved_variables_removal(addons_dir, &addon)?
     } else {
         SavedVariablesRemovalPlan::default()
     };
@@ -112,7 +112,7 @@ pub fn remove_installed_addon(
         message: if remove_saved_variables {
             "Addon and SavedVariables removed.".to_owned()
         } else {
-            "Addon removed. SavedVariables were kept.".to_owned()
+            "Addon uninstalled. SavedVariables were kept.".to_owned()
         },
     })
 }
@@ -122,8 +122,7 @@ pub fn clear_saved_variables(
     folder_name: &str,
 ) -> Result<ClearSavedVariablesResult, RemoveAddonError> {
     let addon = resolve_installed_addon(addons_dir, folder_name)?;
-    let plan =
-        plan_saved_variables_removal(addons_dir, &addon, SavedVariablesCandidateSet::ClearOnly)?;
+    let plan = plan_saved_variables_removal(addons_dir, &addon)?;
     let saved_variables_dir = plan.saved_variables_dir.clone();
     let saved_variables_dir_missing = plan.saved_variables_dir_missing;
     let result = apply_saved_variables_removal(plan)?;
@@ -232,22 +231,15 @@ struct SavedVariablesRemovalResult {
     missing_files: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SavedVariablesCandidateSet {
-    AddonRemoval,
-    ClearOnly,
-}
-
 fn plan_saved_variables_removal(
     addons_dir: &Path,
     addon: &local::LocalAddon,
-    candidate_set: SavedVariablesCandidateSet,
 ) -> Result<SavedVariablesRemovalPlan, RemoveAddonError> {
     let saved_variables_dir = addons_dir
         .parent()
         .map(|parent| parent.join("SavedVariables"))
         .unwrap_or_else(|| PathBuf::from("SavedVariables"));
-    let file_names = saved_variables_file_names(addon, candidate_set);
+    let file_names = saved_variables_file_names(addon);
     let mut plan = SavedVariablesRemovalPlan {
         saved_variables_dir: saved_variables_dir.clone(),
         ..SavedVariablesRemovalPlan::default()
@@ -301,22 +293,10 @@ fn apply_saved_variables_removal(
     Ok(result)
 }
 
-fn saved_variables_file_names(
-    addon: &local::LocalAddon,
-    candidate_set: SavedVariablesCandidateSet,
-) -> BTreeSet<String> {
+fn saved_variables_file_names(addon: &local::LocalAddon) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
 
     add_saved_variable_file_names(&mut names, &addon.folder_name);
-    if matches!(candidate_set, SavedVariablesCandidateSet::AddonRemoval) {
-        if let Some(title) = addon
-            .title
-            .as_deref()
-            .and_then(sanitize_saved_variables_title)
-        {
-            add_saved_variable_file_names(&mut names, &title);
-        }
-    }
     for value in addon
         .saved_variables
         .iter()
@@ -335,39 +315,6 @@ fn add_saved_variable_file_names(names: &mut BTreeSet<String>, value: &str) {
     }
     names.insert(format!("{value}.lua"));
     names.insert(format!("{value}.lua.bak"));
-}
-
-fn sanitize_saved_variables_title(value: &str) -> Option<String> {
-    let without_colors = value
-        .replace("|r", "")
-        .replace("|R", "")
-        .split("|c")
-        .map(|part| {
-            if part.len() >= 6 && part.chars().take(6).all(|ch| ch.is_ascii_hexdigit()) {
-                &part[6..]
-            } else {
-                part
-            }
-        })
-        .collect::<String>();
-    let sanitized = without_colors
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_owned();
-
-    if sanitized.is_empty() {
-        None
-    } else {
-        Some(sanitized)
-    }
 }
 
 fn contained_saved_variables_file(
@@ -469,8 +416,14 @@ mod tests {
         fs::create_dir_all(&saved_variables).unwrap();
         fs::write(saved_variables.join("SampleAddon.lua"), "saved").unwrap();
 
-        remove_installed_addon(&addons_dir, "SampleAddon", false).unwrap();
+        let result = remove_installed_addon(&addons_dir, "SampleAddon", false).unwrap();
 
+        assert!(!result.removed_saved_variables);
+        assert_eq!(result.saved_variables_deleted_count, 0);
+        assert_eq!(
+            result.message,
+            "Addon uninstalled. SavedVariables were kept."
+        );
         assert_eq!(
             fs::read_to_string(saved_variables.join("SampleAddon.lua")).unwrap(),
             "saved"
@@ -478,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_saved_variables_true_deletes_declared_folder_and_bak_files() {
+    fn remove_saved_variables_true_deletes_exact_declared_folder_and_bak_files() {
         let dir = tempdir().unwrap();
         let addons_dir = dir.path().join("AddOns");
         let saved_variables = dir.path().join("SavedVariables");
@@ -504,11 +457,11 @@ mod tests {
 
         assert!(result.removed_addon);
         assert!(result.removed_saved_variables);
-        assert_eq!(result.saved_variables_deleted_count, 6);
+        assert_eq!(result.saved_variables_deleted_count, 5);
         assert!(!addons_dir.join("SampleAddon").exists());
         assert!(!saved_variables.join("SampleAddon.lua").exists());
         assert!(!saved_variables.join("SampleAddon.lua.bak").exists());
-        assert!(!saved_variables.join("Sample_Addon.lua").exists());
+        assert!(saved_variables.join("Sample_Addon.lua").is_file());
         assert!(!saved_variables.join("AccountSettings.lua").exists());
         assert!(!saved_variables.join("AccountSettings.lua.bak").exists());
         assert!(!saved_variables.join("CharacterSettings.lua").exists());
@@ -543,7 +496,39 @@ mod tests {
         assert!(result.removed_addon);
         assert!(result.removed_saved_variables);
         assert_eq!(result.saved_variables_deleted_count, 0);
+        assert!(result.saved_variables_deleted_files.is_empty());
+        assert_eq!(result.message, "Addon and SavedVariables removed.");
         assert!(!addons_dir.join("SampleAddon").exists());
+    }
+
+    #[test]
+    fn remove_saved_variables_true_rejects_manifest_path_components() {
+        let dir = tempdir().unwrap();
+        let addons_dir = dir.path().join("AddOns");
+        let saved_variables = dir.path().join("SavedVariables");
+        write_addon_manifest(
+            &addons_dir,
+            "SampleAddon",
+            "## SavedVariables: ../Outside Nested/Bad AccountSettings\n",
+        );
+        fs::create_dir_all(&saved_variables).unwrap();
+        fs::write(saved_variables.join("AccountSettings.lua"), "account").unwrap();
+        fs::write(dir.path().join("Outside.lua"), "outside").unwrap();
+        fs::create_dir_all(saved_variables.join("Nested")).unwrap();
+        fs::write(saved_variables.join("Nested").join("Bad.lua"), "bad").unwrap();
+
+        let result = remove_installed_addon(&addons_dir, "SampleAddon", true).unwrap();
+
+        assert_eq!(result.saved_variables_deleted_count, 1);
+        assert!(!saved_variables.join("AccountSettings.lua").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Outside.lua")).unwrap(),
+            "outside"
+        );
+        assert_eq!(
+            fs::read_to_string(saved_variables.join("Nested").join("Bad.lua")).unwrap(),
+            "bad"
+        );
     }
 
     #[test]

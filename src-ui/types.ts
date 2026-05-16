@@ -353,14 +353,39 @@ export interface ClearSavedVariablesResponse {
   message: string;
 }
 
-export interface ManualBackupResponse {
-  backup_path: string;
-  backup_name: string;
-  copied_addons: boolean;
-  copied_saved_variables: boolean;
-  saved_variables_missing: boolean;
-  total_files: number;
+export interface BackupResult {
+  backup_zip_path: string;
+  backup_created: boolean;
+  included_saved_variables: boolean;
+  file_count: number;
   total_bytes: number;
+  skipped_files_count: number;
+  skipped_files: Array<{
+    relative_path: string;
+    reason: string;
+  }>;
+  warnings: string[];
+  backup_status: "complete" | "completed_with_warnings" | string;
+}
+
+export interface BackupInspection {
+  valid: boolean;
+  backup_name: string;
+  created_at: string | null;
+  contains_addons: boolean;
+  contains_saved_variables: boolean;
+  file_count: number;
+  total_bytes: number;
+  warnings: string[];
+  target_addons_folder: string;
+  target_saved_variables_folder: string;
+}
+
+export interface RestoreResult {
+  restored_addons: boolean;
+  restored_saved_variables: boolean;
+  message: string;
+  rollback_path: string | null;
 }
 
 export interface UpdateAllResult {
@@ -379,6 +404,11 @@ export interface UpdateAllResult {
   items: InstallResultItem[];
 }
 
+export interface UpdateAllFailure {
+  local_folder: string;
+  message: string;
+}
+
 export interface ApplyUpdateAllResponse {
   dry_run: boolean;
   applied: boolean;
@@ -389,6 +419,7 @@ export interface ApplyUpdateAllResponse {
   actions: UpdateAllAction[];
   targets: PlannedAction[];
   summary: UpdateAllSummary;
+  failure: UpdateAllFailure | null;
   results: UpdateAllResult[];
 }
 

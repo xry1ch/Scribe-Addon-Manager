@@ -6,5 +6,10 @@
     "urls": ["http://localhost:1420", "http://localhost:1420/*", "http://127.0.0.1:1420", "http://127.0.0.1:1420/*"]
   },
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "dialog:allow-open",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:webview:allow-internal-toggle-devtools"
+  ]
 }

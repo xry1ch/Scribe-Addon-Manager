@@ -18,6 +18,11 @@
   --skeleton-base: #111827;
   --skeleton-mid: #172033;
   --skeleton-highlight: #25314a;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: rgba(100, 116, 139, 0.45);
+  --scrollbar-thumb-hover: rgba(94, 234, 212, 0.65);
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
   font-family:
     "Aptos", "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
   font-size: 14px;
@@ -25,6 +30,33 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  background-clip: content-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 html,
@@ -72,6 +104,7 @@ button {
   padding: 26px 18px;
   overflow-x: hidden;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   color: var(--text-strong);
   background: rgba(7, 12, 23, 0.82);
   border-right: 1px solid var(--border);
@@ -172,6 +205,7 @@ button {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .setup-shell {
@@ -305,6 +339,51 @@ button {
   margin-top: 16px;
 }
 
+.restore-preview-panel {
+  width: min(680px, 100%);
+}
+
+.restore-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.restore-preview-item {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 10px;
+  background: rgba(11, 17, 32, 0.66);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.restore-preview-item span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.restore-preview-item strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.restore-warning {
+  color: #fde68a;
+}
+
+.disabled-option {
+  opacity: 0.56;
+}
+
 .remove-confirmation {
   z-index: 90;
 }
@@ -436,6 +515,12 @@ select:disabled {
 .banner.success {
   background: rgba(34, 197, 94, 0.12);
   border-color: rgba(74, 222, 128, 0.32);
+}
+
+.banner-helper {
+  margin: 4px 0 0;
+  color: var(--muted-strong);
+  font-size: 12px;
 }
 
 .banner.error {
@@ -975,6 +1060,11 @@ input::placeholder {
   color: var(--muted-strong);
 }
 
+.result-state .result-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .result-icon {
   display: grid;
   place-items: center;
@@ -1119,6 +1209,7 @@ input::placeholder {
   min-height: 0;
   padding: 18px 20px 20px;
   overflow: auto;
+  scrollbar-gutter: stable;
 }
 
 .detail-identity {
@@ -1211,22 +1302,10 @@ input::placeholder {
   padding-bottom: 8px;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-color: rgba(148, 163, 184, 0.5) rgba(15, 23, 42, 0.72);
-  scrollbar-width: thin;
 }
 
 .screenshot-gallery::-webkit-scrollbar {
   height: 8px;
-}
-
-.screenshot-gallery::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.72);
-  border-radius: 999px;
-}
-
-.screenshot-gallery::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.5);
-  border-radius: 999px;
 }
 
 .screenshot-frame {
@@ -1570,6 +1649,8 @@ input::placeholder {
 
 .backup-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: flex-start;
 }
 
@@ -1584,6 +1665,12 @@ input::placeholder {
   overflow-wrap: anywhere;
 }
 
+.backup-status-group {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
 .backup-status .button-icon {
   width: 14px;
   height: 14px;
@@ -1594,8 +1681,22 @@ input::placeholder {
   color: #99f6e4;
 }
 
+.backup-status-warning {
+  color: #fde68a;
+}
+
 .backup-status-error {
   color: #fecaca;
+}
+
+.backup-status-note {
+  margin: 0;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+
+.backup-skipped-details {
+  max-width: 100%;
 }
 
 .backup-inline-action {

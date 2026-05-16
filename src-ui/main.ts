@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { renderEsoMarkup, renderInlineEsoMarkup, stripEsoMarkup } from "./bbcode";
 import { shouldShowInstalledAddon, shouldShowSearchAddon } from "./libraryFilters";
@@ -13,6 +14,8 @@ import type {
   AppStartupInfo,
   ApplyUpdateAllResponse,
   BrowseRemoteAddonsResponse,
+  BackupInspection,
+  BackupResult,
   CachedImageResponse,
   CheckAddonsResponse,
   ClearSavedVariablesResponse,
@@ -24,7 +27,6 @@ import type {
   InstalledAddonsResponse,
   InstalledAddonDependenciesResponse,
   LocalAddon,
-  ManualBackupResponse,
   MatchResult,
   PlannedAction,
   PlanRemoteInstallResponse,
@@ -33,6 +35,7 @@ import type {
   RemoteCategory,
   RemoteAddonDetailsWithLocalStateResponse,
   RemoveInstalledAddonResponse,
+  RestoreResult,
   SingleUpdateApplyResponse,
   SingleUpdatePlanResponse,
   UpdateAllAction,
@@ -57,12 +60,11 @@ type OperationKind =
   | "install-plan"
   | "install-apply"
   | "dependency-install"
-  | "update-plan"
   | "update-apply"
   | "remove-apply"
   | "savedvariables-clear"
   | "manual-backup"
-  | "update-all-plan"
+  | "backup-restore"
   | "update-all-apply";
 
 interface AppState {
@@ -73,6 +75,7 @@ interface AppState {
   operationTarget: string | null;
   error: string | null;
   success: string | null;
+  successDetail: string | null;
   warning: string | null;
   installed: InstalledAddonsResponse | null;
   searchQuery: string;
@@ -107,19 +110,27 @@ interface AppState {
   installPlan: PlanRemoteInstallResponse | null;
   installResult: InstallRemoteAddonResponse | null;
   forceUpdate: boolean;
+  singleUpdatePhase: "preparing" | "updating" | null;
   singleUpdatePlan: SingleUpdatePlanResponse | null;
   singleUpdateResult: SingleUpdateApplyResponse | null;
   removeResult: RemoveInstalledAddonResponse | null;
   removeConfirmLocal: LocalAddon | null;
+  removeSavedVariables: boolean;
   clearSavedVariablesResult: ClearSavedVariablesResponse | null;
   clearSavedVariablesConfirmLocal: LocalAddon | null;
   manualBackupConfirmOpen: boolean;
   manualBackupIncludeSavedVariables: boolean;
-  manualBackupResult: ManualBackupResponse | null;
+  manualBackupResult: BackupResult | null;
   manualBackupError: string | null;
+  restoreZipPath: string | null;
+  restoreInspection: BackupInspection | null;
+  restoreAddons: boolean;
+  restoreSavedVariables: boolean;
+  restoreResult: RestoreResult | null;
   addonContextMenu: AddonContextMenuState | null;
   updateAllPlan: PlanUpdateAllResponse | null;
   updateAllResult: ApplyUpdateAllResponse | null;
+  updateAllProgress: UpdateAllProgress | null;
   settings: AppSettings | null;
   addonsPathExists: boolean | null;
   needsInitialSetup: boolean;
@@ -143,6 +154,12 @@ interface AddonContextMenuState {
   y: number;
 }
 
+interface UpdateAllProgress {
+  index: number;
+  total: number;
+  local_folder: string;
+}
+
 interface CategoryMeta {
   name: string;
   x: number;
@@ -157,6 +174,7 @@ const state: AppState = {
   operationTarget: null,
   error: null,
   success: null,
+  successDetail: null,
   warning: null,
   installed: null,
   searchQuery: "",
@@ -191,19 +209,27 @@ const state: AppState = {
   installPlan: null,
   installResult: null,
   forceUpdate: false,
+  singleUpdatePhase: null,
   singleUpdatePlan: null,
   singleUpdateResult: null,
   removeResult: null,
   removeConfirmLocal: null,
+  removeSavedVariables: false,
   clearSavedVariablesResult: null,
   clearSavedVariablesConfirmLocal: null,
   manualBackupConfirmOpen: false,
   manualBackupIncludeSavedVariables: false,
   manualBackupResult: null,
   manualBackupError: null,
+  restoreZipPath: null,
+  restoreInspection: null,
+  restoreAddons: true,
+  restoreSavedVariables: false,
+  restoreResult: null,
   addonContextMenu: null,
   updateAllPlan: null,
   updateAllResult: null,
+  updateAllProgress: null,
   settings: null,
   addonsPathExists: null,
   needsInitialSetup: false,
@@ -227,6 +253,25 @@ const ADDON_CONTEXT_MENU_WIDTH = 224;
 const ADDON_CONTEXT_MENU_HEIGHT = 132;
 const CONTEXT_MENU_MARGIN = 8;
 const SEARCH_SCROLL_THRESHOLD_PX = 300;
+const UPDATE_ALL_PROGRESS_EVENT = "scribe-update-all-progress";
+const TEXT_INPUT_IDS = {
+  setupAddonsPath: "scribe-setup-addons-path",
+  installedFilter: "scribe-installed-filter",
+  addonSearch: "scribe-addon-search",
+  settingsAddonsPath: "scribe-addons-path",
+  settingsBackupFolder: "scribe-backup-folder",
+  settingsDownloadFolder: "scribe-download-folder",
+} as const;
+const noAutocompleteAttrs = [
+  `autocomplete="off"`,
+  `autocorrect="off"`,
+  `autocapitalize="off"`,
+  `spellcheck="false"`,
+  `data-form-type="other"`,
+  `data-lpignore="true"`,
+  `data-1p-ignore="true"`,
+].join(" ");
+const disableDevToolsShortcuts = false;
 
 let searchScrollContainer: HTMLElement | null = null;
 let searchScrollHandler: (() => void) | null = null;
@@ -240,6 +285,7 @@ document.addEventListener("pointerdown", (event) => {
 });
 window.addEventListener("blur", () => closeAddonContextMenu());
 window.addEventListener("resize", () => closeAddonContextMenu());
+window.addEventListener("keydown", preventProductionDevToolsShortcut, { capture: true });
 
 window.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
@@ -256,6 +302,11 @@ window.addEventListener("keydown", (event) => {
   if (state.manualBackupConfirmOpen && !guardedOperationRunning()) {
     event.preventDefault();
     cancelManualBackup();
+    return;
+  }
+  if (state.restoreInspection && !guardedOperationRunning()) {
+    event.preventDefault();
+    cancelRestoreBackup();
     return;
   }
   if (state.removeConfirmLocal && !guardedOperationRunning()) {
@@ -304,13 +355,14 @@ function render() {
       </aside>
       <section class="content">
         ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
-        ${state.success ? `<div class="banner success compact-banner">${escapeHtml(state.success)}</div>` : ""}
+        ${state.success ? `<div class="banner success compact-banner">${escapeHtml(state.success)}${state.successDetail ? `<p class="banner-helper">${escapeHtml(state.successDetail)}</p>` : ""}</div>` : ""}
         ${state.warning ? `<div class="banner warning">${escapeHtml(state.warning)}</div>` : ""}
         ${renderCurrentTab()}
         ${renderDetailsModal()}
         ${renderRemoveConfirmationModal()}
         ${renderClearSavedVariablesConfirmationModal()}
         ${renderManualBackupConfirmationModal()}
+        ${renderRestoreBackupModal()}
         ${renderAddonContextMenu()}
       </section>
     </main>
@@ -337,9 +389,11 @@ function renderInitialSetup() {
         </div>
         ${state.detectedAddonsPath ? `<div class="banner info">Detected AddOns path: ${escapeHtml(state.detectedAddonsPath)}</div>` : `<div class="banner warning">No ESO AddOns path was detected automatically.</div>`}
         <div class="field" id="setup-addons-field">
-          <label for="setup-addons-dir">AddOns path</label>
+          <label for="${TEXT_INPUT_IDS.setupAddonsPath}">AddOns path</label>
           <div class="field-with-action">
-            <input id="setup-addons-dir" value="${escapeAttr(state.setupAddonsPath)}" placeholder="C:\\Users\\Name\\Documents\\Elder Scrolls Online\\live\\AddOns" ${disabledAttr()} />
+            ${textInput(TEXT_INPUT_IDS.setupAddonsPath, state.setupAddonsPath, {
+              placeholder: "C:\\Users\\Name\\Documents\\Elder Scrolls Online\\live\\AddOns",
+            })}
             <button class="secondary icon-button" id="browse-setup-addons" title="Browse for AddOns folder" ${disabledAttr()}>${icon("folder")} Browse</button>
           </div>
         </div>
@@ -384,8 +438,15 @@ function renderRemoveConfirmationModal() {
         <div class="modal-icon danger-icon">${icon("target")}</div>
         <div class="modal-content">
           <h2 id="remove-addon-title">Uninstall addon?</h2>
-          <p>This will delete the addon folder from AddOns. SavedVariables will not be touched.</p>
+          <p>This will delete the addon folder from AddOns.</p>
           <p class="modal-path" title="${escapeAttr(local.folder_name)}">${escapeHtml(local.folder_name)}</p>
+          <div class="modal-option">
+            <label class="checkbox-line" for="remove-addon-savedvariables">
+              <input ${checkboxInputAttrs("remove-addon-savedvariables", "scribe-remove-addon-savedvariables")} type="checkbox" ${state.removeSavedVariables ? "checked" : ""} ${disabledAttr()} />
+              <span>Also delete SavedVariables</span>
+            </label>
+            <p class="setting-helper">SavedVariables store addon settings and account/character data. Leave this unchecked to keep your settings.</p>
+          </div>
         </div>
         <div class="modal-actions">
           <button class="secondary" id="cancel-remove-addon" ${disabledAttr()}>Cancel</button>
@@ -425,10 +486,10 @@ function renderManualBackupConfirmationModal() {
         <div class="modal-icon">${icon("folder")}</div>
         <div class="modal-content">
           <h2 id="manual-backup-title">Create backup?</h2>
-          <p>This will copy your AddOns folder to the selected backup folder.</p>
+          <p>This will create a compressed ZIP backup in the selected backup folder.</p>
           <div class="modal-option">
             <label class="checkbox-line" for="manual-backup-savedvariables">
-              <input id="manual-backup-savedvariables" type="checkbox" ${state.manualBackupIncludeSavedVariables ? "checked" : ""} ${disabledAttr()} />
+              <input ${checkboxInputAttrs("manual-backup-savedvariables", "scribe-manual-backup-savedvariables")} type="checkbox" ${state.manualBackupIncludeSavedVariables ? "checked" : ""} ${disabledAttr()} />
               <span>Include SavedVariables</span>
             </label>
             <p class="setting-helper">SavedVariables contain addon settings and account/character data.</p>
@@ -439,6 +500,56 @@ function renderManualBackupConfirmationModal() {
           <button class="primary" id="confirm-manual-backup" ${disabledAttr()}>${loadingButtonContent("Create backup", "Creating backup...", "manual-backup")}</button>
         </div>
       </section>
+    </div>
+  `;
+}
+
+function renderRestoreBackupModal() {
+  const inspection = state.restoreInspection;
+  if (!inspection || !state.restoreZipPath) return "";
+  return `
+    <div class="modal-backdrop remove-confirmation" role="presentation">
+      <section class="modal-panel restore-preview-panel" role="dialog" aria-modal="true" aria-labelledby="restore-backup-title">
+        <div class="modal-icon danger-icon">${icon("rotate")}</div>
+        <div class="modal-content">
+          <h2 id="restore-backup-title">Restore backup?</h2>
+          <div class="restore-preview-grid">
+            ${restorePreviewItem("Backup", inspection.backup_name)}
+            ${restorePreviewItem("Created", formatBackupDate(inspection.created_at))}
+            ${restorePreviewItem("Contains AddOns", yesNo(inspection.contains_addons))}
+            ${restorePreviewItem("Contains SavedVariables", yesNo(inspection.contains_saved_variables))}
+            ${restorePreviewItem("Estimated files", formatCount(inspection.file_count))}
+            ${restorePreviewItem("Estimated size", formatBytesDisplay(inspection.total_bytes))}
+          </div>
+          ${pathDisplay(`Target AddOns folder: ${inspection.target_addons_folder}`)}
+          ${inspection.contains_saved_variables ? pathDisplay(`Target SavedVariables folder: ${inspection.target_saved_variables_folder}`) : ""}
+          <div class="modal-option">
+            <label class="checkbox-line" for="restore-backup-addons">
+              <input ${checkboxInputAttrs("restore-backup-addons", "scribe-restore-backup-addons")} type="checkbox" ${state.restoreAddons ? "checked" : ""} ${disabledAttr()} />
+              <span>Restore AddOns</span>
+            </label>
+            <label class="checkbox-line ${inspection.contains_saved_variables ? "" : "disabled-option"}" for="restore-backup-savedvariables">
+              <input ${checkboxInputAttrs("restore-backup-savedvariables", "scribe-restore-backup-savedvariables")} type="checkbox" ${state.restoreSavedVariables ? "checked" : ""} ${!inspection.contains_saved_variables || state.loading ? "disabled" : ""} />
+              <span>Restore SavedVariables</span>
+            </label>
+          </div>
+          <p>Restoring AddOns will replace the current AddOns folder. Create a backup first if you want to keep the current state.</p>
+          ${inspection.warnings.length > 0 ? `<p class="restore-warning">${escapeHtml(inspection.warnings.join(" "))}</p>` : ""}
+        </div>
+        <div class="modal-actions">
+          <button class="secondary" id="cancel-restore-backup" ${disabledAttr()}>Cancel</button>
+          <button class="danger" id="confirm-restore-backup" ${disabledAttr()}>${loadingButtonContent("Confirm Restore", "Restoring...", "backup-restore")}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function restorePreviewItem(label: string, value: string) {
+  return `
+    <div class="restore-preview-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
     </div>
   `;
 }
@@ -477,7 +588,7 @@ function brandMark() {
 function renderInstalled() {
   const view = installedView();
   const updateAllButton = shouldShowUpdateAllButton()
-    ? `<button class="primary" id="plan-update-all-installed" ${disabledAttr()}>${loadingButtonContent("Update All", "Preparing update...", "update-all-plan")}</button>`
+    ? `<button class="primary" id="apply-update-all-installed" ${disabledAttr()}>${loadingButtonContent("Update All", updateAllButtonLoadingLabel(), "update-all-apply")}</button>`
     : "";
   return `
     ${pageHeader(
@@ -492,7 +603,9 @@ function renderInstalled() {
     <section class="control-panel">
       <label class="field">
         <span>Filter installed</span>
-        <input id="installed-filter-input" value="${escapeAttr(state.installedQuery)}" placeholder="Addon name, author, folder" ${disabledAttr()} />
+        ${textInput(TEXT_INPUT_IDS.installedFilter, state.installedQuery, {
+          placeholder: "Addon name, author, folder",
+        })}
       </label>
       <label class="field sort-field">
         <span>Sort</span>
@@ -505,9 +618,8 @@ function renderInstalled() {
       </label>
     </section>
     <section class="addon-list" id="installed-list">${renderInstalledList(view)}</section>
-    ${renderUpdateAllPlan()}
+    ${renderUpdateAllProgress()}
     ${renderUpdateAllResult()}
-    ${hasDetailsOpen() ? "" : renderSingleUpdatePlan()}
     ${hasDetailsOpen() ? "" : renderSingleUpdateResult()}
   `;
 }
@@ -584,7 +696,9 @@ function renderSearch() {
       <label class="field search-query-field">
         <span>Search term</span>
         <div class="field-with-action">
-          <input id="search-query" value="${escapeAttr(state.searchQuery)}" placeholder="Addon name, author, or keyword" ${disabledAttr()} />
+          ${textInput(TEXT_INPUT_IDS.addonSearch, state.searchQuery, {
+            placeholder: "Addon name, author, or keyword",
+          })}
           <button class="primary" id="run-search" ${disabledAttr()}>${loadingButtonContent("Search", "Searching...", "search")}</button>
         </div>
       </label>
@@ -830,7 +944,6 @@ function renderDetailsActionPanels() {
   return `
     ${renderInstallPlan()}
     ${renderInstallResult()}
-    ${renderSingleUpdatePlan()}
     ${renderSingleUpdateResult()}
     ${renderRemoveResult()}
   `;
@@ -859,7 +972,7 @@ function shouldShowDependenciesTab() {
 }
 
 function selectedDependencyPlan() {
-  return state.installPlan?.dependency_plan ?? state.singleUpdatePlan?.dependency_plan ?? null;
+  return state.installPlan?.dependency_plan ?? state.singleUpdateResult?.dependency_plan ?? null;
 }
 
 function renderAddonInfoTab() {
@@ -1214,17 +1327,11 @@ function renderInstallUpdateFooterAction() {
 
   if (!match) return "";
   const target = match.local.folder_name;
-  const matchingPlan = state.singleUpdatePlan?.target.toLowerCase() === target.toLowerCase() ? state.singleUpdatePlan : null;
-  if (matchingPlan?.should_install) {
-    if (hasRequiredDependencyIssues(matchingPlan.dependency_plan)) return "";
-    const label = matchingPlan.decision === "forced-reinstall" ? "Reinstall" : "Update";
-    return `<button class="danger" id="confirm-update" ${disabledAttr()}>${loadingButtonContent(`Confirm ${label}`, "Updating...", "update-apply", target)}</button>`;
-  }
   if (match.update_confidence === "reliable-update") {
-    return `<button class="primary" data-plan-update-target="${escapeAttr(target)}" ${disabledAttr()}>${loadingButtonContent("Update", "Preparing update...", "update-plan", target)}</button>`;
+    return `<button class="primary" data-apply-update-target="${escapeAttr(target)}" ${disabledAttr()}>${loadingButtonContent("Update", singleUpdateButtonLoadingLabel(target), "update-apply", target)}</button>`;
   }
   if (state.forceUpdate && ["matched", "unknown-update", "local-newer"].includes(match.status)) {
-    return `<button class="secondary" data-plan-update-target="${escapeAttr(target)}" ${disabledAttr()}>${loadingButtonContent("Reinstall", "Preparing update...", "update-plan", target)}</button>`;
+    return `<button class="secondary" data-apply-update-target="${escapeAttr(target)}" ${disabledAttr()}>${loadingButtonContent("Reinstall", singleUpdateButtonLoadingLabel(target), "update-apply", target)}</button>`;
   }
   return "";
 }
@@ -1239,7 +1346,6 @@ function selectedDetailsStatusNote() {
     if (state.installResult) return "Installed successfully";
     return "Not installed locally";
   }
-  if (state.singleUpdatePlan?.reason) return state.singleUpdatePlan.reason;
   if (state.singleUpdateResult) return "Update completed";
   const status = installedStatus(match, local);
   const localName = plainEsoText(local.title?.trim() || local.folder_name);
@@ -1330,12 +1436,12 @@ function renderFolderSettings(settings: AppSettings | null) {
         </div>
       </div>
       <div class="settings-detail-body">
-        ${settingField("AddOns folder", "settings-addons-dir", settings?.addons_dir_override ?? "", {
+        ${settingField("AddOns folder", TEXT_INPUT_IDS.settingsAddonsPath, settings?.addons_dir_override ?? "", {
           browse: true,
           helper: "Where ESO loads your addons from.",
           placeholder: "Auto-detect AddOns folder",
         })}
-        ${settingField("Backup folder", "settings-backup-dir", settings?.backup_dir_override ?? "", {
+        ${settingField("Backup folder", TEXT_INPUT_IDS.settingsBackupFolder, settings?.backup_dir_override ?? "", {
           browse: true,
           helper: "Where manual backups are saved.",
           placeholder: "Choose backup folder",
@@ -1356,7 +1462,7 @@ function renderDownloadsSettings(settings: AppSettings | null) {
         </div>
       </div>
       <div class="settings-detail-body">
-        ${settingField("Download folder", "settings-download-dir", settings?.download_dir ?? "", {
+        ${settingField("Download folder", TEXT_INPUT_IDS.settingsDownloadFolder, settings?.download_dir ?? "", {
           browse: true,
           helper: "Where ZIP files are saved when you keep downloads.",
           placeholder: "Use default download folder",
@@ -1410,8 +1516,10 @@ function renderManualBackupSettings() {
   return `
     <div class="backup-actions">
       <button class="secondary icon-button" id="create-manual-backup" ${disabledAttr()}>${loadingButtonContent(`${icon("folder")} Create backup`, "Creating backup...", "manual-backup")}</button>
+      <button class="secondary icon-button" id="restore-backup" ${disabledAttr()}>${loadingButtonContent(`${icon("rotate")} Restore backup`, "Restoring...", "backup-restore")}</button>
     </div>
     ${renderManualBackupStatus()}
+    ${renderRestoreBackupStatus()}
   `;
 }
 
@@ -1420,18 +1528,56 @@ function renderManualBackupStatus() {
     return `
       <p class="backup-status backup-status-error">
         <span>${escapeHtml(state.manualBackupError)}</span>
-        ${state.manualBackupResult ? `<button class="backup-inline-action" id="open-created-backup-folder" title="Open backup folder" ${disabledAttr()}>Open</button>` : ""}
+        ${state.manualBackupResult ? `<button class="backup-inline-action" id="open-created-backup-folder" title="Open backup location" ${disabledAttr()}>Open</button>` : ""}
       </p>
     `;
   }
   if (!state.manualBackupResult) return "";
+  const hasSkippedFiles = state.manualBackupResult.skipped_files_count > 0;
+  const label = hasSkippedFiles ? "Backup created with warnings" : "Backup created";
 
+  return `
+    <div class="backup-status-group">
+      <p class="backup-status ${hasSkippedFiles ? "backup-status-warning" : "backup-status-success"}">
+        ${icon("check")}
+        <span>${escapeHtml(label)}</span>
+        <span aria-hidden="true">&middot;</span>
+        <button class="backup-inline-action" id="open-created-backup-folder" title="Open backup location" ${disabledAttr()}>Open</button>
+      </p>
+      ${hasSkippedFiles ? `<p class="backup-status-note">Some files could not be copied because they were in use.</p>${renderBackupSkippedFiles(state.manualBackupResult)}` : ""}
+    </div>
+  `;
+}
+
+function renderBackupSkippedFiles(result: BackupResult) {
+  if (result.skipped_files_count === 0) return "";
+  return `
+    <details class="result-details backup-skipped-details">
+      <summary>Skipped files (${formatCount(result.skipped_files_count)})</summary>
+      <div class="mini-list">
+        ${result.skipped_files.map((file) => `
+          <div class="mini-row">
+            <strong title="${escapeAttr(file.relative_path)}">${escapeHtml(file.relative_path)}</strong>
+            <span>${escapeHtml(file.reason)}</span>
+          </div>
+        `).join("")}
+      </div>
+      ${result.skipped_files_count >= 10 ? `<p class="setting-helper">Close ESO or Minion and retry if many files were skipped.</p>` : ""}
+    </details>
+  `;
+}
+
+function renderRestoreBackupStatus() {
+  if (!state.restoreResult) return "";
+  const details = [
+    state.restoreResult.restored_addons ? "AddOns restored" : null,
+    state.restoreResult.restored_saved_variables ? "SavedVariables restored" : null,
+  ].filter(Boolean).join(" · ");
   return `
     <p class="backup-status backup-status-success">
       ${icon("check")}
-      <span>Backup created</span>
-      <span aria-hidden="true">&middot;</span>
-      <button class="backup-inline-action" id="open-created-backup-folder" title="Open backup folder" ${disabledAttr()}>Open</button>
+      <span>Backup restored</span>
+      ${details ? `<span aria-hidden="true">&middot;</span><span>${escapeHtml(details)}</span>` : ""}
     </p>
   `;
 }
@@ -1520,29 +1666,37 @@ function renderInstallResult() {
   return renderCompactInstallResult(result);
 }
 
-function renderUpdateAllPlan() {
-  if (isOperation("update-all-plan")) return renderPlanSkeletonPanel("All Updates Preview");
-  const plan = state.updateAllPlan;
-  if (!plan) return "";
+function renderUpdateAllProgress() {
+  if (!isOperation("update-all-apply")) return "";
+  const progress = state.updateAllProgress;
+  const message = progress
+    ? `Updating ${progress.index} of ${progress.total}: ${plainEsoText(progress.local_folder)}`
+    : "Preparing update...";
   return `
-    <section class="panel">
-      <div class="banner info">Dry run only. This preview did not download, extract, modify, or delete addon files.</div>
-      <div class="panel-heading">
+    <section class="panel result-panel">
+      <div class="result-state">
+        <span class="button-spinner" aria-hidden="true"></span>
         <div>
-          <h3>All Updates Preview</h3>
-          <p>${plan.summary.planned_updates} update candidate${plan.summary.planned_updates === 1 ? "" : "s"} in ${escapeHtml(plan.addons_dir)}</p>
+          <h3>${escapeHtml(message)}</h3>
+          <p>Fetching fresh metadata, verifying the ZIP, and applying the update safely.</p>
         </div>
-        ${plan.summary.planned_updates > 0 ? `<button class="danger" id="apply-update-all" ${disabledAttr()}>${loadingButtonContent("Confirm Update All", "Updating...", "update-all-apply")}</button>` : ""}
-      </div>
-      <div class="addon-list">
-        ${
-          plan.actions.length === 0
-            ? emptyState("No update candidates", "No update candidates were found in this preview.")
-            : plan.actions.map(renderUpdateAllActionCard).join("")
-        }
       </div>
     </section>
   `;
+}
+
+function updateAllNoUpdatesMessage(plan: PlanUpdateAllResponse) {
+  const skipped = [
+    plan.summary.skipped_current > 0 ? `${plan.summary.skipped_current} current` : null,
+    plan.summary.skipped_local_newer > 0 ? `${plan.summary.skipped_local_newer} local newer` : null,
+    plan.summary.skipped_unknown > 0 ? `${plan.summary.skipped_unknown} uncertain` : null,
+    plan.summary.skipped_no_match > 0 ? `${plan.summary.skipped_no_match} without remote match` : null,
+    plan.summary.skipped_ambiguous > 0 ? `${plan.summary.skipped_ambiguous} ambiguous` : null,
+    plan.summary.skipped_libraries > 0 ? `${plan.summary.skipped_libraries} libraries` : null,
+  ].filter(Boolean);
+
+  if (skipped.length === 0) return "No actionable updates are available.";
+  return `No actionable updates are available. Skipped: ${skipped.join(", ")}.`;
 }
 
 function renderUpdateAllActionCard(action: UpdateAllAction) {
@@ -1563,6 +1717,7 @@ function renderUpdateAllActionCard(action: UpdateAllAction) {
           ${metaItem("Remote", action.remote_version)}
           ${metaItem("Action", action.action)}
           ${metaItem("Update-all", action.update_all_action)}
+          ${metaItem("Reason", action.update_reason)}
         </div>
       </div>
     </article>
@@ -1572,13 +1727,20 @@ function renderUpdateAllActionCard(action: UpdateAllAction) {
 function renderUpdateAllResult() {
   const result = state.updateAllResult;
   if (!result) return "";
+  const failure = result.failure;
+  const updatedCount = result.results.length;
+  const title = failure
+    ? `Stopped at ${failure.local_folder}: ${failure.message}`
+    : updatedCount > 0
+      ? `Updated ${updatedCount} addon${updatedCount === 1 ? "" : "s"}`
+      : "Already current";
   return `
     <section class="panel">
-      <div class="banner ${result.applied ? "success" : "warning"}">Update-all ${result.applied ? "completed" : "finished without file changes"}.</div>
+      <div class="banner ${failure ? "warning" : result.applied ? "success" : "warning"}">${escapeHtml(title)}</div>
       <div class="summary">
-        ${summaryItem("Updated", result.results.length)}
+        ${summaryItem("Updated", updatedCount)}
         ${summaryItem("Previewed", result.summary.planned_updates)}
-        ${summaryItem("Applied", result.applied ? 1 : 0)}
+        ${summaryItem("Stopped", failure ? 1 : 0)}
       </div>
       ${result.results.length === 0 ? emptyState("No updates applied", "No addons were updated.") : result.results.map(renderUpdateAllResultCard).join("")}
     </section>
@@ -1608,26 +1770,6 @@ function renderUpdateAllResultCard(item: ApplyUpdateAllResponse["results"][numbe
   `;
 }
 
-function renderSingleUpdatePlan() {
-  if (isOperation("update-plan")) return renderPlanSkeletonPanel("Single Update Preview");
-  const plan = state.singleUpdatePlan;
-  if (!plan) return "";
-  const dependencyIssues = hasRequiredDependencyIssues(plan.dependency_plan);
-  return `
-    <section class="panel">
-      ${dependencyIssues ? `<div class="banner warning">Some required dependencies could not be resolved safely. Update is blocked until those dependencies are resolved.</div>` : ""}
-      <div class="panel-heading">
-        <div>
-          <h3>Single Update Preview</h3>
-          <p>${escapeHtml(plan.reason ?? plan.decision)}</p>
-        </div>
-      </div>
-      ${plan.plan ? renderPlanItems(plan.plan.items) : emptyState("No file changes previewed", "This addon is not eligible for update with the current options.")}
-      ${renderDependencyPlan(plan.dependency_plan)}
-    </section>
-  `;
-}
-
 function renderSingleUpdateResult() {
   const result = state.singleUpdateResult;
   if (!result) return "";
@@ -1640,6 +1782,7 @@ interface CompactResultInput {
   kind: CompactResultKind;
   title: string;
   message: string;
+  note?: string | null;
   backupDir?: string | null;
   detailsTitle?: string;
   details?: string;
@@ -1696,7 +1839,7 @@ function renderCompactUpdateResult(result: SingleUpdateApplyResponse) {
     return renderCompactResultPanel({
       kind: "warning",
       title: "Update finished without file changes",
-      message: "No addon folders were updated.",
+      message: singleUpdateNoChangeMessage(result),
       detailsTitle: "Details",
       details: renderUpdateResultDetails(result),
     });
@@ -1728,7 +1871,8 @@ function renderRemoveResult() {
   return renderCompactResultPanel({
     kind: result.removed_addon ? "success" : "warning",
     title: result.removed_addon ? "Addon uninstalled" : "Uninstall finished without file changes",
-    message: result.removed_addon && !result.removed_saved_variables ? "Addon uninstalled. SavedVariables were kept." : result.message,
+    message: removeSuccessMessage(result),
+    note: removeSavedVariablesStatusText(result),
     detailsTitle: result.saved_variables_deleted_count > 0 ? "Deleted SavedVariables" : undefined,
     details:
       result.saved_variables_deleted_count > 0
@@ -1763,6 +1907,7 @@ function renderCompactResultPanel(result: CompactResultInput) {
         <div>
           <h3>${escapeHtml(result.title)}</h3>
           <p>${escapeHtml(result.message)}</p>
+          ${result.note ? `<p class="result-note">${escapeHtml(result.note)}</p>` : ""}
         </div>
       </div>
       ${result.backupDir ? renderBackupDetails(result.backupDir) : ""}
@@ -2041,7 +2186,7 @@ function bindCommonEvents() {
     button.addEventListener("click", () => {
       state.tab = button.dataset.tab as Tab;
       state.error = null;
-      state.success = null;
+      clearSuccess();
       state.warning = null;
       closeAddonContextMenu(false);
       render();
@@ -2053,7 +2198,7 @@ function bindCommonEvents() {
 }
 
 function bindInitialSetupEvents() {
-  document.querySelector<HTMLInputElement>("#setup-addons-dir")?.addEventListener("input", (event) => {
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.setupAddonsPath}`)?.addEventListener("input", (event) => {
     state.setupAddonsPath = (event.currentTarget as HTMLInputElement).value;
     clearPendingInitialImport();
   });
@@ -2091,13 +2236,13 @@ function handleCardClick(card: HTMLElement) {
 
 function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#refresh-installed")?.addEventListener("click", () => loadInstalled(true));
-  document.querySelector<HTMLButtonElement>("#plan-update-all-installed")?.addEventListener("click", planUpdateAll);
+  document.querySelector<HTMLButtonElement>("#apply-update-all-installed")?.addEventListener("click", applyUpdateAll);
   document.querySelector<HTMLButtonElement>("#open-settings")?.addEventListener("click", () => {
     state.tab = "settings";
     state.activeSettingsSection = "folders";
     render();
   });
-  document.querySelector<HTMLInputElement>("#installed-filter-input")?.addEventListener("input", (event) => {
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.installedFilter}`)?.addEventListener("input", (event) => {
     state.installedQuery = (event.currentTarget as HTMLInputElement).value;
     renderInstalledListOnly();
   });
@@ -2105,11 +2250,11 @@ function bindTabEvents() {
     state.installedSort = (event.currentTarget as HTMLSelectElement).value as InstalledSort;
     render();
   });
-  document.querySelector<HTMLInputElement>("#search-query")?.addEventListener("input", (event) => {
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.addonSearch}`)?.addEventListener("input", (event) => {
     const value = (event.currentTarget as HTMLInputElement).value;
     state.searchQuery = value;
   });
-  document.querySelector<HTMLInputElement>("#search-query")?.addEventListener("keydown", (event) => {
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.addonSearch}`)?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       runSearch();
@@ -2180,24 +2325,34 @@ function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#remove-addon")?.addEventListener("click", removeAddon);
   document.querySelector<HTMLButtonElement>("#cancel-remove-addon")?.addEventListener("click", cancelRemoveAddon);
   document.querySelector<HTMLButtonElement>("#confirm-remove-addon")?.addEventListener("click", confirmRemoveAddon);
+  document.querySelector<HTMLInputElement>("#remove-addon-savedvariables")?.addEventListener("change", (event) => {
+    state.removeSavedVariables = (event.currentTarget as HTMLInputElement).checked;
+  });
   document.querySelector<HTMLButtonElement>("#cancel-clear-savedvariables")?.addEventListener("click", cancelClearSavedVariables);
   document.querySelector<HTMLButtonElement>("#confirm-clear-savedvariables")?.addEventListener("click", confirmClearSavedVariables);
   document.querySelector<HTMLButtonElement>("#create-manual-backup")?.addEventListener("click", requestManualBackup);
+  document.querySelector<HTMLButtonElement>("#restore-backup")?.addEventListener("click", requestRestoreBackup);
   document.querySelector<HTMLButtonElement>("#cancel-manual-backup")?.addEventListener("click", cancelManualBackup);
   document.querySelector<HTMLButtonElement>("#confirm-manual-backup")?.addEventListener("click", confirmManualBackup);
   document.querySelector<HTMLInputElement>("#manual-backup-savedvariables")?.addEventListener("change", (event) => {
     state.manualBackupIncludeSavedVariables = (event.currentTarget as HTMLInputElement).checked;
   });
+  document.querySelector<HTMLButtonElement>("#cancel-restore-backup")?.addEventListener("click", cancelRestoreBackup);
+  document.querySelector<HTMLButtonElement>("#confirm-restore-backup")?.addEventListener("click", confirmRestoreBackup);
+  document.querySelector<HTMLInputElement>("#restore-backup-addons")?.addEventListener("change", (event) => {
+    state.restoreAddons = (event.currentTarget as HTMLInputElement).checked;
+  });
+  document.querySelector<HTMLInputElement>("#restore-backup-savedvariables")?.addEventListener("change", (event) => {
+    state.restoreSavedVariables = (event.currentTarget as HTMLInputElement).checked;
+  });
   document.querySelector<HTMLButtonElement>("#open-created-backup-folder")?.addEventListener("click", openCreatedBackupFolder);
   document.querySelector<HTMLButtonElement>("#refresh-installed-after-install")?.addEventListener("click", () => loadInstalled(true));
-  document.querySelector<HTMLButtonElement>("#apply-update-all")?.addEventListener("click", applyUpdateAll);
-  document.querySelectorAll<HTMLButtonElement>("[data-plan-update-target]").forEach((button) => {
+  document.querySelectorAll<HTMLButtonElement>("[data-apply-update-target]").forEach((button) => {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
-      planSingleUpdate(button.dataset.planUpdateTarget ?? "");
+      applySingleUpdate(button.dataset.applyUpdateTarget ?? "");
     });
   });
-  document.querySelector<HTMLButtonElement>("#confirm-update")?.addEventListener("click", confirmUpdate);
   document.querySelector<HTMLButtonElement>("#save-settings")?.addEventListener("click", saveSettings);
   document.querySelector<HTMLButtonElement>("#reset-settings")?.addEventListener("click", resetSettings);
   document.querySelector<HTMLButtonElement>("#clear-http-cache")?.addEventListener("click", clearHttpCache);
@@ -2208,13 +2363,13 @@ function bindTabEvents() {
       render();
     });
   });
-  document.querySelector<HTMLInputElement>("#settings-addons-dir")?.addEventListener("input", syncSettingsDraft);
-  document.querySelector<HTMLInputElement>("#settings-backup-dir")?.addEventListener("input", () => {
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.settingsAddonsPath}`)?.addEventListener("input", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.settingsBackupFolder}`)?.addEventListener("input", () => {
     const hadBackupFolder = Boolean(state.settings?.backup_dir_override);
     syncSettingsDraft();
     if (hadBackupFolder !== Boolean(state.settings?.backup_dir_override)) render();
   });
-  document.querySelector<HTMLInputElement>("#settings-download-dir")?.addEventListener("input", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.settingsDownloadFolder}`)?.addEventListener("input", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-keep-downloads")?.addEventListener("change", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-include-unknown")?.addEventListener("change", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-hide-libraries-search")?.addEventListener("change", syncSettingsDraft);
@@ -2229,6 +2384,40 @@ function bindTabEvents() {
   if (state.tab === "settings" && state.activeSettingsSection === "cache") {
     ensureHttpCacheStatsLoaded();
   }
+}
+
+function singleUpdateNoChangeMessage(result: SingleUpdateApplyResponse) {
+  if (result.decision === "skipped-current") return "Already current.";
+  if (result.decision === "skipped-ambiguous") return "Remote match is ambiguous.";
+  if (result.decision === "skipped-no-match") return "No clean remote match is available.";
+  if (result.decision === "skipped-local-newer") return "The local version appears newer than remote.";
+  if (result.decision === "skipped-unknown-use-force") return "Version check is uncertain.";
+  return result.reason ?? "No addon folders were updated.";
+}
+
+function singleUpdateSuccessMessage(result: SingleUpdateApplyResponse) {
+  if (!result.applied) return singleUpdateNoChangeMessage(result);
+  return `Updated ${plainEsoText(result.remote_details?.name ?? result.remote?.name ?? result.local.folder_name)}.`;
+}
+
+function updateAllSuccessMessage(result: ApplyUpdateAllResponse) {
+  const count = result.results.length;
+  if (count === 0) return "Already current.";
+  return `Updated ${count} addon${count === 1 ? "" : "s"}.`;
+}
+
+function preventProductionDevToolsShortcut(event: KeyboardEvent) {
+  if (!disableDevToolsShortcuts || !isDevToolsShortcut(event)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}
+
+function isDevToolsShortcut(event: KeyboardEvent) {
+  const key = event.key.toLowerCase();
+  const ctrlOrMeta = event.ctrlKey || event.metaKey;
+  const macInspectorChord = event.metaKey && event.altKey && ["i", "j", "c"].includes(key);
+  const inspectorChord = ctrlOrMeta && event.shiftKey && ["i", "j", "c"].includes(key);
+  return event.key === "F12" || macInspectorChord || inspectorChord;
 }
 
 function handleGlobalContextMenu(event: MouseEvent) {
@@ -2311,13 +2500,22 @@ function runAddonContextAction(action: AddonContextAction) {
   void openAddonFolder(local);
 }
 
+function setSuccess(message: string | null, detail: string | null = null) {
+  state.success = message;
+  state.successDetail = message ? detail : null;
+}
+
+function clearSuccess() {
+  setSuccess(null);
+}
+
 async function withLoading(task: () => Promise<void>, operation: OperationKind = "general", operationTarget: string | null = null) {
   state.loading = true;
   state.operation = operation;
   state.operationTarget = operationTarget;
   state.error = null;
-  state.success = null;
-  if (operation === "manual-backup") {
+  clearSuccess();
+  if (operation === "manual-backup" || operation === "backup-restore") {
     state.manualBackupError = null;
   }
   closeAddonContextMenu(false);
@@ -2326,11 +2524,13 @@ async function withLoading(task: () => Promise<void>, operation: OperationKind =
     await task();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (operation === "manual-backup") {
+    if (operation === "manual-backup" || operation === "backup-restore") {
       state.manualBackupConfirmOpen = false;
+      state.restoreInspection = null;
+      state.restoreZipPath = null;
       state.manualBackupError = message;
     } else {
-      state.error = message;
+      state.error = operationErrorMessage(operation, operationTarget, message);
     }
   } finally {
     state.loading = false;
@@ -2338,6 +2538,43 @@ async function withLoading(task: () => Promise<void>, operation: OperationKind =
     state.operationTarget = null;
     render();
   }
+}
+
+function operationErrorMessage(operation: OperationKind, operationTarget: string | null, message: string) {
+  if (operation === "update-apply") {
+    return operationTarget ? `Could not update ${operationTarget}. ${message}` : `Could not apply update. ${message}`;
+  }
+  if (operation === "update-all-apply") {
+    return `Could not apply Update All. ${message}`;
+  }
+  return message;
+}
+
+function invokeWithTimeout<T>(command: string, args: Record<string, unknown>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timeoutId: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+
+  return Promise.race([invoke<T>(command, args), timeout]).finally(() => {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId);
+  });
+}
+
+function removeSuccessMessage(result: RemoveInstalledAddonResponse) {
+  if (result.removed_addon && !result.removed_saved_variables) return "Addon uninstalled. SavedVariables were kept.";
+  if (result.removed_addon && result.removed_saved_variables) return "Addon and SavedVariables removed.";
+  return result.message;
+}
+
+function removeSavedVariablesStatusText(result: RemoveInstalledAddonResponse) {
+  if (!result.removed_saved_variables) return null;
+  if (result.saved_variables_deleted_count === 0) return "No SavedVariables files were found.";
+  return `Deleted ${formatCount(result.saved_variables_deleted_count)} SavedVariables ${result.saved_variables_deleted_count === 1 ? "file" : "files"}.`;
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 
 function renderInstalledListOnly() {
@@ -2354,10 +2591,10 @@ function bindCardEventsOnly() {
   document.querySelectorAll<HTMLElement>(".addon-card button, .addon-card a").forEach((element) => {
     element.addEventListener("click", (event) => event.stopPropagation());
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-plan-update-target]").forEach((button) => {
+  document.querySelectorAll<HTMLButtonElement>("[data-apply-update-target]").forEach((button) => {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
-      planSingleUpdate(button.dataset.planUpdateTarget ?? "");
+      applySingleUpdate(button.dataset.applyUpdateTarget ?? "");
     });
   });
 }
@@ -2454,6 +2691,23 @@ async function browseForFolder(defaultPath: string | null | undefined) {
     return typeof selected === "string" ? selected : null;
   } catch (error) {
     state.error = `Could not open folder browser. ${error instanceof Error ? error.message : String(error)}`;
+    render();
+    return null;
+  }
+}
+
+async function browseForBackupZip(defaultPath: string | null | undefined) {
+  try {
+    const selected = await openDialog({
+      directory: false,
+      multiple: false,
+      defaultPath: defaultPath || undefined,
+      filters: [{ name: "ZIP backups", extensions: ["zip"] }],
+    });
+
+    return typeof selected === "string" ? selected : null;
+  } catch (error) {
+    state.manualBackupError = `Could not open backup picker. ${error instanceof Error ? error.message : String(error)}`;
     render();
     return null;
   }
@@ -2655,6 +2909,7 @@ function closeDetails() {
   state.singleUpdateResult = null;
   state.removeResult = null;
   state.removeConfirmLocal = null;
+  state.removeSavedVariables = false;
   state.clearSavedVariablesConfirmLocal = null;
   render();
 }
@@ -2795,7 +3050,7 @@ function installDependency(remoteUid: string) {
 
     if (!result) return;
     state.path = result.addons_dir;
-    state.success = `Installed dependency ${result.remote.name ?? plan.remote.name ?? remoteUid}.`;
+    setSuccess(`Installed dependency ${result.remote.name ?? plan.remote.name ?? remoteUid}.`);
     await refreshInstalledData(true);
     if (parentFolder && state.selectedLocal?.folder_name === parentFolder) {
       state.selectedLocal = installedLocalByFolder(parentFolder) ?? state.selectedLocal;
@@ -2810,47 +3065,28 @@ function installDependency(remoteUid: string) {
   }, "dependency-install", remoteUid);
 }
 
-function planSingleUpdate(target: string) {
+async function applySingleUpdate(target: string) {
   if (!target) return;
   state.singleUpdatePlan = null;
   state.singleUpdateResult = null;
   state.removeResult = null;
   state.updateAllPlan = null;
   state.updateAllResult = null;
-  return withLoading(async () => {
-    state.singleUpdatePlan = await invoke<SingleUpdatePlanResponse>("plan_single_update", {
-      target,
-      path: effectiveAddonsPath(),
-      force: state.forceUpdate,
-    });
-    state.singleUpdateResult = null;
-    state.removeResult = null;
-    state.updateAllPlan = null;
-    state.updateAllResult = null;
-    state.path = state.singleUpdatePlan.addons_dir;
-  }, "update-plan", target);
-}
+  state.loading = true;
+  state.operation = "update-apply";
+  state.operationTarget = target;
+  state.singleUpdatePhase = "preparing";
+  state.error = null;
+  clearSuccess();
+  closeAddonContextMenu(false);
+  render();
 
-function confirmUpdate() {
-  const plan = state.singleUpdatePlan;
-  if (!plan || !plan.should_install || !plan.plan) return;
-  if (hasRequiredDependencyIssues(plan.dependency_plan)) {
-    state.error = "Some required dependencies could not be resolved safely. Nothing was installed.";
+  try {
+    await nextFrame();
+    state.singleUpdatePhase = "updating";
     render();
-    return;
-  }
-  const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
-    ? "Existing addon folders may be backed up and replaced."
-    : "No existing addon folder replacement is currently expected.";
-  const dependencyText = plan.dependency_plan ? installDependencyConfirmText(plan.dependency_plan) : "No required library changes are currently expected.";
-  const confirmed = window.confirm(
-    `Update ${plan.local.folder_name}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n${dependencyText}\n\nThe app will match the addon again, fetch fresh metadata, download and verify the ZIP, validate it, build a fresh preview, and back up replacements before applying.`,
-  );
-  if (!confirmed) return;
-  state.removeResult = null;
-  return withLoading(async () => {
     state.singleUpdateResult = await invoke<SingleUpdateApplyResponse>("apply_single_update", {
-      target: plan.target,
+      target,
       path: effectiveAddonsPath(),
       backupDir: state.settings?.backup_dir_override || null,
       keepDownload: state.settings?.keep_downloads_default ?? false,
@@ -2860,9 +3096,19 @@ function confirmUpdate() {
     state.path = state.singleUpdateResult.addons_dir;
     state.updateAllPlan = null;
     state.updateAllResult = null;
-    state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: state.path || null });
-    await refreshUpdatePlan(true);
-  }, "update-apply", plan.target);
+    setSuccess(singleUpdateSuccessMessage(state.singleUpdateResult));
+    await refreshInstalledData(true);
+    syncSelectedStateAfterUpdate(target);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    state.error = operationErrorMessage("update-apply", target, message);
+  } finally {
+    state.loading = false;
+    state.operation = null;
+    state.operationTarget = null;
+    state.singleUpdatePhase = null;
+    render();
+  }
 }
 
 function removeAddon() {
@@ -2873,6 +3119,7 @@ function removeAddon() {
 
 function requestUninstallAddon(local: LocalAddon) {
   state.removeConfirmLocal = local;
+  state.removeSavedVariables = false;
   state.clearSavedVariablesConfirmLocal = null;
   render();
 }
@@ -2880,12 +3127,14 @@ function requestUninstallAddon(local: LocalAddon) {
 function cancelRemoveAddon() {
   if (guardedOperationRunning()) return;
   state.removeConfirmLocal = null;
+  state.removeSavedVariables = false;
   render();
 }
 
 function confirmRemoveAddon() {
   const local = state.removeConfirmLocal;
   if (!local) return;
+  const removeSavedVariables = state.removeSavedVariables;
   state.installPlan = null;
   state.installResult = null;
   state.singleUpdatePlan = null;
@@ -2895,10 +3144,11 @@ function confirmRemoveAddon() {
     state.removeResult = await invoke<RemoveInstalledAddonResponse>("remove_installed_addon", {
       folderName: local.folder_name,
       path: effectiveAddonsPath(),
-      removeSavedVariables: false,
+      removeSavedVariables,
     });
     state.removeConfirmLocal = null;
-    state.success = "Addon uninstalled. SavedVariables were kept.";
+    state.removeSavedVariables = false;
+    setSuccess(removeSuccessMessage(state.removeResult), removeSavedVariablesStatusText(state.removeResult));
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: effectiveAddonsPath() });
     state.path = state.installed.addons_dir;
     syncInstalledStateAfterRemove(state.removeResult);
@@ -2928,7 +3178,7 @@ function confirmClearSavedVariables() {
     });
     state.clearSavedVariablesResult = result;
     state.clearSavedVariablesConfirmLocal = null;
-    state.success = result.deleted_count > 0 ? "SavedVariables cleared." : "No SavedVariables files were found.";
+    setSuccess(result.deleted_count > 0 ? "SavedVariables cleared." : "No SavedVariables files were found.");
   }, "savedvariables-clear");
 }
 
@@ -2939,6 +3189,7 @@ function requestManualBackup() {
     return;
   }
   state.manualBackupError = null;
+  state.restoreResult = null;
   state.manualBackupConfirmOpen = true;
   state.manualBackupIncludeSavedVariables = false;
   render();
@@ -2962,15 +3213,85 @@ function confirmManualBackup() {
   state.manualBackupResult = null;
   state.manualBackupError = null;
   return withLoading(async () => {
-    const result = await invoke<ManualBackupResponse>("create_manual_backup", {
+    const result = await invoke<BackupResult>("create_compressed_backup", {
       addonsPath: effectiveAddonsPath(),
       backupDir,
       includeSavedVariables: state.manualBackupIncludeSavedVariables,
     });
     state.manualBackupResult = result;
     state.manualBackupError = null;
+    state.restoreResult = null;
     state.manualBackupConfirmOpen = false;
   }, "manual-backup");
+}
+
+async function requestRestoreBackup() {
+  if (!state.settings?.backup_dir_override) {
+    state.manualBackupError = "Choose a backup folder to enable restore.";
+    render();
+    return;
+  }
+
+  state.manualBackupError = null;
+  state.manualBackupResult = null;
+  state.restoreResult = null;
+  const selected = await browseForBackupZip(state.settings.backup_dir_override);
+  if (!selected) return;
+
+  if (!selected.toLowerCase().endsWith(".zip")) {
+    state.manualBackupError = "Only ZIP backups are supported.";
+    render();
+    return;
+  }
+
+  return withLoading(async () => {
+    const inspection = await invoke<BackupInspection>("inspect_backup_zip", {
+      zipPath: selected,
+      addonsPath: effectiveAddonsPath(),
+    });
+    if (!inspection.valid) {
+      state.manualBackupError = inspection.warnings[0] || "Backup ZIP is invalid.";
+      return;
+    }
+
+    state.restoreZipPath = selected;
+    state.restoreInspection = inspection;
+    state.restoreAddons = inspection.contains_addons;
+    state.restoreSavedVariables = false;
+  }, "backup-restore");
+}
+
+function cancelRestoreBackup() {
+  if (guardedOperationRunning()) return;
+  state.restoreZipPath = null;
+  state.restoreInspection = null;
+  render();
+}
+
+function confirmRestoreBackup() {
+  const zipPath = state.restoreZipPath;
+  const inspection = state.restoreInspection;
+  if (!zipPath || !inspection) return;
+  if (!state.restoreAddons && !state.restoreSavedVariables) {
+    state.manualBackupError = "Choose at least one folder to restore.";
+    render();
+    return;
+  }
+
+  return withLoading(async () => {
+    const result = await invoke<RestoreResult>("restore_backup_zip", {
+      zipPath,
+      addonsPath: effectiveAddonsPath(),
+      restoreAddons: state.restoreAddons,
+      restoreSavedVariables: state.restoreSavedVariables,
+    });
+    state.restoreResult = result;
+    state.restoreZipPath = null;
+    state.restoreInspection = null;
+    state.manualBackupResult = null;
+    state.manualBackupError = null;
+    await refreshInstalledData(true);
+  }, "backup-restore");
 }
 
 async function openCreatedBackupFolder() {
@@ -2980,16 +3301,16 @@ async function openCreatedBackupFolder() {
   state.manualBackupError = null;
   render();
   try {
-    await invoke("open_folder", { path: result.backup_path });
+    await invoke("open_path_location", { path: result.backup_zip_path });
   } catch (error) {
-    state.manualBackupError = `Could not open backup folder. ${error instanceof Error ? error.message : String(error)}`;
+    state.manualBackupError = `Could not open backup location. ${error instanceof Error ? error.message : String(error)}`;
     render();
   }
 }
 
 async function openAddonFolder(local: LocalAddon) {
   state.error = null;
-  state.success = null;
+  clearSuccess();
   render();
   try {
     await invoke("open_addon_folder", {
@@ -3051,6 +3372,17 @@ function syncInstalledStateAfterRemove(result: RemoveInstalledAddonResponse) {
     : null;
 }
 
+function syncSelectedStateAfterUpdate(target?: string) {
+  const folderName = target ?? state.selectedLocal?.folder_name ?? null;
+  if (!folderName || state.selectedLocal?.folder_name.toLowerCase() !== folderName.toLowerCase()) return;
+  state.selectedLocal = installedLocalByFolder(folderName) ?? state.selectedLocal;
+  state.selectedMatch = state.updates?.matches.find((match) => match.local.folder_name.toLowerCase() === folderName.toLowerCase()) ?? null;
+  if (state.selectedLocal) {
+    state.selectedDependenciesLoading = true;
+    void loadInstalledDependencies(state.selectedLocal.folder_name);
+  }
+}
+
 function installedLocalFromResult(result: InstallRemoteAddonResponse) {
   const mainFolders = new Set(
     result.plan.items
@@ -3074,57 +3406,52 @@ function folderNameFromPath(value: string | null) {
   return parts[parts.length - 1] ?? null;
 }
 
-function planUpdateAll() {
+async function applyUpdateAll() {
   state.updateAllPlan = null;
   state.updateAllResult = null;
   state.singleUpdatePlan = null;
   state.singleUpdateResult = null;
-  return withLoading(async () => {
-    state.updateAllPlan = await invoke<PlanUpdateAllResponse>("plan_update_all", {
-      path: effectiveAddonsPath(),
-      includeUnknown: updateIncludeUnknownDefault(),
-      limit: null,
-    });
-    state.path = state.updateAllPlan.addons_dir;
-    state.updateAllResult = null;
-    state.singleUpdatePlan = null;
-    state.singleUpdateResult = null;
-    state.removeResult = null;
-  }, "update-all-plan");
-}
-
-function applyUpdateAll() {
-  const plan = state.updateAllPlan;
-  if (!plan || plan.summary.planned_updates === 0) return;
-  const confirmed = window.confirm(
-    `Update ${plan.summary.planned_updates} addon${plan.summary.planned_updates === 1 ? "" : "s"}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\nThe app will process updates sequentially, fetch fresh metadata for each addon, download and verify each ZIP, validate each package, and back up replacements before applying. It will stop on the first error.`,
-  );
-  if (!confirmed) return;
   state.removeResult = null;
-  return withLoading(async () => {
+  state.updateAllProgress = null;
+  state.loading = true;
+  state.operation = "update-all-apply";
+  state.operationTarget = null;
+  state.error = null;
+  clearSuccess();
+  closeAddonContextMenu(false);
+  render();
+
+  let unlistenProgress: (() => void) | null = null;
+  try {
+    unlistenProgress = await listen<UpdateAllProgress>(UPDATE_ALL_PROGRESS_EVENT, (event) => {
+      state.updateAllProgress = event.payload;
+      render();
+    });
+
     state.updateAllResult = await invoke<ApplyUpdateAllResponse>("apply_update_all", {
       path: effectiveAddonsPath(),
       backupDir: state.settings?.backup_dir_override || null,
       keepDownload: state.settings?.keep_downloads_default ?? false,
       downloadDir: state.settings?.download_dir || null,
-      includeUnknown: plan.include_unknown,
-      limit: plan.limit,
+      includeUnknown: updateIncludeUnknownDefault(),
+      limit: null,
     });
     state.path = state.updateAllResult.addons_dir;
     state.updateAllPlan = null;
-    state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: state.path || null });
-    await refreshUpdatePlan(true);
-  }, "update-all-apply");
-}
-
-function loadUpdates() {
-  return withLoading(async () => {
-    await refreshUpdatePlan(true);
-    state.singleUpdatePlan = null;
-    state.singleUpdateResult = null;
-    state.updateAllPlan = null;
-    state.updateAllResult = null;
-  }, "update-plan");
+    setSuccess(state.updateAllResult.failure ? null : updateAllSuccessMessage(state.updateAllResult));
+    await refreshInstalledData(true);
+    syncSelectedStateAfterUpdate();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    state.error = operationErrorMessage("update-all-apply", null, message);
+  } finally {
+    unlistenProgress?.();
+    state.loading = false;
+    state.operation = null;
+    state.operationTarget = null;
+    state.updateAllProgress = null;
+    render();
+  }
 }
 
 async function refreshUpdatePlan(refresh = false) {
@@ -3137,6 +3464,10 @@ async function refreshUpdatePlan(refresh = false) {
   state.updates = updatesFromPlan(updatePlan);
   state.path = updatePlan.addons_dir;
   state.warning = updatePlan.cache_warning;
+}
+
+function actionableUpdateTargets() {
+  return (state.updatePlan?.actions ?? []).filter(isActionableUpdateAction);
 }
 
 function installedView(): InstalledViewModel[] {
@@ -3207,10 +3538,10 @@ function installedStatus(match: MatchResult | null, addon: LocalAddon) {
 function renderCardUpdateAction(match: MatchResult | null) {
   if (!match) return "";
   if (match.update_confidence === "reliable-update") {
-    return `<button class="primary small" data-plan-update-target="${escapeAttr(match.local.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Update", "Preparing update...", "update-plan", match.local.folder_name)}</button>`;
+    return `<button class="primary small" data-apply-update-target="${escapeAttr(match.local.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Update", singleUpdateButtonLoadingLabel(match.local.folder_name), "update-apply", match.local.folder_name)}</button>`;
   }
   if (state.forceUpdate && ["matched", "unknown-update", "local-newer"].includes(match.status)) {
-    return `<button class="secondary small" data-plan-update-target="${escapeAttr(match.local.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Reinstall", "Preparing update...", "update-plan", match.local.folder_name)}</button>`;
+    return `<button class="secondary small" data-apply-update-target="${escapeAttr(match.local.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Reinstall", singleUpdateButtonLoadingLabel(match.local.folder_name), "update-apply", match.local.folder_name)}</button>`;
   }
   return "";
 }
@@ -3516,6 +3847,16 @@ function skeletonButton() {
   return `<span class="skeleton skeleton-button" aria-hidden="true"></span>`;
 }
 
+function singleUpdateButtonLoadingLabel(target: string) {
+  if (!isOperation("update-apply", target)) return "Updating...";
+  return state.singleUpdatePhase === "preparing" ? "Preparing update..." : "Updating...";
+}
+
+function updateAllButtonLoadingLabel() {
+  if (!isOperation("update-all-apply")) return "Updating...";
+  return state.updateAllProgress ? "Updating..." : "Preparing update...";
+}
+
 function loadingButtonContent(defaultContent: string, loadingLabel: string, operation: OperationKind, target?: string) {
   if (!isOperation(operation, target)) return defaultContent;
   return `<span class="button-spinner" aria-hidden="true"></span>${escapeHtml(loadingLabel)}`;
@@ -3527,6 +3868,29 @@ function pathDisplay(value: string) {
 
 function formatCount(value: number | null | undefined) {
   return value === null || value === undefined ? "-" : new Intl.NumberFormat().format(value);
+}
+
+function formatBytesDisplay(value: number | null | undefined) {
+  if (value === null || value === undefined) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return unitIndex === 0 ? `${value} ${units[unitIndex]}` : `${size.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function formatBackupDate(value: string | null) {
+  if (!value) return "Unknown";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function yesNo(value: boolean) {
+  return value ? "Yes" : "No";
 }
 
 function disabledAttr() {
@@ -3569,12 +3933,11 @@ function guardedOperationRunning() {
         "install-plan",
         "install-apply",
         "dependency-install",
-        "update-plan",
         "update-apply",
         "remove-apply",
         "savedvariables-clear",
         "manual-backup",
-        "update-all-plan",
+        "backup-restore",
         "update-all-apply",
       ].includes(
         state.operation,
@@ -3708,6 +4071,9 @@ function syncSettingsDraft() {
   ) {
     state.manualBackupResult = null;
     state.manualBackupError = null;
+    state.restoreResult = null;
+    state.restoreInspection = null;
+    state.restoreZipPath = null;
   }
   state.addonsPathExists = null;
 }
@@ -3715,9 +4081,9 @@ function syncSettingsDraft() {
 function readSettingsDraft(): AppSettings {
   const current = state.settings;
   return {
-    addons_dir_override: valueOrCurrent("#settings-addons-dir", current?.addons_dir_override ?? null),
-    backup_dir_override: valueOrCurrent("#settings-backup-dir", current?.backup_dir_override ?? null),
-    download_dir: valueOrCurrent("#settings-download-dir", current?.download_dir ?? null),
+    addons_dir_override: valueOrCurrent(`#${TEXT_INPUT_IDS.settingsAddonsPath}`, current?.addons_dir_override ?? null),
+    backup_dir_override: valueOrCurrent(`#${TEXT_INPUT_IDS.settingsBackupFolder}`, current?.backup_dir_override ?? null),
+    download_dir: valueOrCurrent(`#${TEXT_INPUT_IDS.settingsDownloadFolder}`, current?.download_dir ?? null),
     keep_downloads_default: checkedOrCurrent("#settings-keep-downloads", current?.keep_downloads_default ?? false),
     include_unknown_updates_default: checkedOrCurrent("#settings-include-unknown", current?.include_unknown_updates_default ?? false),
     hide_libraries_in_search: checkedOrCurrent("#settings-hide-libraries-search", current?.hide_libraries_in_search ?? false),
@@ -3834,7 +4200,7 @@ function clearHttpCache() {
   return withLoading(async () => {
     state.httpCacheStats = await invoke<HttpCacheStatsResponse>("clear_http_cache");
     state.httpCacheStatsLoaded = true;
-    state.success = "Cache cleared.";
+    setSuccess("Cache cleared.");
   }, "cache");
 }
 
@@ -3850,7 +4216,7 @@ function settingField(
       <label for="${escapeAttr(id)}">${escapeHtml(label)}</label>
       ${options.helper ? `<p class="setting-helper">${escapeHtml(options.helper)}</p>` : ""}
       <div class="${browse ? "field-with-action" : ""}">
-        <input id="${escapeAttr(id)}" value="${escapeAttr(value)}" placeholder="${escapeAttr(options.placeholder ?? "Leave blank for default")}" ${disabledAttr()} />
+        ${textInput(id, value, { placeholder: options.placeholder ?? "Leave blank for default" })}
         ${browse ? `<button class="secondary icon-button browse-button" data-browse-target="${escapeAttr(id)}" title="Browse for ${escapeAttr(label)}" ${disabledAttr()}>${icon("folder")} Browse</button>` : ""}
       </div>
     </div>
@@ -3861,7 +4227,7 @@ function settingToggle(label: string, id: string, value: boolean, helper: string
   return `
     <div class="setting-toggle-row">
       <label class="setting-toggle" for="${escapeAttr(id)}">
-        <input class="toggle-input" type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} ${disabledAttr()} />
+        <input class="toggle-input" type="checkbox" ${checkboxInputAttrs(id)} ${value ? "checked" : ""} ${disabledAttr()} />
         <span class="setting-toggle-copy">
           <span class="setting-toggle-label">${escapeHtml(label)}</span>
           <span class="setting-helper">${escapeHtml(helper)}</span>
@@ -3870,6 +4236,15 @@ function settingToggle(label: string, id: string, value: boolean, helper: string
       </label>
     </div>
   `;
+}
+
+function textInput(id: string, value: string, options: { name?: string; placeholder?: string } = {}) {
+  const name = options.name ?? id;
+  return `<input type="text" id="${escapeAttr(id)}" name="${escapeAttr(name)}" value="${escapeAttr(value)}" placeholder="${escapeAttr(options.placeholder ?? "")}" ${noAutocompleteAttrs} ${disabledAttr()} />`;
+}
+
+function checkboxInputAttrs(id: string, name = id) {
+  return `id="${escapeAttr(id)}" name="${escapeAttr(name)}" ${noAutocompleteAttrs}`;
 }
 
 function valueOrCurrent(selector: string, current: string | null) {

@@ -14,16 +14,17 @@
       {
         "label": "main",
         "title": "Scribe Addon Manager",
-        "width": 1180,
-        "height": 760,
+        "width": 1280,
+        "height": 840,
         "minWidth": 900,
-        "minHeight": 600
+        "minHeight": 600,
+        "devtools": false
       }
     ]
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
