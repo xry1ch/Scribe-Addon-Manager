@@ -261,16 +261,19 @@ function render() {
   app.innerHTML = `
     <main class="app-shell">
       <aside class="sidebar">
-        <div class="brand">
+        <div class="brand sidebar-brand">
           ${brandMark()}
           <div>
             <h1>Scribe</h1>
             <p>ESO Addon Manager</p>
           </div>
         </div>
-        <nav class="nav-list">
+        <nav class="nav-list sidebar-nav" aria-label="Primary navigation">
           ${tabButton("installed", "Installed")}
           ${tabButton("search", "Search")}
+        </nav>
+        <div class="sidebar-spacer" aria-hidden="true"></div>
+        <nav class="nav-list sidebar-bottom" aria-label="Settings navigation">
           ${tabButton("settings", "Settings")}
         </nav>
       </aside>
@@ -558,7 +561,7 @@ function renderSearch() {
           ${searchModeButton("recent", "Recent")}
         </div>
       </div>
-      <label class="field">
+      <label class="field search-query-field">
         <span>Search term</span>
         <div class="field-with-action">
           <input id="search-query" value="${escapeAttr(state.searchQuery)}" placeholder="Addon name, author, or keyword" ${disabledAttr()} />
