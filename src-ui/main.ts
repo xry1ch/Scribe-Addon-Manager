@@ -40,6 +40,7 @@ import type {
 
 type Tab = "installed" | "search" | "settings";
 type DetailsTab = "info" | "changelog" | "dependencies";
+type SettingsSection = "folders" | "downloads" | "display" | "cache";
 type InstalledFilter = "all" | "update" | "unknown" | "current";
 type InstalledSort = "name" | "updated" | "downloads" | "status";
 type SearchMode = "most_downloaded" | "recent";
@@ -75,6 +76,7 @@ interface AppState {
   warning: string | null;
   installed: InstalledAddonsResponse | null;
   searchQuery: string;
+  activeSettingsSection: SettingsSection;
   searchAppliedQuery: string;
   searchMode: SearchMode;
   searchCategoryId: string;
@@ -158,6 +160,7 @@ const state: AppState = {
   warning: null,
   installed: null,
   searchQuery: "",
+  activeSettingsSection: "folders",
   searchAppliedQuery: "",
   searchMode: "most_downloaded",
   searchCategoryId: "",
@@ -1269,70 +1272,135 @@ function renderSettings() {
       </div>
     `)}
     ${addonsMissing ? `<div class="banner error">Configured AddOns path does not exist: ${escapeHtml(settings?.addons_dir_override ?? "")}</div>` : ""}
-    <div class="banner info">Leave folders blank to let Scribe choose automatically. Folders are created only when needed.</div>
-    <section class="settings-grid">
-      <section class="panel settings-card">
-        <div class="settings-card-heading">
-          <h3>Addon folders</h3>
+    <section class="settings-layout">
+      ${renderSettingsNavigation()}
+      ${renderActiveSettingsSection(settings)}
+    </section>
+  `;
+}
+
+function renderSettingsNavigation() {
+  const sections: Array<{ id: SettingsSection; label: string; helper: string }> = [
+    { id: "folders", label: "Folders", helper: "Addon and backup locations" },
+    { id: "downloads", label: "Downloads", helper: "ZIP files and update visibility" },
+    { id: "display", label: "Display", helper: "Library visibility" },
+    { id: "cache", label: "Cache", helper: "Temporary browsing data" },
+  ];
+
+  return `
+    <nav class="settings-section-nav" aria-label="Settings sections" role="tablist">
+      ${sections.map((section) => settingsSectionButton(section)).join("")}
+    </nav>
+  `;
+}
+
+function settingsSectionButton(section: { id: SettingsSection; label: string; helper: string }) {
+  const active = state.activeSettingsSection === section.id;
+  return `
+    <button
+      type="button"
+      id="settings-section-tab-${escapeAttr(section.id)}"
+      class="settings-section-button ${active ? "active" : ""}"
+      data-settings-section="${escapeAttr(section.id)}"
+      role="tab"
+      aria-selected="${active ? "true" : "false"}"
+      aria-controls="settings-section-panel"
+      ${disabledAttr()}
+    >
+      <span>${escapeHtml(section.label)}</span>
+      <small>${escapeHtml(section.helper)}</small>
+    </button>
+  `;
+}
+
+function renderActiveSettingsSection(settings: AppSettings | null) {
+  if (state.activeSettingsSection === "downloads") return renderDownloadsSettings(settings);
+  if (state.activeSettingsSection === "display") return renderDisplaySettings(settings);
+  if (state.activeSettingsSection === "cache") return renderHttpCacheSettings();
+  return renderFolderSettings(settings);
+}
+
+function renderFolderSettings(settings: AppSettings | null) {
+  return `
+    <section class="panel settings-detail-panel" id="settings-section-panel" role="tabpanel" aria-labelledby="settings-section-tab-folders">
+      <div class="settings-detail-heading">
+        <div>
+          <h3>Folders</h3>
+          <p>Leave blank to let Scribe choose automatically.</p>
         </div>
-        <div class="settings-card-body">
-          ${settingField("AddOns folder", "settings-addons-dir", settings?.addons_dir_override ?? "", {
-            browse: true,
-            helper: "Where ESO loads your addons from.",
-            placeholder: "Auto-detect AddOns folder",
-          })}
-          ${settingField("Backup folder", "settings-backup-dir", settings?.backup_dir_override ?? "", {
-            browse: true,
-            helper: settings?.backup_dir_override ? undefined : "Choose a backup folder to enable manual backups.",
-            placeholder: "Choose backup folder",
-          })}
-          ${renderManualBackupSettings()}
+      </div>
+      <div class="settings-detail-body">
+        ${settingField("AddOns folder", "settings-addons-dir", settings?.addons_dir_override ?? "", {
+          browse: true,
+          helper: "Where ESO loads your addons from.",
+          placeholder: "Auto-detect AddOns folder",
+        })}
+        ${settingField("Backup folder", "settings-backup-dir", settings?.backup_dir_override ?? "", {
+          browse: true,
+          helper: "Where manual backups are saved.",
+          placeholder: "Choose backup folder",
+        })}
+        ${renderManualBackupSettings()}
+      </div>
+    </section>
+  `;
+}
+
+function renderDownloadsSettings(settings: AppSettings | null) {
+  return `
+    <section class="panel settings-detail-panel" id="settings-section-panel" role="tabpanel" aria-labelledby="settings-section-tab-downloads">
+      <div class="settings-detail-heading">
+        <div>
+          <h3>Downloads</h3>
+          <p>Control where update packages go and which uncertain updates Scribe shows.</p>
         </div>
-      </section>
-      <section class="panel settings-card">
-        <div class="settings-card-heading">
-          <h3>Downloads and updates</h3>
-        </div>
-        <div class="settings-card-body">
-          ${settingField("Download folder", "settings-download-dir", settings?.download_dir ?? "", {
-            browse: true,
-            helper: "Where downloaded ZIP files are saved when downloads are kept.",
-            placeholder: "Use default download folder",
-          })}
-          ${settingCheckbox(
-            "Keep downloaded ZIP files",
-            "settings-keep-downloads",
-            settings?.keep_downloads_default ?? false,
-            "Useful if you want to reinstall addons without downloading again.",
-          )}
-          ${settingCheckbox(
-            "Show uncertain updates",
-            "settings-include-unknown",
-            settings?.include_unknown_updates_default ?? false,
-            "Shows addons where Scribe cannot confidently compare versions.",
-          )}
-        </div>
-      </section>
-      <section class="panel settings-card">
-        <div class="settings-card-heading">
+      </div>
+      <div class="settings-detail-body">
+        ${settingField("Download folder", "settings-download-dir", settings?.download_dir ?? "", {
+          browse: true,
+          helper: "Where ZIP files are saved when you keep downloads.",
+          placeholder: "Use default download folder",
+        })}
+        ${settingToggle(
+          "Keep downloaded ZIP files",
+          "settings-keep-downloads",
+          settings?.keep_downloads_default ?? false,
+          "Useful if you want to reinstall addons without downloading again.",
+        )}
+        ${settingToggle(
+          "Show uncertain updates",
+          "settings-include-unknown",
+          settings?.include_unknown_updates_default ?? false,
+          "Shows addons where Scribe cannot confidently compare versions.",
+        )}
+      </div>
+    </section>
+  `;
+}
+
+function renderDisplaySettings(settings: AppSettings | null) {
+  return `
+    <section class="panel settings-detail-panel" id="settings-section-panel" role="tabpanel" aria-labelledby="settings-section-tab-display">
+      <div class="settings-detail-heading">
+        <div>
           <h3>Display</h3>
+          <p>Keep addon lists focused by hiding libraries where you do not need them.</p>
         </div>
-        <div class="settings-card-body">
-          ${settingCheckbox(
-            "Hide libraries in Search",
-            "settings-hide-libraries-search",
-            settings?.hide_libraries_in_search ?? false,
-            "Library addons will be hidden from browsing results unless they are directly searched for.",
-          )}
-          ${settingCheckbox(
-            "Hide installed libraries",
-            "settings-hide-libraries-installed",
-            settings?.hide_libraries_in_installed ?? false,
-            "Installed libraries will be hidden unless Scribe finds an update for them.",
-          )}
-        </div>
-      </section>
-      ${renderHttpCacheSettings()}
+      </div>
+      <div class="settings-detail-body">
+        ${settingToggle(
+          "Hide libraries in Search",
+          "settings-hide-libraries-search",
+          settings?.hide_libraries_in_search ?? false,
+          "Library addons will be hidden from browsing results unless they are directly searched for.",
+        )}
+        ${settingToggle(
+          "Hide installed libraries",
+          "settings-hide-libraries-installed",
+          settings?.hide_libraries_in_installed ?? false,
+          "Installed libraries will be hidden unless Scribe finds an update for them.",
+        )}
+      </div>
     </section>
   `;
 }
@@ -1371,21 +1439,23 @@ function renderManualBackupStatus() {
 function renderHttpCacheSettings() {
   const stats = state.httpCacheStats;
   return `
-    <section class="panel settings-card settings-cache-card">
-      <div class="settings-card-heading">
+    <section class="panel settings-detail-panel" id="settings-section-panel" role="tabpanel" aria-labelledby="settings-section-tab-cache">
+      <div class="settings-detail-heading">
         <div>
           <h3>Cache</h3>
           <p>Cached addon data and images make browsing faster.</p>
         </div>
-        <div class="toolbar-actions">
+        <div class="settings-detail-actions">
           <button class="danger" id="clear-http-cache" ${disabledAttr()}>${loadingButtonContent("Clear cache", "Clearing...", "cache")}</button>
         </div>
       </div>
-      <div class="cache-summary">
-        <span>Cache size</span>
-        <strong>${escapeHtml(stats?.size_display ?? (state.httpCacheStatsLoaded ? "0 B" : "Loading..."))}</strong>
+      <div class="settings-detail-body">
+        <div class="cache-summary">
+          <span>Cache size</span>
+          <strong>${escapeHtml(stats?.size_display ?? (state.httpCacheStatsLoaded ? "0 B" : "Loading..."))}</strong>
+        </div>
+        <p class="setting-helper">Clearing the cache will not remove installed addons or settings.</p>
       </div>
-      <p class="setting-helper">Clearing the cache will not remove installed addons or settings.</p>
     </section>
   `;
 }
@@ -2024,6 +2094,7 @@ function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#plan-update-all-installed")?.addEventListener("click", planUpdateAll);
   document.querySelector<HTMLButtonElement>("#open-settings")?.addEventListener("click", () => {
     state.tab = "settings";
+    state.activeSettingsSection = "folders";
     render();
   });
   document.querySelector<HTMLInputElement>("#installed-filter-input")?.addEventListener("input", (event) => {
@@ -2130,8 +2201,19 @@ function bindTabEvents() {
   document.querySelector<HTMLButtonElement>("#save-settings")?.addEventListener("click", saveSettings);
   document.querySelector<HTMLButtonElement>("#reset-settings")?.addEventListener("click", resetSettings);
   document.querySelector<HTMLButtonElement>("#clear-http-cache")?.addEventListener("click", clearHttpCache);
+  document.querySelectorAll<HTMLButtonElement>("[data-settings-section]").forEach((button) => {
+    button.addEventListener("click", () => {
+      syncSettingsDraft();
+      state.activeSettingsSection = button.dataset.settingsSection as SettingsSection;
+      render();
+    });
+  });
   document.querySelector<HTMLInputElement>("#settings-addons-dir")?.addEventListener("input", syncSettingsDraft);
-  document.querySelector<HTMLInputElement>("#settings-backup-dir")?.addEventListener("input", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-backup-dir")?.addEventListener("input", () => {
+    const hadBackupFolder = Boolean(state.settings?.backup_dir_override);
+    syncSettingsDraft();
+    if (hadBackupFolder !== Boolean(state.settings?.backup_dir_override)) render();
+  });
   document.querySelector<HTMLInputElement>("#settings-download-dir")?.addEventListener("input", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-keep-downloads")?.addEventListener("change", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-include-unknown")?.addEventListener("change", syncSettingsDraft);
@@ -2144,7 +2226,7 @@ function bindTabEvents() {
     ensureSearchLoaded();
     bindSearchScrollLoading();
   }
-  if (state.tab === "settings") {
+  if (state.tab === "settings" && state.activeSettingsSection === "cache") {
     ensureHttpCacheStatsLoaded();
   }
 }
@@ -3630,14 +3712,15 @@ function syncSettingsDraft() {
 }
 
 function readSettingsDraft(): AppSettings {
+  const current = state.settings;
   return {
-    addons_dir_override: valueOrNull("#settings-addons-dir"),
-    backup_dir_override: valueOrNull("#settings-backup-dir"),
-    download_dir: valueOrNull("#settings-download-dir"),
-    keep_downloads_default: checkedOrFalse("#settings-keep-downloads"),
-    include_unknown_updates_default: checkedOrFalse("#settings-include-unknown"),
-    hide_libraries_in_search: checkedOrFalse("#settings-hide-libraries-search"),
-    hide_libraries_in_installed: checkedOrFalse("#settings-hide-libraries-installed"),
+    addons_dir_override: valueOrCurrent("#settings-addons-dir", current?.addons_dir_override ?? null),
+    backup_dir_override: valueOrCurrent("#settings-backup-dir", current?.backup_dir_override ?? null),
+    download_dir: valueOrCurrent("#settings-download-dir", current?.download_dir ?? null),
+    keep_downloads_default: checkedOrCurrent("#settings-keep-downloads", current?.keep_downloads_default ?? false),
+    include_unknown_updates_default: checkedOrCurrent("#settings-include-unknown", current?.include_unknown_updates_default ?? false),
+    hide_libraries_in_search: checkedOrCurrent("#settings-hide-libraries-search", current?.hide_libraries_in_search ?? false),
+    hide_libraries_in_installed: checkedOrCurrent("#settings-hide-libraries-installed", current?.hide_libraries_in_installed ?? false),
   };
 }
 
@@ -3773,24 +3856,31 @@ function settingField(
   `;
 }
 
-function settingCheckbox(label: string, id: string, value: boolean, helper: string) {
+function settingToggle(label: string, id: string, value: boolean, helper: string) {
   return `
-    <div class="setting-check">
-      <label class="checkbox-line" for="${escapeAttr(id)}">
-        <input type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} ${disabledAttr()} />
-        <span>${escapeHtml(label)}</span>
+    <div class="setting-toggle-row">
+      <label class="setting-toggle" for="${escapeAttr(id)}">
+        <input class="toggle-input" type="checkbox" id="${escapeAttr(id)}" ${value ? "checked" : ""} ${disabledAttr()} />
+        <span class="setting-toggle-copy">
+          <span class="setting-toggle-label">${escapeHtml(label)}</span>
+          <span class="setting-helper">${escapeHtml(helper)}</span>
+        </span>
+        <span class="toggle-switch" aria-hidden="true"></span>
       </label>
-      <p class="setting-helper">${escapeHtml(helper)}</p>
     </div>
   `;
 }
 
-function valueOrNull(selector: string) {
-  return document.querySelector<HTMLInputElement>(selector)?.value.trim() || null;
+function valueOrCurrent(selector: string, current: string | null) {
+  const input = document.querySelector<HTMLInputElement>(selector);
+  if (!input) return current;
+  return input.value.trim() || null;
 }
 
-function checkedOrFalse(selector: string) {
-  return Boolean(document.querySelector<HTMLInputElement>(selector)?.checked);
+function checkedOrCurrent(selector: string, current: boolean) {
+  const input = document.querySelector<HTMLInputElement>(selector);
+  if (!input) return current;
+  return input.checked;
 }
 
 function escapeHtml(value: string) {
