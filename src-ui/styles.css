@@ -1617,6 +1617,173 @@ input::placeholder {
   white-space: nowrap;
 }
 
+.dependency-details {
+  display: grid;
+  gap: 16px;
+}
+
+.dependency-status-section {
+  display: grid;
+  gap: 10px;
+}
+
+.dependency-status-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dependency-status-heading h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.dependency-status-heading span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.dependency-card-list {
+  display: grid;
+  gap: 8px;
+}
+
+.dependency-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 11px;
+  background: rgba(15, 23, 42, 0.64);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.dependency-card.is-installed {
+  border-color: rgba(34, 197, 94, 0.38);
+}
+
+.dependency-card.is-required-missing {
+  background: rgba(127, 29, 29, 0.14);
+  border-color: rgba(248, 113, 113, 0.48);
+}
+
+.dependency-card.is-optional-missing {
+  background: rgba(120, 53, 15, 0.1);
+  border-color: rgba(245, 158, 11, 0.32);
+}
+
+.dependency-card.is-ambiguous {
+  border-color: rgba(245, 158, 11, 0.42);
+}
+
+.dependency-card.is-unknown {
+  border-color: rgba(148, 163, 184, 0.24);
+}
+
+.dependency-card.is-planned {
+  border-color: rgba(56, 189, 248, 0.42);
+}
+
+.dependency-status-icon {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  color: var(--muted-strong);
+  background: rgba(2, 6, 23, 0.28);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.dependency-card.is-installed .dependency-status-icon {
+  color: #99f6e4;
+  background: rgba(45, 212, 191, 0.12);
+  border-color: rgba(45, 212, 191, 0.38);
+}
+
+.dependency-card.is-required-missing .dependency-status-icon {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.38);
+}
+
+.dependency-card.is-optional-missing .dependency-status-icon,
+.dependency-card.is-ambiguous .dependency-status-icon {
+  color: #fde68a;
+  background: rgba(250, 204, 21, 0.1);
+  border-color: rgba(250, 204, 21, 0.3);
+}
+
+.dependency-status-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.dependency-card-main {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.dependency-card-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 10px;
+  min-width: 0;
+}
+
+.dependency-card-title strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-strong);
+  font-size: 13px;
+}
+
+.dependency-card-title span {
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.dependency-lines {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dependency-line {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dependency-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  justify-content: flex-end;
+}
+
+.dependency-card-actions button {
+  white-space: nowrap;
+}
+
 .dependency-section {
   display: grid;
   gap: 10px;
@@ -1949,6 +2116,7 @@ input::placeholder {
   .addon-card,
   .meta-grid,
   .summary,
+  .dependency-card,
   .dependency-row,
   .settings-grid {
     grid-template-columns: 1fr;
@@ -1960,6 +2128,14 @@ input::placeholder {
 
   .card-actions {
     justify-items: stretch;
+  }
+
+  .dependency-card-actions {
+    justify-content: stretch;
+  }
+
+  .dependency-card-actions button {
+    width: 100%;
   }
 
   .path-display {

@@ -106,6 +106,7 @@ struct AddonSummaryDto {
     category_name: Option<String>,
     downloads: Option<i64>,
     monthly_downloads: Option<i64>,
+    is_library: bool,
     image_urls: Vec<String>,
     thumbnail_urls: Vec<String>,
     installed: bool,
@@ -141,6 +142,7 @@ struct AddonDetailsDto {
     category_name: Option<String>,
     downloads: Option<i64>,
     monthly_downloads: Option<i64>,
+    is_library: bool,
     image_urls: Vec<String>,
     thumbnail_urls: Vec<String>,
 }
@@ -180,6 +182,7 @@ struct RemoteCandidateDto {
     category_name: Option<String>,
     downloads: Option<i64>,
     monthly_downloads: Option<i64>,
+    is_library: bool,
     image_urls: Vec<String>,
     thumbnail_urls: Vec<String>,
     tier: u8,
@@ -392,6 +395,29 @@ struct DependencyPlanEntryDto {
 }
 
 #[derive(Debug, Serialize)]
+struct InstalledAddonDependenciesResponse {
+    required_dependencies: Vec<InstalledDependencyStatusDto>,
+    optional_dependencies: Vec<InstalledDependencyStatusDto>,
+    warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledDependencyStatusDto {
+    name: String,
+    raw: String,
+    constraint: Option<String>,
+    required: bool,
+    installed: bool,
+    installed_folder: Option<String>,
+    installed_title: Option<String>,
+    installed_version: Option<String>,
+    remote_uid: Option<String>,
+    remote_name: Option<String>,
+    remote_version: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DependencyInstallItemDto {
     role: String,
     name: String,
@@ -486,6 +512,8 @@ struct AppSettings {
     download_dir: Option<String>,
     keep_downloads_default: bool,
     include_unknown_updates_default: bool,
+    hide_libraries_in_search: bool,
+    hide_libraries_in_installed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -539,6 +567,8 @@ struct AppSettingsInput {
     download_dir: Option<String>,
     keep_downloads_default: Option<bool>,
     include_unknown_updates_default: Option<bool>,
+    hide_libraries_in_search: Option<bool>,
+    hide_libraries_in_installed: Option<bool>,
 }
 
 #[tauri::command]
@@ -555,6 +585,43 @@ async fn get_installed_addons(path: Option<String>) -> Result<InstalledAddonsRes
         candidates,
         addons: addons.iter().map(local_addon_dto).collect(),
     })
+}
+
+#[tauri::command]
+async fn get_installed_addon_dependencies(
+    folder_name: String,
+    path: Option<String>,
+) -> Result<InstalledAddonDependenciesResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let local_addon = local_addons
+        .iter()
+        .find(|addon| addon.folder_name.eq_ignore_ascii_case(folder_name.as_str()))
+        .ok_or_else(|| format!("installed addon folder not found: {folder_name}"))?;
+    let installed_metadata = load_installed_metadata(&addons_dir);
+    let installed_remotes = installed_remote_addons(&installed_metadata);
+    let (remote_addons, remote_warning) = load_dependency_remote_addons().await;
+    let mut warnings = Vec::new();
+
+    if !local_addon.valid_manifest {
+        warnings.push("No valid addon manifest was found for this folder.".to_owned());
+    }
+    if let Some(warning) = remote_warning {
+        warnings.push(warning);
+    }
+
+    let report = dependencies::resolve_manifest_dependencies(
+        &local_addon.depends_on,
+        &local_addon.optional_depends_on,
+        &local_addons,
+        remote_addons.as_deref(),
+        &installed_remotes,
+    );
+
+    Ok(installed_addon_dependencies_response(
+        &report,
+        join_warning_messages(warnings),
+    ))
 }
 
 #[tauri::command]
@@ -737,6 +804,7 @@ async fn browse_remote_addons(
     limit: Option<usize>,
     path: Option<String>,
     refresh: Option<bool>,
+    hide_libraries: Option<bool>,
 ) -> Result<BrowseRemoteAddonsResponse, String> {
     let mode = BrowseMode::from_str(&mode).map_err(to_string_error)?;
     let limit = limit.unwrap_or(25).clamp(1, 100);
@@ -782,6 +850,7 @@ async fn browse_remote_addons(
         category_id.as_deref(),
         query.as_str(),
         result_limit,
+        hide_libraries.unwrap_or(false),
     );
 
     Ok(BrowseRemoteAddonsResponse {
@@ -1284,6 +1353,7 @@ fn main() {
             path_exists,
             import_existing_addons_as_current,
             get_installed_addons,
+            get_installed_addon_dependencies,
             remove_installed_addon,
             clear_saved_variables,
             create_manual_backup,
@@ -1358,6 +1428,8 @@ fn app_settings_from_input(settings: AppSettingsInput) -> AppSettings {
         download_dir: normalize_optional_path(settings.download_dir),
         keep_downloads_default: settings.keep_downloads_default.unwrap_or(false),
         include_unknown_updates_default: settings.include_unknown_updates_default.unwrap_or(false),
+        hide_libraries_in_search: settings.hide_libraries_in_search.unwrap_or(false),
+        hide_libraries_in_installed: settings.hide_libraries_in_installed.unwrap_or(false),
     }
 }
 
@@ -1425,6 +1497,44 @@ fn local_addon_dto(addon: &LocalAddon) -> LocalAddonDto {
     }
 }
 
+async fn load_dependency_remote_addons() -> (Option<Vec<AddonSummary>>, Option<String>) {
+    let client = match ApiClient::new() {
+        Ok(client) => client,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("Remote dependency lookup is unavailable. {error}")),
+            );
+        }
+    };
+
+    match client.eso_file_list().await {
+        Ok(addons) => {
+            let warning = client.cache_warning_message();
+            (Some(addons), warning)
+        }
+        Err(error) => (
+            None,
+            Some(format!("Remote dependency lookup is unavailable. {error}")),
+        ),
+    }
+}
+
+fn join_warning_messages(warnings: Vec<String>) -> Option<String> {
+    let warning = warnings
+        .into_iter()
+        .map(|warning| warning.trim().to_owned())
+        .filter(|warning| !warning.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if warning.is_empty() {
+        None
+    } else {
+        Some(warning)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowseMode {
     MostDownloaded,
@@ -1458,13 +1568,23 @@ fn browse_remote_results(
     category_id: Option<&str>,
     query: &str,
     limit: Option<usize>,
+    hide_libraries: bool,
 ) -> Vec<AddonSummaryDto> {
+    let query = query.trim();
     let needle = query.trim().to_lowercase();
+    let library_category_selected = selected_category_is_libraries(category_id, categories);
     let mut results = addons
         .iter()
         .filter(|addon| {
             addon_matches_category(addon, category_id, categories)
                 && (needle.is_empty() || addon.searchable_text().contains(&needle))
+                && addon_visible_after_library_filter(
+                    addon,
+                    local_state,
+                    hide_libraries,
+                    library_category_selected,
+                    query,
+                )
         })
         .collect::<Vec<_>>();
 
@@ -1479,6 +1599,57 @@ fn browse_remote_results(
         .into_iter()
         .map(|addon| addon_summary_dto_with_local_state(addon, addons, local_state))
         .collect()
+}
+
+fn addon_visible_after_library_filter(
+    addon: &AddonSummary,
+    local_state: Option<&RemoteLocalState>,
+    hide_libraries: bool,
+    library_category_selected: bool,
+    query: &str,
+) -> bool {
+    if !hide_libraries || library_category_selected {
+        return true;
+    }
+
+    if !browse_addon_is_library(addon, local_state) {
+        return true;
+    }
+
+    exact_addon_query_matches(addon, query)
+}
+
+fn browse_addon_is_library(addon: &AddonSummary, local_state: Option<&RemoteLocalState>) -> bool {
+    remote_summary_is_library(addon)
+        || local_state
+            .is_some_and(|local_state| local_manifest_marks_remote_library(addon, local_state))
+}
+
+fn local_manifest_marks_remote_library(
+    addon: &AddonSummary,
+    local_state: &RemoteLocalState,
+) -> bool {
+    let Some(uid) = addon.uid.as_deref() else {
+        return false;
+    };
+
+    local_state.matches.iter().any(|result| {
+        result.local.is_library == Some(true)
+            && result
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.uid.as_deref())
+                == Some(uid)
+    }) || local_state
+        .metadata
+        .addons
+        .iter()
+        .any(|(folder_name, metadata)| {
+            metadata.remote_uid.as_deref() == Some(uid)
+                && local_state.local_addons.iter().any(|local| {
+                    local.folder_name == *folder_name && local.is_library == Some(true)
+                })
+        })
 }
 
 fn compare_remote_addons(
@@ -1544,6 +1715,116 @@ fn addon_matches_category(
         .is_some_and(|name| normalize_category_name(name) == selected_name)
 }
 
+fn selected_category_is_libraries(
+    category_id: Option<&str>,
+    categories: &[RemoteCategoryDto],
+) -> bool {
+    let Some(category_id) = category_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+
+    if category_is_libraries(Some(category_id), None) {
+        return true;
+    }
+
+    categories
+        .iter()
+        .find(|category| category.id == category_id)
+        .is_some_and(|category| category_is_libraries(Some(&category.id), Some(&category.name)))
+}
+
+fn remote_summary_is_library(addon: &AddonSummary) -> bool {
+    let category_id = addon.category_id();
+    let category_name = addon.category_name();
+    if category_is_libraries(category_id.as_deref(), category_name.as_deref()) {
+        return true;
+    }
+
+    if category_id.is_some() || category_name.is_some() {
+        return false;
+    }
+
+    weak_library_name_signal(addon.name.as_deref(), &addon.directories)
+}
+
+fn remote_candidate_is_library(candidate: &RemoteCandidate) -> bool {
+    if category_is_libraries(
+        candidate.category_id.as_deref(),
+        candidate.category_name.as_deref(),
+    ) {
+        return true;
+    }
+
+    if candidate.category_id.is_some() || candidate.category_name.is_some() {
+        return false;
+    }
+
+    weak_library_name_signal(candidate.name.as_deref(), &candidate.directories)
+}
+
+fn remote_details_is_library(details: &AddonDetails) -> bool {
+    let category_id = details.category_id();
+    let category_name = details.category_name();
+    if category_is_libraries(category_id.as_deref(), category_name.as_deref()) {
+        return true;
+    }
+
+    if category_id.is_some() || category_name.is_some() {
+        return false;
+    }
+
+    details.name.as_deref().is_some_and(starts_with_lib)
+}
+
+fn category_is_libraries(category_id: Option<&str>, category_name: Option<&str>) -> bool {
+    category_id.is_some_and(|id| id.trim() == "53")
+        || category_name.is_some_and(|name| normalize_category_name(name).contains("librar"))
+}
+
+fn weak_library_name_signal(name: Option<&str>, directories: &[String]) -> bool {
+    name.is_some_and(starts_with_lib)
+        || directories
+            .iter()
+            .any(|directory| starts_with_lib(directory))
+}
+
+fn starts_with_lib(value: &str) -> bool {
+    value.trim_start().to_ascii_lowercase().starts_with("lib")
+}
+
+fn exact_addon_query_matches(addon: &AddonSummary, query: &str) -> bool {
+    let query = normalize_addon_lookup_name(query);
+    if query.is_empty() {
+        return false;
+    }
+
+    addon
+        .name
+        .as_deref()
+        .is_some_and(|name| normalize_addon_lookup_name(name) == query)
+        || addon
+            .directories
+            .iter()
+            .any(|directory| normalize_addon_lookup_name(directory) == query)
+}
+
+fn normalize_addon_lookup_name(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn normalize_optional_filter(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_owned())
@@ -1607,6 +1888,7 @@ fn addon_summary_dto(addon: &AddonSummary) -> AddonSummaryDto {
         category_name: addon.category_name(),
         downloads: addon.downloads(),
         monthly_downloads: addon.monthly_downloads(),
+        is_library: remote_summary_is_library(addon),
         image_urls: addon.image_urls(),
         thumbnail_urls: addon.thumbnail_urls(),
         installed: false,
@@ -1629,6 +1911,7 @@ fn addon_summary_dto_with_local_state(
     };
     if let Some(result) = remote_addon_match(addon_id, remote_addons, local_state) {
         dto.installed = true;
+        dto.is_library = dto.is_library || result.local.is_library == Some(true);
         dto.installed_local = Some(local_addon_dto(&result.local));
         dto.installed_match = Some(match_result_dto(&result, &local_state.metadata));
     }
@@ -1762,6 +2045,7 @@ fn addon_details_dto(details: &AddonDetails) -> AddonDetailsDto {
         category_name: details.category_name(),
         downloads: details.downloads(),
         monthly_downloads: details.monthly_downloads(),
+        is_library: remote_details_is_library(details),
         image_urls: details.image_urls(),
         thumbnail_urls: details.thumbnail_urls(),
     }
@@ -1800,6 +2084,7 @@ fn remote_candidate_dto(candidate: &RemoteCandidate) -> RemoteCandidateDto {
         category_name: candidate.category_name.clone(),
         downloads: candidate.downloads,
         monthly_downloads: candidate.monthly_downloads,
+        is_library: remote_candidate_is_library(candidate),
         image_urls: candidate.image_urls.clone(),
         thumbnail_urls: candidate.thumbnail_urls.clone(),
         tier: candidate.tier,
@@ -2197,6 +2482,44 @@ fn dependency_plan_entry_dto(entry: &dependencies::DependencyPlanEntry) -> Depen
         remote_name: entry.remote_name.clone(),
         installed_folder: entry.installed_folder.clone(),
         bundled_folder: entry.bundled_folder.clone(),
+    }
+}
+
+fn installed_addon_dependencies_response(
+    report: &dependencies::DependencyStatusReport,
+    warning: Option<String>,
+) -> InstalledAddonDependenciesResponse {
+    InstalledAddonDependenciesResponse {
+        required_dependencies: report
+            .required_dependencies
+            .iter()
+            .map(installed_dependency_status_dto)
+            .collect(),
+        optional_dependencies: report
+            .optional_dependencies
+            .iter()
+            .map(installed_dependency_status_dto)
+            .collect(),
+        warning,
+    }
+}
+
+fn installed_dependency_status_dto(
+    dependency: &dependencies::DependencyStatusEntry,
+) -> InstalledDependencyStatusDto {
+    InstalledDependencyStatusDto {
+        name: dependency.name.clone(),
+        raw: dependency.raw.clone(),
+        constraint: dependency.constraint.clone(),
+        required: dependency.required,
+        installed: dependency.installed,
+        installed_folder: dependency.installed_folder.clone(),
+        installed_title: dependency.installed_title.clone(),
+        installed_version: dependency.installed_version.clone(),
+        remote_uid: dependency.remote_uid.clone(),
+        remote_name: dependency.remote_name.clone(),
+        remote_version: dependency.remote_version.clone(),
+        status: dependency.status.as_str().to_owned(),
     }
 }
 
@@ -3014,12 +3337,37 @@ mod tests {
             download_dir: Some("D:\\ESO\\Downloads".to_owned()),
             keep_downloads_default: true,
             include_unknown_updates_default: true,
+            hide_libraries_in_search: true,
+            hide_libraries_in_installed: true,
         };
 
         save_app_settings_to_path(&path, &settings).unwrap();
         let loaded = load_app_settings_from_path(&path).unwrap();
 
         assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn app_settings_loads_missing_library_visibility_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = app_settings_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{
+  "addons_dir_override": "D:\\ESO\\AddOns",
+  "keep_downloads_default": true,
+  "include_unknown_updates_default": true
+}"#,
+        )
+        .unwrap();
+
+        let settings = load_app_settings_from_path(&path).unwrap();
+
+        assert!(!settings.hide_libraries_in_search);
+        assert!(!settings.hide_libraries_in_installed);
+        assert!(settings.keep_downloads_default);
+        assert!(settings.include_unknown_updates_default);
     }
 
     #[test]
@@ -3032,6 +3380,8 @@ mod tests {
             download_dir: Some("D:\\ESO\\Downloads".to_owned()),
             keep_downloads_default: true,
             include_unknown_updates_default: true,
+            hide_libraries_in_search: true,
+            hide_libraries_in_installed: true,
         };
         save_app_settings_to_path(&path, &settings).unwrap();
 
@@ -3052,6 +3402,8 @@ mod tests {
             download_dir: Some("\t".to_owned()),
             keep_downloads_default: None,
             include_unknown_updates_default: None,
+            hide_libraries_in_search: None,
+            hide_libraries_in_installed: None,
         });
 
         save_app_settings_to_path(&path, &settings).unwrap();
@@ -3071,6 +3423,8 @@ mod tests {
             download_dir: None,
             keep_downloads_default: true,
             include_unknown_updates_default: true,
+            hide_libraries_in_search: false,
+            hide_libraries_in_installed: false,
         };
 
         save_app_settings_to_path(&path, &settings).unwrap();
@@ -3292,6 +3646,7 @@ mod tests {
             None,
             "",
             Some(2),
+            false,
         );
 
         assert_eq!(results.len(), 2);
@@ -3339,6 +3694,7 @@ mod tests {
             None,
             "combat",
             Some(25),
+            false,
         );
 
         assert_eq!(results.len(), 2);
@@ -3378,8 +3734,16 @@ mod tests {
             ),
         ];
 
-        let results =
-            browse_remote_results(&addons, &[], None, BrowseMode::Recent, None, "combat", None);
+        let results = browse_remote_results(
+            &addons,
+            &[],
+            None,
+            BrowseMode::Recent,
+            None,
+            "combat",
+            None,
+            false,
+        );
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].uid.as_deref(), Some("2"));
@@ -3408,11 +3772,100 @@ mod tests {
             Some("17"),
             "",
             Some(25),
+            false,
         );
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].uid.as_deref(), Some("2"));
         assert_eq!(results[1].uid.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn browse_library_filter_hides_libraries_before_limit() {
+        let addons = vec![
+            test_addon_summary("1", "LibAddonMenu-2.0", "100", 100, "53", "Libraries"),
+            test_addon_summary(
+                "2",
+                "Inventory Helper",
+                "10",
+                90,
+                "20",
+                "Bags, Bank, Inventory",
+            ),
+        ];
+
+        let results = browse_remote_results(
+            &addons,
+            &[],
+            None,
+            BrowseMode::MostDownloaded,
+            None,
+            "",
+            Some(1),
+            true,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uid.as_deref(), Some("2"));
+        assert!(!results[0].is_library);
+    }
+
+    #[test]
+    fn browse_library_filter_shows_selected_libraries_category() {
+        let categories = vec![RemoteCategoryDto {
+            id: "53".to_owned(),
+            name: "Libraries".to_owned(),
+            parent_id: None,
+        }];
+        let addons = vec![
+            test_addon_summary("1", "LibAddonMenu-2.0", "100", 100, "53", "Libraries"),
+            test_addon_summary(
+                "2",
+                "Inventory Helper",
+                "10",
+                90,
+                "20",
+                "Bags, Bank, Inventory",
+            ),
+        ];
+
+        let results = browse_remote_results(
+            &addons,
+            &categories,
+            None,
+            BrowseMode::MostDownloaded,
+            Some("53"),
+            "",
+            Some(25),
+            true,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uid.as_deref(), Some("1"));
+        assert!(results[0].is_library);
+    }
+
+    #[test]
+    fn browse_library_filter_shows_exact_library_query() {
+        let addons = vec![
+            test_addon_summary("1", "LibAddonMenu-2.0", "100", 100, "53", "Libraries"),
+            test_addon_summary("2", "LibDialog", "50", 90, "53", "Libraries"),
+        ];
+
+        let results = browse_remote_results(
+            &addons,
+            &[],
+            None,
+            BrowseMode::MostDownloaded,
+            None,
+            "LibAddonMenu-2.0",
+            None,
+            true,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].uid.as_deref(), Some("1"));
+        assert!(results[0].is_library);
     }
 
     #[test]

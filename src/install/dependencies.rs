@@ -9,6 +9,7 @@ pub struct ManifestDependency {
     pub name: String,
     pub constraint: Option<String>,
     pub raw: String,
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +113,7 @@ impl DependencyPlan {
 struct DependencyRemoteCandidate {
     uid: String,
     name: Option<String>,
+    version: Option<String>,
     library_category: bool,
 }
 
@@ -122,7 +124,60 @@ enum DependencyResolution {
     Ambiguous,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyAvailability {
+    Installed,
+    Missing,
+    Unknown,
+    Ambiguous,
+}
+
+impl DependencyAvailability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Missing => "missing",
+            Self::Unknown => "unknown",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyStatusEntry {
+    pub name: String,
+    pub raw: String,
+    pub constraint: Option<String>,
+    pub required: bool,
+    pub installed: bool,
+    pub installed_folder: Option<String>,
+    pub installed_title: Option<String>,
+    pub installed_version: Option<String>,
+    pub remote_uid: Option<String>,
+    pub remote_name: Option<String>,
+    pub remote_version: Option<String>,
+    pub status: DependencyAvailability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyStatusReport {
+    pub required_dependencies: Vec<DependencyStatusEntry>,
+    pub optional_dependencies: Vec<DependencyStatusEntry>,
+}
+
 pub fn parse_dependency_values(value: &str) -> Vec<ManifestDependency> {
+    parse_dependency_values_with_required(value, true)
+}
+
+pub fn parse_required_dependency_values(value: &str) -> Vec<ManifestDependency> {
+    parse_dependency_values_with_required(value, true)
+}
+
+pub fn parse_optional_dependency_values(value: &str) -> Vec<ManifestDependency> {
+    parse_dependency_values_with_required(value, false)
+}
+
+fn parse_dependency_values_with_required(value: &str, required: bool) -> Vec<ManifestDependency> {
     let tokens = value
         .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
         .map(str::trim)
@@ -160,12 +215,56 @@ pub fn parse_dependency_values(value: &str) -> Vec<ManifestDependency> {
                 name,
                 constraint,
                 raw,
+                required,
             });
         }
         index += consumed;
     }
 
     dependencies
+}
+
+pub fn resolve_manifest_dependencies(
+    required_values: &[String],
+    optional_values: &[String],
+    installed_addons: &[LocalAddon],
+    remote_addons: Option<&[AddonSummary]>,
+    installed_remotes: &[InstalledRemoteAddon],
+) -> DependencyStatusReport {
+    let required_dependencies = collect_dependencies(required_values.iter(), true);
+    let required_names = required_dependencies
+        .iter()
+        .map(|dependency| normalize_key(&dependency.name))
+        .collect::<BTreeSet<_>>();
+    let optional_dependencies = collect_dependencies(optional_values.iter(), false)
+        .into_iter()
+        .filter(|dependency| !required_names.contains(&normalize_key(&dependency.name)))
+        .collect::<Vec<_>>();
+
+    DependencyStatusReport {
+        required_dependencies: required_dependencies
+            .into_iter()
+            .map(|dependency| {
+                resolve_manifest_dependency_status(
+                    dependency,
+                    installed_addons,
+                    remote_addons,
+                    installed_remotes,
+                )
+            })
+            .collect(),
+        optional_dependencies: optional_dependencies
+            .into_iter()
+            .map(|dependency| {
+                resolve_manifest_dependency_status(
+                    dependency,
+                    installed_addons,
+                    remote_addons,
+                    installed_remotes,
+                )
+            })
+            .collect(),
+    }
 }
 
 pub fn build_dependency_plan(
@@ -181,6 +280,7 @@ pub fn build_dependency_plan(
             .iter()
             .filter(|addon| addon.valid_manifest)
             .flat_map(|addon| addon.depends_on.iter()),
+        true,
     );
     let required_names = required
         .iter()
@@ -192,6 +292,7 @@ pub fn build_dependency_plan(
             .iter()
             .filter(|addon| addon.valid_manifest)
             .flat_map(|addon| addon.optional_depends_on.iter()),
+        false,
     )
     .into_iter()
     .filter(|dependency| !required_names.contains(&normalize_key(&dependency.name)))
@@ -392,12 +493,13 @@ fn entry(
 
 fn collect_dependencies<'a>(
     raw_values: impl Iterator<Item = &'a String>,
+    required: bool,
 ) -> Vec<ManifestDependency> {
     let mut seen = BTreeSet::new();
     let mut dependencies = Vec::new();
 
     for raw in raw_values {
-        for dependency in parse_dependency_values(raw) {
+        for dependency in parse_dependency_values_with_required(raw, required) {
             if seen.insert(normalize_key(&dependency.name)) {
                 dependencies.push(dependency);
             }
@@ -407,7 +509,101 @@ fn collect_dependencies<'a>(
     dependencies
 }
 
+fn resolve_manifest_dependency_status(
+    dependency: ManifestDependency,
+    installed_addons: &[LocalAddon],
+    remote_addons: Option<&[AddonSummary]>,
+    installed_remotes: &[InstalledRemoteAddon],
+) -> DependencyStatusEntry {
+    if let Some(local) = find_matching_local_addon_details(&dependency.name, installed_addons) {
+        let remote = remote_for_installed_addon(local, remote_addons, installed_remotes);
+        return dependency_status_entry(
+            dependency,
+            DependencyAvailability::Installed,
+            Some(local),
+            remote,
+        );
+    }
+
+    let Some(remote_addons) = remote_addons else {
+        return dependency_status_entry(dependency, DependencyAvailability::Unknown, None, None);
+    };
+
+    match resolve_dependency_exact(&dependency.name, remote_addons)
+        .unwrap_or(DependencyResolution::Unresolved)
+    {
+        DependencyResolution::Resolved(remote) => {
+            if let Some(local) =
+                find_installed_remote_addon(&remote.uid, installed_remotes, installed_addons)
+            {
+                dependency_status_entry(
+                    dependency,
+                    DependencyAvailability::Installed,
+                    Some(local),
+                    Some(remote),
+                )
+            } else {
+                dependency_status_entry(
+                    dependency,
+                    DependencyAvailability::Missing,
+                    None,
+                    Some(remote),
+                )
+            }
+        }
+        DependencyResolution::Ambiguous => {
+            dependency_status_entry(dependency, DependencyAvailability::Ambiguous, None, None)
+        }
+        DependencyResolution::Unresolved => {
+            dependency_status_entry(dependency, DependencyAvailability::Missing, None, None)
+        }
+    }
+}
+
+fn dependency_status_entry(
+    dependency: ManifestDependency,
+    status: DependencyAvailability,
+    installed: Option<&LocalAddon>,
+    remote: Option<DependencyRemoteCandidate>,
+) -> DependencyStatusEntry {
+    DependencyStatusEntry {
+        name: dependency.name,
+        raw: dependency.raw,
+        constraint: dependency.constraint,
+        required: dependency.required,
+        installed: status == DependencyAvailability::Installed,
+        installed_folder: installed.map(|addon| addon.folder_name.clone()),
+        installed_title: installed.and_then(|addon| addon.title.clone()),
+        installed_version: installed.and_then(local_addon_display_version),
+        remote_uid: remote.as_ref().map(|remote| remote.uid.clone()),
+        remote_name: remote.as_ref().and_then(|remote| remote.name.clone()),
+        remote_version: remote.and_then(|remote| remote.version),
+        status,
+    }
+}
+
 fn resolve_dependency(name: &str, remote_addons: &[AddonSummary]) -> DependencyResolution {
+    resolve_dependency_exact(name, remote_addons)
+        .or_else(|| {
+            let normalized = normalize_identity(name);
+            resolve_by(remote_addons, |addon| {
+                addon
+                    .name
+                    .as_deref()
+                    .is_some_and(|remote_name| normalize_identity(remote_name) == normalized)
+                    || addon
+                        .directories
+                        .iter()
+                        .any(|directory| normalize_identity(directory) == normalized)
+            })
+        })
+        .unwrap_or(DependencyResolution::Unresolved)
+}
+
+fn resolve_dependency_exact(
+    name: &str,
+    remote_addons: &[AddonSummary],
+) -> Option<DependencyResolution> {
     resolve_by(remote_addons, |addon| exact_ci(addon.name.as_deref(), name))
         .or_else(|| {
             resolve_by(remote_addons, |addon| {
@@ -425,20 +621,6 @@ fn resolve_dependency(name: &str, remote_addons: &[AddonSummary]) -> DependencyR
                     .any(|directory| exact_ci(Some(directory.as_str()), name))
             })
         })
-        .or_else(|| {
-            let normalized = normalize_identity(name);
-            resolve_by(remote_addons, |addon| {
-                addon
-                    .name
-                    .as_deref()
-                    .is_some_and(|remote_name| normalize_identity(remote_name) == normalized)
-                    || addon
-                        .directories
-                        .iter()
-                        .any(|directory| normalize_identity(directory) == normalized)
-            })
-        })
-        .unwrap_or(DependencyResolution::Unresolved)
 }
 
 fn resolve_by(
@@ -458,6 +640,7 @@ fn remote_candidate(addon: &AddonSummary) -> Option<DependencyRemoteCandidate> {
     Some(DependencyRemoteCandidate {
         uid: addon.uid.clone()?,
         name: addon.name.clone(),
+        version: addon.version.clone(),
         library_category: addon
             .category_name()
             .is_some_and(|name| name.to_lowercase().contains("librar")),
@@ -493,16 +676,20 @@ fn choose_candidate(candidates: Vec<DependencyRemoteCandidate>) -> Option<Depend
 }
 
 fn find_matching_local_addon(name: &str, addons: &[LocalAddon]) -> Option<String> {
-    addons
-        .iter()
-        .find(|addon| {
-            exact_ci(Some(addon.folder_name.as_str()), name)
-                || addon
-                    .title
-                    .as_deref()
-                    .is_some_and(|title| exact_ci(Some(title), name))
-        })
-        .map(|addon| addon.folder_name.clone())
+    find_matching_local_addon_details(name, addons).map(|addon| addon.folder_name.clone())
+}
+
+fn find_matching_local_addon_details<'a>(
+    name: &str,
+    addons: &'a [LocalAddon],
+) -> Option<&'a LocalAddon> {
+    addons.iter().find(|addon| {
+        exact_ci(Some(addon.folder_name.as_str()), name)
+            || addon
+                .title
+                .as_deref()
+                .is_some_and(|title| exact_ci(Some(title), name))
+    })
 }
 
 fn find_installed_remote(uid: &str, installed_remotes: &[InstalledRemoteAddon]) -> Option<String> {
@@ -510,6 +697,49 @@ fn find_installed_remote(uid: &str, installed_remotes: &[InstalledRemoteAddon]) 
         .iter()
         .find(|installed| installed.remote_uid == uid)
         .map(|installed| installed.folder_name.clone())
+}
+
+fn find_installed_remote_addon<'a>(
+    uid: &str,
+    installed_remotes: &[InstalledRemoteAddon],
+    installed_addons: &'a [LocalAddon],
+) -> Option<&'a LocalAddon> {
+    let installed = installed_remotes
+        .iter()
+        .find(|installed| installed.remote_uid == uid)?;
+    installed_addons.iter().find(|addon| {
+        addon
+            .folder_name
+            .eq_ignore_ascii_case(installed.folder_name.as_str())
+    })
+}
+
+fn remote_for_installed_addon(
+    addon: &LocalAddon,
+    remote_addons: Option<&[AddonSummary]>,
+    installed_remotes: &[InstalledRemoteAddon],
+) -> Option<DependencyRemoteCandidate> {
+    let remote_uid = installed_remotes
+        .iter()
+        .find(|installed| {
+            installed
+                .folder_name
+                .eq_ignore_ascii_case(addon.folder_name.as_str())
+        })?
+        .remote_uid
+        .as_str();
+
+    remote_addons?
+        .iter()
+        .find(|remote| remote.uid.as_deref() == Some(remote_uid))
+        .and_then(remote_candidate)
+}
+
+fn local_addon_display_version(addon: &LocalAddon) -> Option<String> {
+    addon
+        .addon_version
+        .clone()
+        .or_else(|| addon.version.clone())
 }
 
 fn dependency_from_token(
@@ -601,8 +831,9 @@ mod tests {
 
     use crate::api::models::AddonSummary;
     use crate::install::dependencies::{
-        build_dependency_plan, parse_dependency_values, DependencyInstallRole, DependencyStatus,
-        InstalledRemoteAddon, RemoteAddonRef,
+        build_dependency_plan, parse_dependency_values, parse_optional_dependency_values,
+        resolve_manifest_dependencies, DependencyAvailability, DependencyInstallRole,
+        DependencyStatus, InstalledRemoteAddon, RemoteAddonRef,
     };
     use crate::install::zip_safety::{ExtractedZip, ZipInspection};
     use crate::local::LocalAddon;
@@ -679,6 +910,7 @@ mod tests {
         assert_eq!(parsed[0].name, "LibAddonMenu-2.0");
         assert_eq!(parsed[0].constraint, None);
         assert_eq!(parsed[0].raw, "LibAddonMenu-2.0");
+        assert!(parsed[0].required);
     }
 
     #[test]
@@ -712,6 +944,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["LibDebugLogger", "LibAddonMenu-2.0"]
         );
+    }
+
+    #[test]
+    fn parses_optional_dependson() {
+        let parsed = parse_optional_dependency_values("LibDebugLogger LibAddonMenu-2.0>=41");
+
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|dependency| !dependency.required));
+        assert_eq!(parsed[1].constraint.as_deref(), Some(">=41"));
     }
 
     #[test]
@@ -762,6 +1003,130 @@ mod tests {
             Some("LibInstalled")
         );
         assert_eq!(plan.install_items.len(), 1);
+    }
+
+    #[test]
+    fn status_report_detects_installed_dependency_by_folder() {
+        let report = resolve_manifest_dependencies(
+            &["LibInstalled".to_owned()],
+            &[],
+            &[local("LibInstalled", Some("Different Title"), &[], &[])],
+            Some(&[remote("7", "LibInstalled", &["LibInstalled"])]),
+            &[],
+        );
+
+        assert_eq!(
+            report.required_dependencies[0].status,
+            DependencyAvailability::Installed
+        );
+        assert_eq!(
+            report.required_dependencies[0].installed_folder.as_deref(),
+            Some("LibInstalled")
+        );
+    }
+
+    #[test]
+    fn status_report_detects_installed_dependency_by_title() {
+        let report = resolve_manifest_dependencies(
+            &["LibInstalled".to_owned()],
+            &[],
+            &[local("DifferentFolder", Some("LibInstalled"), &[], &[])],
+            Some(&[remote("7", "LibInstalled", &["LibInstalled"])]),
+            &[],
+        );
+
+        assert_eq!(
+            report.required_dependencies[0].status,
+            DependencyAvailability::Installed
+        );
+        assert_eq!(
+            report.required_dependencies[0].installed_folder.as_deref(),
+            Some("DifferentFolder")
+        );
+        assert_eq!(
+            report.required_dependencies[0].installed_title.as_deref(),
+            Some("LibInstalled")
+        );
+    }
+
+    #[test]
+    fn status_report_detects_installed_dependency_by_metadata_uid() {
+        let report = resolve_manifest_dependencies(
+            &["LibMapped".to_owned()],
+            &[],
+            &[local("RenamedLibFolder", Some("Renamed"), &[], &[])],
+            Some(&[remote("7", "LibMapped", &["LibMapped"])]),
+            &[InstalledRemoteAddon {
+                folder_name: "RenamedLibFolder".to_owned(),
+                remote_uid: "7".to_owned(),
+            }],
+        );
+
+        assert_eq!(
+            report.required_dependencies[0].status,
+            DependencyAvailability::Installed
+        );
+        assert_eq!(
+            report.required_dependencies[0].installed_folder.as_deref(),
+            Some("RenamedLibFolder")
+        );
+        assert_eq!(
+            report.required_dependencies[0].remote_uid.as_deref(),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn status_report_marks_missing_dependency_as_missing() {
+        let report =
+            resolve_manifest_dependencies(&["MissingLib".to_owned()], &[], &[], Some(&[]), &[]);
+
+        assert_eq!(
+            report.required_dependencies[0].status,
+            DependencyAvailability::Missing
+        );
+        assert!(!report.required_dependencies[0].installed);
+    }
+
+    #[test]
+    fn status_report_keeps_hidden_installed_library_visible() {
+        let mut hidden_library = local("LibAddonMenu-2.0", Some("LibAddonMenu-2.0"), &[], &[]);
+        hidden_library.is_library = Some(true);
+        let report = resolve_manifest_dependencies(
+            &["LibAddonMenu-2.0".to_owned()],
+            &[],
+            &[hidden_library],
+            Some(&[remote("7", "LibAddonMenu-2.0", &["LibAddonMenu-2.0"])]),
+            &[],
+        );
+
+        assert_eq!(
+            report.required_dependencies[0].status,
+            DependencyAvailability::Installed
+        );
+        assert_eq!(
+            report.required_dependencies[0].installed_folder.as_deref(),
+            Some("LibAddonMenu-2.0")
+        );
+    }
+
+    #[test]
+    fn status_report_marks_ambiguous_remote_dependency() {
+        let report = resolve_manifest_dependencies(
+            &["LibFoo".to_owned()],
+            &[],
+            &[],
+            Some(&[
+                remote("7", "LibFoo", &["LibFoo"]),
+                remote("8", "LibFoo", &["Other"]),
+            ]),
+            &[],
+        );
+
+        assert_eq!(
+            report.required_dependencies[0].status,
+            DependencyAvailability::Ambiguous
+        );
     }
 
     #[test]

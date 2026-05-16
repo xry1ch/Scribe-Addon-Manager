@@ -32,6 +32,7 @@ export interface AddonSummary {
   category_name: string | null;
   downloads: number | null;
   monthly_downloads: number | null;
+  is_library: boolean;
   image_urls: string[];
   thumbnail_urls: string[];
   installed: boolean;
@@ -79,6 +80,7 @@ export interface AddonDetails {
   category_name: string | null;
   downloads: number | null;
   monthly_downloads: number | null;
+  is_library: boolean;
   image_urls: string[];
   thumbnail_urls: string[];
 }
@@ -105,6 +107,7 @@ export interface RemoteCandidate {
   category_name: string | null;
   downloads: number | null;
   monthly_downloads: number | null;
+  is_library: boolean;
   image_urls: string[];
   thumbnail_urls: string[];
 }
@@ -216,6 +219,27 @@ export interface DependencyPlan {
   required_dependencies: DependencyPlanEntry[];
   optional_dependencies: DependencyPlanEntry[];
   install_items: DependencyInstallItem[];
+}
+
+export interface AddonDependencyStatus {
+  name: string;
+  raw: string;
+  constraint: string | null;
+  required: boolean;
+  installed: boolean;
+  installed_folder: string | null;
+  installed_title: string | null;
+  installed_version: string | null;
+  remote_uid: string | null;
+  remote_name: string | null;
+  remote_version: string | null;
+  status: "installed" | "missing" | "unknown" | "ambiguous" | string;
+}
+
+export interface InstalledAddonDependenciesResponse {
+  required_dependencies: AddonDependencyStatus[];
+  optional_dependencies: AddonDependencyStatus[];
+  warning: string | null;
 }
 
 export interface PlanRemoteInstallResponse {
@@ -363,6 +387,8 @@ export interface AppSettings {
   download_dir: string | null;
   keep_downloads_default: boolean;
   include_unknown_updates_default: boolean;
+  hide_libraries_in_search: boolean;
+  hide_libraries_in_installed: boolean;
 }
 
 export interface AppStartupInfo {
@@ -389,6 +415,8 @@ export interface AppSettingsInput {
   download_dir: string | null;
   keep_downloads_default: boolean;
   include_unknown_updates_default: boolean;
+  hide_libraries_in_search: boolean;
+  hide_libraries_in_installed: boolean;
 }
 
 export interface HttpCacheStatsResponse {

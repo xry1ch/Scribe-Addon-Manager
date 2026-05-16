@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { renderEsoMarkup, renderInlineEsoMarkup, stripEsoMarkup } from "./bbcode";
+import { shouldShowInstalledAddon, shouldShowSearchAddon } from "./libraryFilters";
 import iconSpriteUrl from "./assets/esoui/icons-45px.png";
 import logoUrl from "./assets/LOGO.png";
 import "./styles.css";
@@ -16,10 +17,12 @@ import type {
   CheckAddonsResponse,
   ClearSavedVariablesResponse,
   DependencyPlan,
+  AddonDependencyStatus,
   HttpCacheStatsResponse,
   ImportExistingAddonsResponse,
   InstallRemoteAddonResponse,
   InstalledAddonsResponse,
+  InstalledAddonDependenciesResponse,
   LocalAddon,
   ManualBackupResponse,
   MatchResult,
@@ -36,7 +39,7 @@ import type {
 } from "./types";
 
 type Tab = "installed" | "search" | "settings";
-type DetailsTab = "info" | "changelog";
+type DetailsTab = "info" | "changelog" | "dependencies";
 type InstalledFilter = "all" | "update" | "unknown" | "current";
 type InstalledSort = "name" | "updated" | "downloads" | "status";
 type SearchMode = "most_downloaded" | "recent";
@@ -52,6 +55,7 @@ type OperationKind =
   | "cache"
   | "install-plan"
   | "install-apply"
+  | "dependency-install"
   | "update-plan"
   | "update-apply"
   | "remove-apply"
@@ -92,6 +96,9 @@ interface AppState {
   lightboxImageUrl: string | null;
   selectedLocal: LocalAddon | null;
   selectedMatch: MatchResult | null;
+  selectedDependencies: InstalledAddonDependenciesResponse | null;
+  selectedDependenciesLoading: boolean;
+  selectedDependenciesError: string | null;
   updates: CheckAddonsResponse | null;
   updatePlan: PlanUpdatesResponse | null;
   includeUnknown: boolean;
@@ -172,6 +179,9 @@ const state: AppState = {
   lightboxImageUrl: null,
   selectedLocal: null,
   selectedMatch: null,
+  selectedDependencies: null,
+  selectedDependenciesLoading: false,
+  selectedDependenciesError: null,
   updates: null,
   updatePlan: null,
   includeUnknown: false,
@@ -521,7 +531,7 @@ function renderInstalledCard(item: InstalledViewModel) {
   const remote = item.match?.remote ?? null;
   const status = installedStatus(item.match, addon);
   const title = addon.folder_name;
-  const category = categoryMeta(remote?.category_name ?? null, remote?.category_id ?? null, addon.is_library);
+  const category = categoryMeta(remote?.category_name ?? null, remote?.category_id ?? null, addon.is_library === true || remote?.is_library === true);
   const author = addon.author ?? remote?.author_name ?? null;
   const statusNote = installedStatusNote(status);
   return `
@@ -609,7 +619,7 @@ function renderSearchResultSummary(showSearchSkeleton: boolean, hasCategoryFilte
   if (isTypedSearchActive()) {
     const subtext = showSearchSkeleton
       ? "Loading results..."
-      : `Showing ${visibleSearchResults().length} of ${state.totalSearchMatches} results${categorySuffix}`;
+      : `Showing ${visibleSearchResults().length} of ${totalVisibleSearchMatches()} results${categorySuffix}`;
     return `
       <div class="result-caption search-result-summary" id="search-result-summary">
         <strong>${escapeHtml(resultTitle)}</strong>
@@ -629,12 +639,12 @@ function searchResultTitle() {
 function renderSearchList(showSearchSkeleton: boolean) {
   if (showSearchSkeleton) return renderSkeletonCards(6);
   if (!state.searchLoaded) return emptyState("Remote addons unavailable", "Resolve the error above, then refresh Search.");
-  if (state.searchResults.length === 0) return emptyState("No matching addons", "No remote addons matched the current mode, category, and search filters.");
+  if (filteredSearchResults().length === 0) return emptyState("No matching addons", "No remote addons matched the current mode, category, and search filters.");
   return visibleSearchResults().map(renderSearchCard).join("");
 }
 
 function renderSearchIncrementStatus(showSearchSkeleton: boolean) {
-  if (!isTypedSearchActive() || showSearchSkeleton || !state.searchLoaded || state.searchResults.length === 0) return "";
+  if (!isTypedSearchActive() || showSearchSkeleton || !state.searchLoaded || filteredSearchResults().length === 0) return "";
   return `<p class="search-load-status" id="search-load-status">${hasMoreSearchResults() ? "Scroll to load more" : "All results shown"}</p>`;
 }
 
@@ -643,12 +653,28 @@ function isTypedSearchActive() {
 }
 
 function visibleSearchResults() {
-  if (!isTypedSearchActive()) return state.searchResults;
-  return state.searchResults.slice(0, Math.min(state.visibleSearchCount, state.searchResults.length));
+  const results = filteredSearchResults();
+  if (!isTypedSearchActive()) return results;
+  return results.slice(0, Math.min(state.visibleSearchCount, results.length));
+}
+
+function filteredSearchResults() {
+  return state.searchResults.filter((addon) =>
+    shouldShowSearchAddon(addon, {
+      hideLibraries: state.settings?.hide_libraries_in_search ?? false,
+      selectedCategoryId: state.searchCategoryId,
+      categories: state.remoteCategories,
+      query: state.searchAppliedQuery,
+    }),
+  );
+}
+
+function totalVisibleSearchMatches() {
+  return filteredSearchResults().length;
 }
 
 function hasMoreSearchResults() {
-  return isTypedSearchActive() && state.visibleSearchCount < state.totalSearchMatches;
+  return isTypedSearchActive() && state.visibleSearchCount < totalVisibleSearchMatches();
 }
 
 function resetSearchPagination() {
@@ -664,7 +690,7 @@ function selectedCategoryName() {
 }
 
 function renderSearchCard(addon: AddonSummary) {
-  const category = categoryMeta(addon.category_name, addon.category_id, false);
+  const category = categoryMeta(addon.category_name, addon.category_id, addon.is_library);
   return `
     <article class="addon-card clickable${addon.installed ? " is-installed" : ""}" data-addon-id="${escapeAttr(addon.uid ?? "")}">
       ${CategoryIcon(category)}
@@ -708,7 +734,7 @@ function renderDetailsModal() {
   const category = categoryMeta(
     details?.category_name ?? match?.remote?.category_name ?? summary?.category_name ?? null,
     details?.category_id ?? match?.remote?.category_id ?? summary?.category_id ?? null,
-    local?.is_library ?? false,
+    local?.is_library === true || details?.is_library === true || match?.remote?.is_library === true || summary?.is_library === true,
   );
   const title = details?.name ?? local?.title ?? match?.remote?.name ?? summary?.name ?? local?.folder_name ?? "Addon Details";
   const author = details?.author_name ?? match?.remote?.author_name ?? summary?.author_name ?? local?.author ?? null;
@@ -719,6 +745,7 @@ function renderDetailsModal() {
   const statusNote = selectedDetailsStatusNote();
   const websiteUrl = selectedWebsiteUrl();
   const closeDisabled = guardedOperationRunning() ? "disabled" : "";
+  const activeDetailsTab = selectedDetailsTab();
   return `
     <div class="details-modal-backdrop" id="close-details-backdrop"></div>
     <section class="addon-modal" role="dialog" aria-modal="true" aria-labelledby="addon-details-title">
@@ -746,7 +773,7 @@ function renderDetailsModal() {
         ${renderDetailsActionPanels()}
         ${renderDetailsTabs()}
         <section class="details-tab-panel">
-          ${state.detailsTab === "changelog" ? renderChangelogTab() : renderAddonInfoTab()}
+          ${activeDetailsTab === "dependencies" ? renderDependenciesTab() : activeDetailsTab === "changelog" ? renderChangelogTab() : renderAddonInfoTab()}
         </section>
       </div>
       <footer class="addon-modal-footer">
@@ -807,12 +834,29 @@ function renderDetailsActionPanels() {
 }
 
 function renderDetailsTabs() {
+  const activeTab = selectedDetailsTab();
+  const dependencyTab = shouldShowDependenciesTab()
+    ? `<button class="details-tab ${activeTab === "dependencies" ? "active" : ""}" data-details-tab="dependencies" role="tab" aria-selected="${activeTab === "dependencies"}">Dependencies</button>`
+    : "";
   return `
     <div class="details-tabs" role="tablist" aria-label="Addon details sections">
-      <button class="details-tab ${state.detailsTab === "info" ? "active" : ""}" data-details-tab="info" role="tab" aria-selected="${state.detailsTab === "info"}">Addon Info</button>
-      <button class="details-tab ${state.detailsTab === "changelog" ? "active" : ""}" data-details-tab="changelog" role="tab" aria-selected="${state.detailsTab === "changelog"}">Changelog</button>
+      <button class="details-tab ${activeTab === "info" ? "active" : ""}" data-details-tab="info" role="tab" aria-selected="${activeTab === "info"}">Addon Info</button>
+      <button class="details-tab ${activeTab === "changelog" ? "active" : ""}" data-details-tab="changelog" role="tab" aria-selected="${activeTab === "changelog"}">Changelog</button>
+      ${dependencyTab}
     </div>
   `;
+}
+
+function selectedDetailsTab(): DetailsTab {
+  return state.detailsTab === "dependencies" && !shouldShowDependenciesTab() ? "info" : state.detailsTab;
+}
+
+function shouldShowDependenciesTab() {
+  return Boolean(state.selectedLocal || selectedDependencyPlan());
+}
+
+function selectedDependencyPlan() {
+  return state.installPlan?.dependency_plan ?? state.singleUpdatePlan?.dependency_plan ?? null;
 }
 
 function renderAddonInfoTab() {
@@ -834,6 +878,258 @@ function renderChangelogTab() {
     return emptyState("No changelog", "No changelog is available for this addon.");
   }
   return `<section class="prose-block">${renderEsoMarkup(changelog)}</section>`;
+}
+
+function renderDependenciesTab() {
+  if (state.selectedLocal) return renderInstalledDependenciesTab();
+  const plan = selectedDependencyPlan();
+  if (plan) return renderPreviewDependenciesTab(plan);
+  return emptyState("No dependencies found", "No dependency data is available for this addon.");
+}
+
+function renderInstalledDependenciesTab() {
+  const dependencies = state.selectedDependencies;
+  const warning = state.selectedDependenciesError ?? dependencies?.warning ?? null;
+
+  if (state.selectedDependenciesLoading && !dependencies) {
+    return `
+      <section class="dependency-details">
+        ${warning ? `<div class="banner warning compact-banner">${escapeHtml(warning)}</div>` : ""}
+        <div class="dependency-status-section">
+          <div class="dependency-status-heading">
+            <h3>Required dependencies</h3>
+            <span>Loading</span>
+          </div>
+          <div class="dependency-card-list">
+            ${Array.from({ length: 3 }, () => renderSkeletonMiniRow()).join("")}
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  if (!dependencies) {
+    return `
+      <section class="dependency-details">
+        ${warning ? `<div class="banner warning compact-banner">${escapeHtml(warning)}</div>` : ""}
+        ${emptyState("No dependencies found", "Dependency data is not available for this addon.")}
+      </section>
+    `;
+  }
+
+  return renderDependencyStatusSections(
+    dependencies.required_dependencies,
+    dependencies.optional_dependencies,
+    warning,
+  );
+}
+
+function renderPreviewDependenciesTab(plan: DependencyPlan) {
+  const required = plan.required_dependencies;
+  const optional = plan.optional_dependencies;
+  if (required.length === 0 && optional.length === 0) {
+    return emptyState("No dependencies found", "No required or optional dependencies were found in this package.");
+  }
+
+  return `
+    <section class="dependency-details">
+      ${renderPreviewDependencySection("Required dependencies", required, "No required dependencies.", true)}
+      ${renderPreviewDependencySection("Optional dependencies", optional, "No optional dependencies.", false)}
+    </section>
+  `;
+}
+
+function renderDependencyStatusSections(required: AddonDependencyStatus[], optional: AddonDependencyStatus[], warning: string | null) {
+  if (required.length === 0 && optional.length === 0) {
+    return `
+      <section class="dependency-details">
+        ${warning ? `<div class="banner warning compact-banner">${escapeHtml(warning)}</div>` : ""}
+        ${emptyState("No dependencies found", "No dependencies found.")}
+      </section>
+    `;
+  }
+
+  return `
+    <section class="dependency-details">
+      ${warning ? `<div class="banner warning compact-banner">${escapeHtml(warning)}</div>` : ""}
+      ${renderInstalledDependencySection("Required dependencies", required, "No required dependencies.")}
+      ${renderInstalledDependencySection("Optional dependencies", optional, "No optional dependencies.")}
+    </section>
+  `;
+}
+
+function renderInstalledDependencySection(title: string, dependencies: AddonDependencyStatus[], emptyMessage: string) {
+  return `
+    <div class="dependency-status-section">
+      <div class="dependency-status-heading">
+        <h3>${escapeHtml(title)}</h3>
+        <span>${dependencies.length === 0 ? "None" : `${dependencies.length} found`}</span>
+      </div>
+      ${
+        dependencies.length === 0
+          ? `<p class="muted-text">${escapeHtml(emptyMessage)}</p>`
+          : `<div class="dependency-card-list">${dependencies.map(renderInstalledDependencyCard).join("")}</div>`
+      }
+    </div>
+  `;
+}
+
+function renderPreviewDependencySection(
+  title: string,
+  dependencies: DependencyPlan["required_dependencies"],
+  emptyMessage: string,
+  required: boolean,
+) {
+  return `
+    <div class="dependency-status-section">
+      <div class="dependency-status-heading">
+        <h3>${escapeHtml(title)}</h3>
+        <span>${dependencies.length === 0 ? "None" : `${dependencies.length} found`}</span>
+      </div>
+      ${
+        dependencies.length === 0
+          ? `<p class="muted-text">${escapeHtml(emptyMessage)}</p>`
+          : `<div class="dependency-card-list">${dependencies.map((dependency) => renderPreviewDependencyCard(dependency, required)).join("")}</div>`
+      }
+    </div>
+  `;
+}
+
+function renderInstalledDependencyCard(dependency: AddonDependencyStatus) {
+  const action = renderInstalledDependencyAction(dependency);
+  return `
+    <article class="dependency-card ${dependencyAvailabilityClass(dependency)}">
+      <span class="dependency-status-icon" aria-hidden="true">${dependencyAvailabilityIcon(dependency)}</span>
+      <div class="dependency-card-main">
+        <div class="dependency-card-title">
+          <strong>${escapeHtml(dependency.name)}</strong>
+          <span>${escapeHtml(dependencyAvailabilityText(dependency))}</span>
+        </div>
+        ${renderInstalledDependencyLines(dependency)}
+      </div>
+      ${action ? `<div class="dependency-card-actions">${action}</div>` : ""}
+    </article>
+  `;
+}
+
+function renderPreviewDependencyCard(dependency: DependencyPlan["required_dependencies"][number], required: boolean) {
+  return `
+    <article class="dependency-card ${previewDependencyClass(dependency, required)}">
+      <span class="dependency-status-icon" aria-hidden="true">${previewDependencyIcon(dependency, required)}</span>
+      <div class="dependency-card-main">
+        <div class="dependency-card-title">
+          <strong>${escapeHtml(dependency.name)}</strong>
+          <span>${escapeHtml(dependencyStatusText(dependency))}</span>
+        </div>
+        ${renderPreviewDependencyLines(dependency)}
+      </div>
+    </article>
+  `;
+}
+
+function renderInstalledDependencyLines(dependency: AddonDependencyStatus) {
+  const installedName = plainEsoText(dependency.installed_title ?? dependency.installed_folder ?? dependency.name);
+  const remoteName = plainEsoText(dependency.remote_name ?? dependency.name);
+  const lines = [
+    dependency.constraint ? dependencyLine(`Requires ${dependency.constraint}`) : "",
+    dependency.installed ? dependencyLine(compactDependencySummary("Installed", installedName, formatInstalledDependencyVersion(dependency.installed_version))) : "",
+    dependency.remote_uid || dependency.remote_name ? dependencyLine(compactDependencySummary("Remote", remoteName, dependency.remote_version)) : "",
+  ].filter(Boolean);
+
+  if (lines.length === 0) {
+    const fallback = dependency.status === "ambiguous" ? "Multiple remote matches" : dependency.status === "unknown" ? "Remote lookup unavailable" : "No remote match";
+    lines.push(dependencyLine(fallback));
+  }
+
+  return `<div class="dependency-lines">${lines.join("")}</div>`;
+}
+
+function renderPreviewDependencyLines(dependency: DependencyPlan["required_dependencies"][number]) {
+  const lines = [
+    dependency.constraint ? dependencyLine(`Requires ${dependency.constraint}`) : "",
+    dependency.installed_folder ? dependencyLine(compactDependencySummary("Installed", dependency.installed_folder, null)) : "",
+    dependency.remote_name ? dependencyLine(compactDependencySummary("Remote", dependency.remote_name, null)) : "",
+    dependency.bundled_folder ? dependencyLine(compactDependencySummary("Bundled", dependency.bundled_folder, null)) : "",
+  ].filter(Boolean);
+
+  if (lines.length === 0) {
+    lines.push(dependencyLine(dependencyDetailText(dependency)));
+  }
+
+  return `<div class="dependency-lines">${lines.join("")}</div>`;
+}
+
+function dependencyLine(value: string) {
+  return `
+    <p class="dependency-line">${escapeHtml(value)}</p>
+  `;
+}
+
+function compactDependencySummary(label: string, name: string, version: string | null | undefined) {
+  return `${label}: ${name}${version ? ` · ${version}` : ""}`;
+}
+
+function formatInstalledDependencyVersion(version: string | null) {
+  const value = version?.trim();
+  if (!value) return null;
+  return value.toLowerCase().startsWith("v") ? value : `v${value}`;
+}
+
+function renderInstalledDependencyAction(dependency: AddonDependencyStatus) {
+  if (dependency.installed && dependency.installed_folder) {
+    return `<button class="secondary small" data-open-installed-dependency="${escapeAttr(dependency.installed_folder)}" ${disabledAttr()}>Open details</button>`;
+  }
+  if (dependency.status === "missing" && dependency.remote_uid) {
+    return `<button class="primary small" data-install-dependency="${escapeAttr(dependency.remote_uid)}" ${disabledAttr()}>${loadingButtonContent("Install dependency", "Installing...", "dependency-install", dependency.remote_uid)}</button>`;
+  }
+  if (dependency.remote_uid) {
+    return `<button class="secondary small" data-open-remote-dependency="${escapeAttr(dependency.remote_uid)}" ${disabledAttr()}>Details</button>`;
+  }
+  return "";
+}
+
+function dependencyAvailabilityText(dependency: AddonDependencyStatus) {
+  if (dependency.status === "installed") return "Installed";
+  if (dependency.status === "missing") return "Missing";
+  if (dependency.status === "ambiguous") return "Ambiguous";
+  return "Unknown";
+}
+
+function dependencyAvailabilityClass(dependency: AddonDependencyStatus) {
+  if (dependency.status === "installed") return "is-installed";
+  if (dependency.status === "missing" && dependency.required) return "is-required-missing";
+  if (dependency.status === "missing") return "is-optional-missing";
+  if (dependency.status === "ambiguous") return "is-ambiguous";
+  return "is-unknown";
+}
+
+function dependencyAvailabilityIcon(dependency: AddonDependencyStatus) {
+  if (dependency.status === "installed") return resultCheckIcon();
+  if (dependency.status === "missing") return resultWarningIcon();
+  return neutralDependencyIcon();
+}
+
+function previewDependencyClass(dependency: DependencyPlan["required_dependencies"][number], required: boolean) {
+  if (dependency.status === "already-installed") return "is-installed";
+  if (dependency.status === "will-install") return "is-planned";
+  if (dependency.status === "ambiguous") return "is-ambiguous";
+  if (dependency.status === "unresolved" || dependency.status === "not-installed") {
+    return required ? "is-required-missing" : "is-optional-missing";
+  }
+  return "is-unknown";
+}
+
+function previewDependencyIcon(dependency: DependencyPlan["required_dependencies"][number], required: boolean) {
+  if (dependency.status === "already-installed") return resultCheckIcon();
+  if (dependency.status === "will-install") return neutralDependencyIcon();
+  if (dependency.status === "ambiguous" || dependency.status === "unresolved" || (required && dependency.status === "not-installed")) {
+    return resultWarningIcon();
+  }
+  return neutralDependencyIcon();
+}
+
+function neutralDependencyIcon() {
+  return `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 8v5"></path><path d="M12 16h.01"></path></svg>`;
 }
 
 function renderScreenshotGallery() {
@@ -985,6 +1281,25 @@ function renderSettings() {
             "settings-include-unknown",
             settings?.include_unknown_updates_default ?? false,
             "Shows addons where Scribe cannot confidently compare versions.",
+          )}
+        </div>
+      </section>
+      <section class="panel settings-card">
+        <div class="settings-card-heading">
+          <h3>Display</h3>
+        </div>
+        <div class="settings-card-body">
+          ${settingCheckbox(
+            "Hide libraries in Search",
+            "settings-hide-libraries-search",
+            settings?.hide_libraries_in_search ?? false,
+            "Library addons will be hidden from browsing results unless they are directly searched for.",
+          )}
+          ${settingCheckbox(
+            "Hide installed libraries",
+            "settings-hide-libraries-installed",
+            settings?.hide_libraries_in_installed ?? false,
+            "Installed libraries will be hidden unless Scribe finds an update for them.",
           )}
         </div>
       </section>
@@ -1174,7 +1489,7 @@ function renderUpdateAllResult() {
 function renderUpdateAllResultCard(item: ApplyUpdateAllResponse["results"][number]) {
   return `
     <article class="addon-card compact-card">
-      ${CategoryIcon(categoryMeta(item.remote_details.category_name, item.remote_details.category_id, false))}
+      ${CategoryIcon(categoryMeta(item.remote_details.category_name, item.remote_details.category_id, item.remote_details.is_library))}
       <div class="addon-main">
         <div class="addon-title-row">
           <div>
@@ -1486,6 +1801,7 @@ function requiredDependencySummary(plan: DependencyPlan) {
 function dependencyStatusText(dependency: DependencyPlan["required_dependencies"][number]) {
   if (dependency.status === "already-installed") return "Already installed";
   if (dependency.status === "will-install") return dependency.bundled_folder ? "Bundled" : "Will install";
+  if (dependency.status === "not-installed") return "Not installed";
   if (dependency.status === "ambiguous") return "Ambiguous";
   if (dependency.status === "unresolved") return "Unresolved";
   return dependency.status;
@@ -1707,6 +2023,15 @@ function bindTabEvents() {
       render();
     });
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-open-installed-dependency]").forEach((button) => {
+    button.addEventListener("click", () => openInstalledDetails(button.dataset.openInstalledDependency ?? ""));
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-open-remote-dependency]").forEach((button) => {
+    button.addEventListener("click", () => loadDetails(button.dataset.openRemoteDependency ?? ""));
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-install-dependency]").forEach((button) => {
+    button.addEventListener("click", () => installDependency(button.dataset.installDependency ?? ""));
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-lightbox-url]").forEach((button) => {
     button.addEventListener("click", () => openImageLightbox(button.dataset.lightboxUrl ?? ""));
   });
@@ -1748,6 +2073,8 @@ function bindTabEvents() {
   document.querySelector<HTMLInputElement>("#settings-download-dir")?.addEventListener("input", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-keep-downloads")?.addEventListener("change", syncSettingsDraft);
   document.querySelector<HTMLInputElement>("#settings-include-unknown")?.addEventListener("change", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-hide-libraries-search")?.addEventListener("change", syncSettingsDraft);
+  document.querySelector<HTMLInputElement>("#settings-hide-libraries-installed")?.addEventListener("change", syncSettingsDraft);
   document.querySelectorAll<HTMLButtonElement>("[data-browse-target]").forEach((button) => {
     button.addEventListener("click", () => browseSettingsFolder(button.dataset.browseTarget ?? ""));
   });
@@ -1946,7 +2273,7 @@ function unbindSearchScrollListener() {
 
 function loadMoreSearchResults() {
   if (!hasMoreSearchResults()) return;
-  const nextVisibleCount = Math.min(state.visibleSearchCount + state.searchPageSize, state.totalSearchMatches);
+  const nextVisibleCount = Math.min(state.visibleSearchCount + state.searchPageSize, totalVisibleSearchMatches());
   if (nextVisibleCount === state.visibleSearchCount) return;
   state.visibleSearchCount = nextVisibleCount;
   renderSearchResultsOnly();
@@ -2040,6 +2367,7 @@ function loadSearchResults(refresh = false) {
       limit: state.searchLimit,
       path: effectiveAddonsPath(),
       refresh,
+      hideLibraries: state.settings?.hide_libraries_in_search ?? false,
     });
     state.searchMode = response.mode === "recent" ? "recent" : "most_downloaded";
     state.searchAppliedQuery = response.query;
@@ -2064,6 +2392,9 @@ function loadDetails(addonId: string) {
   state.cachedImageUrls = {};
   state.selectedLocal = state.selectedSummary?.installed_local ?? null;
   state.selectedMatch = state.selectedSummary?.installed_match ?? null;
+  state.selectedDependencies = null;
+  state.selectedDependenciesLoading = false;
+  state.selectedDependenciesError = null;
   state.installPlan = null;
   state.installResult = null;
   state.singleUpdatePlan = null;
@@ -2078,7 +2409,11 @@ function loadDetails(addonId: string) {
       state.selectedDetails = response.details;
       state.selectedLocal = response.local;
       state.selectedMatch = response.match_result;
+      state.selectedDependencies = null;
+      state.selectedDependenciesError = null;
+      state.selectedDependenciesLoading = Boolean(response.local);
       state.warning = [response.cache_warning, response.local_warning].filter(Boolean).join(" ") || null;
+      if (response.local) void loadInstalledDependencies(response.local.folder_name);
       void cacheSelectedImages();
     }
   }, "details");
@@ -2095,6 +2430,9 @@ function openInstalledDetails(folderName: string) {
   state.detailsTab = "info";
   state.lightboxImageUrl = null;
   state.cachedImageUrls = {};
+  state.selectedDependencies = null;
+  state.selectedDependenciesLoading = true;
+  state.selectedDependenciesError = null;
   state.installPlan = null;
   state.installResult = null;
   state.singleUpdatePlan = null;
@@ -2103,19 +2441,52 @@ function openInstalledDetails(folderName: string) {
   const uid = match?.remote?.uid;
   if (uid) {
     return withLoading(async () => {
-      const details = await invoke<AddonDetails>("get_remote_addon_details", { addonId: uid });
+      const [details, dependencies] = await Promise.all([
+        invoke<AddonDetails>("get_remote_addon_details", { addonId: uid }),
+        fetchInstalledDependencies(folderName),
+      ]);
       if (state.selectedLocal?.folder_name === folderName) {
         state.selectedDetails = details;
+        if (dependencies) {
+          state.selectedDependencies = dependencies;
+          state.selectedDependenciesError = null;
+        }
+        state.selectedDependenciesLoading = false;
         void cacheSelectedImages();
       }
     }, "details");
   } else {
     render();
+    void loadInstalledDependencies(folderName);
   }
 }
 
 function installedLocalByFolder(folderName: string) {
   return state.installed?.addons.find((addon) => addon.folder_name.toLowerCase() === folderName.toLowerCase()) ?? null;
+}
+
+async function fetchInstalledDependencies(folderName: string) {
+  try {
+    return await invoke<InstalledAddonDependenciesResponse>("get_installed_addon_dependencies", {
+      folderName,
+      path: effectiveAddonsPath(),
+    });
+  } catch (error) {
+    if (state.selectedLocal?.folder_name === folderName) {
+      state.selectedDependenciesError = `Dependency details could not be loaded. ${error instanceof Error ? error.message : String(error)}`;
+    }
+    return null;
+  }
+}
+
+async function loadInstalledDependencies(folderName: string) {
+  state.selectedDependenciesLoading = true;
+  const dependencies = await fetchInstalledDependencies(folderName);
+  if (state.selectedLocal?.folder_name !== folderName) return;
+  state.selectedDependencies = dependencies;
+  state.selectedDependenciesLoading = false;
+  if (dependencies) state.selectedDependenciesError = null;
+  render();
 }
 
 function requestCloseDetails() {
@@ -2128,6 +2499,9 @@ function closeDetails() {
   state.selectedSummary = null;
   state.selectedLocal = null;
   state.selectedMatch = null;
+  state.selectedDependencies = null;
+  state.selectedDependenciesLoading = false;
+  state.selectedDependenciesError = null;
   state.detailsTab = "info";
   state.lightboxImageUrl = null;
   state.cachedImageUrls = {};
@@ -2225,6 +2599,63 @@ function confirmInstall() {
     await refreshInstalledData(true);
     syncInstalledStateAfterInstall(state.installResult);
   }, "install-apply");
+}
+
+function installDependency(remoteUid: string) {
+  if (!remoteUid) return;
+  const parentFolder = state.selectedLocal?.folder_name ?? null;
+  return withLoading(async () => {
+    const plan = await invoke<PlanRemoteInstallResponse>("plan_remote_install", {
+      addonId: remoteUid,
+      path: effectiveAddonsPath(),
+    });
+
+    if (!hasInstallablePlanItems(plan)) {
+      throw new Error("No valid addon folders were found in this dependency package. Nothing was installed.");
+    }
+
+    let result: InstallRemoteAddonResponse | null = null;
+    if (isSafeNewInstallPlan(plan)) {
+      result = await invoke<InstallRemoteAddonResponse>("install_remote_addon_new_only", {
+        addonId: remoteUid,
+        path: effectiveAddonsPath(),
+        backupDir: state.settings?.backup_dir_override || null,
+        keepDownload: state.settings?.keep_downloads_default ?? false,
+        downloadDir: state.settings?.download_dir || null,
+      });
+    } else {
+      const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
+        ? "Existing addon folders may be backed up and replaced."
+        : "No existing addon folder replacement is currently expected.";
+      const dependencyText = installDependencyConfirmText(plan.dependency_plan);
+      const confirmed = window.confirm(
+        `Install dependency ${plan.remote.name ?? remoteUid}?\n\nTarget AddOns directory:\n${plan.addons_dir}\n\n${backupText}\n${dependencyText}\n\nThe app will fetch fresh metadata, download and verify the ZIP, validate it, build a fresh preview, and back up replacements before applying.`,
+      );
+      if (!confirmed) return;
+      result = await invoke<InstallRemoteAddonResponse>("install_remote_addon", {
+        addonId: remoteUid,
+        path: effectiveAddonsPath(),
+        backupDir: state.settings?.backup_dir_override || null,
+        keepDownload: state.settings?.keep_downloads_default ?? false,
+        downloadDir: state.settings?.download_dir || null,
+      });
+    }
+
+    if (!result) return;
+    state.path = result.addons_dir;
+    state.success = `Installed dependency ${result.remote.name ?? plan.remote.name ?? remoteUid}.`;
+    await refreshInstalledData(true);
+    if (parentFolder && state.selectedLocal?.folder_name === parentFolder) {
+      state.selectedLocal = installedLocalByFolder(parentFolder) ?? state.selectedLocal;
+      state.selectedDependenciesLoading = true;
+      const dependencies = await fetchInstalledDependencies(parentFolder);
+      if (state.selectedLocal?.folder_name === parentFolder) {
+        state.selectedDependencies = dependencies;
+        state.selectedDependenciesLoading = false;
+        if (dependencies) state.selectedDependenciesError = null;
+      }
+    }
+  }, "dependency-install", remoteUid);
 }
 
 function planSingleUpdate(target: string) {
@@ -2562,7 +2993,8 @@ function installedView(): InstalledViewModel[] {
   return items
     .filter((item) => {
       const status = installedStatus(item.match, item.addon);
-      if (state.installedFilter === "update" && status.kind !== "update") return false;
+      if (!shouldShowInstalledAddon(item, state.settings?.hide_libraries_in_installed ?? false, state.updatePlan?.actions ?? [])) return false;
+      if (state.installedFilter === "update" && status.kind !== "reliable-update") return false;
       if (state.installedFilter === "current" && status.kind !== "current") return false;
       if (state.installedFilter === "unknown" && !["unknown", "not-found", "ambiguous"].includes(status.kind)) return false;
       if (!query) return true;
@@ -2601,11 +3033,11 @@ function dateValue(value: string | null | undefined) {
 function installedStatus(match: MatchResult | null, addon: LocalAddon) {
   if (!addon.valid_manifest) return { label: "Invalid folder", kind: "invalid", rank: 3 };
   if (match?.update_confidence === "current") return { label: "Current", kind: "current", rank: 4 };
-  if (addon.is_library === true) return { label: "Unknown", kind: "unknown", rank: 2 };
   if (!match) return { label: "Unknown", kind: "unknown", rank: 2 };
   if (match.update_confidence === "reliable-update") return { label: "Update candidate", kind: "reliable-update", rank: 1 };
   if (match.update_confidence === "possible-update") return { label: "Version check uncertain", kind: "possible-update", rank: 2 };
   if (match.update_confidence === "local-newer") return { label: "Local newer", kind: "local-newer", rank: 5 };
+  if (addon.is_library === true) return { label: "Unknown", kind: "unknown", rank: 2 };
   if (match.status === "possible-update") return { label: "Version differs", kind: "possible-update", rank: 2 };
   if (match.status === "unknown-update") return { label: "Unknown", kind: "unknown", rank: 2 };
   if (match.status === "no-match") return { label: "Not found", kind: "not-found", rank: 3 };
@@ -2978,6 +3410,7 @@ function guardedOperationRunning() {
       [
         "install-plan",
         "install-apply",
+        "dependency-install",
         "update-plan",
         "update-apply",
         "remove-apply",
@@ -3128,6 +3561,8 @@ function readSettingsDraft(): AppSettings {
     download_dir: valueOrNull("#settings-download-dir"),
     keep_downloads_default: checkedOrFalse("#settings-keep-downloads"),
     include_unknown_updates_default: checkedOrFalse("#settings-include-unknown"),
+    hide_libraries_in_search: checkedOrFalse("#settings-hide-libraries-search"),
+    hide_libraries_in_installed: checkedOrFalse("#settings-hide-libraries-installed"),
   };
 }
 
@@ -3179,6 +3614,8 @@ async function finishInitialSetup(selectedPath: string, importExisting: boolean)
       download_dir: state.settings?.download_dir ?? null,
       keep_downloads_default: state.settings?.keep_downloads_default ?? false,
       include_unknown_updates_default: state.settings?.include_unknown_updates_default ?? false,
+      hide_libraries_in_search: state.settings?.hide_libraries_in_search ?? false,
+      hide_libraries_in_installed: state.settings?.hide_libraries_in_installed ?? false,
     } satisfies AppSettingsInput,
   });
   state.settings = saved;
@@ -3198,6 +3635,7 @@ function saveSettings() {
     const saved = await invoke<AppSettings>("save_app_settings", {
       settings: readSettingsDraft() as AppSettingsInput,
     });
+    invalidateSearchResults();
     state.settings = saved;
     applySettingsToState(saved);
     state.addonsPathExists = await invoke<boolean>("path_exists", { path: effectiveAddonsPath() });
@@ -3207,10 +3645,18 @@ function saveSettings() {
 function resetSettings() {
   return withLoading(async () => {
     const reset = await invoke<AppSettings>("reset_app_settings");
+    invalidateSearchResults();
     state.settings = reset;
     applySettingsToState(reset);
     state.addonsPathExists = await invoke<boolean>("path_exists", { path: effectiveAddonsPath() });
   }, "settings");
+}
+
+function invalidateSearchResults() {
+  state.searchLoaded = false;
+  state.searchLoadAttempted = false;
+  state.searchResults = [];
+  state.totalSearchMatches = 0;
 }
 
 function ensureHttpCacheStatsLoaded() {
