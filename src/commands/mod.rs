@@ -540,6 +540,7 @@ pub async fn plan_update(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_all(
     client: &ApiClient,
     path: Option<&Path>,
@@ -716,6 +717,7 @@ pub async fn update_all(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_all_one(
     client: &ApiClient,
     target: &PlannedAddonAction,
@@ -741,11 +743,11 @@ async fn update_all_one(
     .await?;
     validate_single_update_plan(&prepared.main_plan, &target.local_folder)?;
 
-    Ok(apply_prepared_install(
+    apply_prepared_install(
         &prepared,
         backup_dir,
         manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
-    )?)
+    )
 }
 
 pub fn inspect_zip(zip_path: &Path, json_output: bool) -> Result<()> {
@@ -845,6 +847,7 @@ pub fn install_zip(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn install_remote(
     client: &ApiClient,
     addon_id: &str,
@@ -932,6 +935,7 @@ pub async fn install_remote(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_one(
     client: &ApiClient,
     request: &str,
@@ -1071,6 +1075,7 @@ pub async fn update_one(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_remote_install_plan(
     client: &ApiClient,
     details: &AddonDetails,
@@ -1173,6 +1178,7 @@ async fn prepare_remote_install_plan(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_remote_package(
     client: &ApiClient,
     details: &AddonDetails,
@@ -2159,9 +2165,8 @@ fn print_install_plan(plan: &InstallPlan, dry_run: bool) {
 
         if matches!(item.action, InstallPlanAction::WouldWarnMultipleAddons) {
             println!(
-                "{:<28} {}",
-                "",
-                "Archive contains multiple addon folders; review all planned targets before real install support is added."
+                "{:<28} Archive contains multiple addon folders; review all planned targets before real install support is added.",
+                ""
             );
         }
     }

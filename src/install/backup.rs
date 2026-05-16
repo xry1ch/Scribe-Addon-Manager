@@ -171,7 +171,7 @@ fn validate_backup_against_source(
     backup_dir: &Path,
     addons_dir: &Path,
 ) -> Result<(), ManualBackupError> {
-    if is_same_or_child(&backup_dir, &addons_dir) {
+    if is_same_or_child(backup_dir, addons_dir) {
         return Err(ManualBackupError::BackupDirInsideAddons(
             backup_dir.to_path_buf(),
         ));
@@ -179,7 +179,7 @@ fn validate_backup_against_source(
 
     if let Some(live_dir) = addons_dir.parent() {
         let saved_variables_dir = live_dir.join("SavedVariables");
-        if is_same_or_child(&backup_dir, &saved_variables_dir) {
+        if is_same_or_child(backup_dir, &saved_variables_dir) {
             return Err(ManualBackupError::BackupDirInsideSavedVariables(
                 backup_dir.to_path_buf(),
             ));

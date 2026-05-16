@@ -168,7 +168,7 @@ fn compare_numeric_segments(local: &[u64], remote: &[u64]) -> VersionComparison 
 
 fn compare_packed_integer_to_dotted(integer: u64, dotted: &[u64]) -> Option<VersionComparison> {
     let packed = packed_dotted_versions(dotted)?;
-    if packed.iter().any(|candidate| *candidate == integer) {
+    if packed.contains(&integer) {
         return Some(VersionComparison::Same);
     }
 
@@ -181,7 +181,7 @@ fn compare_packed_integer_to_dotted(integer: u64, dotted: &[u64]) -> Option<Vers
 
 fn compare_dotted_to_packed_integer(dotted: &[u64], integer: u64) -> Option<VersionComparison> {
     let packed = packed_dotted_versions(dotted)?;
-    if packed.iter().any(|candidate| *candidate == integer) {
+    if packed.contains(&integer) {
         return Some(VersionComparison::Same);
     }
 

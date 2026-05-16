@@ -3,6 +3,7 @@
 debug
 target
 src-tauri/target
+src-tauri/target-tauri-test
 node_modules
 dist
 

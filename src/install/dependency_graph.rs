@@ -333,6 +333,7 @@ impl<'a> GraphBuilder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_dependency(
         &mut self,
         parent_node: Option<usize>,
@@ -401,6 +402,7 @@ impl<'a> GraphBuilder<'a> {
         path.pop();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upsert_node(
         &mut self,
         key: String,

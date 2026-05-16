@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -68,6 +69,12 @@ pub enum InstallApplyError {
 
     #[error("planned target path escapes AddOns directory: {0}")]
     TargetEscapesAddonsDir(PathBuf),
+
+    #[error("backup folder cannot be inside the AddOns directory: {0}")]
+    BackupDirInsideAddons(PathBuf),
+
+    #[error("backup folder cannot be inside SavedVariables: {0}")]
+    BackupDirInsideSavedVariables(PathBuf),
 
     #[error("copy failed after backup; target may need manual restore from {backup}: {source}")]
     CopyFailedAfterBackup {
@@ -283,10 +290,11 @@ fn validate_target_in_addons_dir(
     addons_dir: &Path,
     target: &Path,
 ) -> Result<(), InstallApplyError> {
-    if !target.starts_with(addons_dir) {
-        return Err(InstallApplyError::TargetEscapesAddonsDir(
-            target.to_path_buf(),
-        ));
+    let addons_dir = absolute_normalized(addons_dir)?;
+    let target = absolute_normalized(target)?;
+
+    if !target.starts_with(&addons_dir) {
+        return Err(InstallApplyError::TargetEscapesAddonsDir(target));
     }
 
     Ok(())
@@ -311,6 +319,7 @@ fn create_backup_session_dir(
             .map(|parent| parent.join(".eso-addon-manager-backups"))
             .unwrap_or_else(|| PathBuf::from(".eso-addon-manager-backups"))
     });
+    validate_backup_root_location(&root, addons_dir)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -318,7 +327,94 @@ fn create_backup_session_dir(
     let session_dir = unique_path(&root.join(timestamp.to_string()));
 
     fs::create_dir_all(&session_dir)?;
+    validate_backup_root_location(&root, addons_dir)?;
     Ok(session_dir)
+}
+
+fn validate_backup_root_location(
+    backup_root: &Path,
+    addons_dir: &Path,
+) -> Result<(), InstallApplyError> {
+    validate_backup_against_source(
+        &absolute_normalized(backup_root)?,
+        &absolute_normalized(addons_dir)?,
+    )?;
+
+    validate_backup_against_source(
+        &absolute_normalized_existing_prefix(backup_root)?,
+        &absolute_normalized_existing_prefix(addons_dir)?,
+    )
+}
+
+fn validate_backup_against_source(
+    backup_root: &Path,
+    addons_dir: &Path,
+) -> Result<(), InstallApplyError> {
+    if backup_root == addons_dir || backup_root.starts_with(addons_dir) {
+        return Err(InstallApplyError::BackupDirInsideAddons(
+            backup_root.to_path_buf(),
+        ));
+    }
+
+    if let Some(live_dir) = addons_dir.parent() {
+        let saved_variables_dir = live_dir.join("SavedVariables");
+        if backup_root == saved_variables_dir || backup_root.starts_with(&saved_variables_dir) {
+            return Err(InstallApplyError::BackupDirInsideSavedVariables(
+                backup_root.to_path_buf(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn absolute_normalized(path: &Path) -> Result<PathBuf, InstallApplyError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(normalize_components(&absolute))
+}
+
+fn absolute_normalized_existing_prefix(path: &Path) -> Result<PathBuf, InstallApplyError> {
+    let absolute = absolute_normalized(path)?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::<OsString>::new();
+
+    while !existing.exists() {
+        if let Some(name) = existing.file_name() {
+            missing.push(name.to_os_string());
+        }
+        existing = existing.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no existing parent found for {}", path.display()),
+            )
+        })?;
+    }
+
+    let mut resolved = fs::canonicalize(existing)?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+
+    Ok(normalize_components(&resolved))
+}
+
+fn normalize_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn unique_backup_path(backup_session_dir: &Path, folder_name: &str) -> PathBuf {
@@ -557,6 +653,60 @@ mod tests {
         ));
         assert!(!addons.join("Addon").exists());
         assert!(!dir.path().join("outside").exists());
+    }
+
+    #[test]
+    fn lexical_target_escape_is_rejected() {
+        let dir = tempdir().unwrap();
+        let temp = dir.path().join("temp");
+        let addons = dir.path().join("AddOns");
+        write_addon(&temp, "Addon", "new");
+        let plan = InstallPlan {
+            addons_dir: addons.clone(),
+            temp_dir: temp,
+            items: vec![InstallPlanItem {
+                source_folder: Some("Addon".to_owned()),
+                title: None,
+                version: None,
+                target_folder: Some(addons.join("..").join("outside")),
+                action: InstallPlanAction::WouldInstallNew,
+            }],
+        };
+
+        let result = apply_install_plan(&plan, None);
+
+        assert!(matches!(
+            result,
+            Err(InstallApplyError::TargetEscapesAddonsDir(_))
+        ));
+        assert!(!dir.path().join("outside").exists());
+    }
+
+    #[test]
+    fn install_backup_target_inside_addons_is_refused() {
+        let dir = tempdir().unwrap();
+        let temp = dir.path().join("temp");
+        let addons = dir.path().join("AddOns");
+        let backup_root = addons.join("Backups");
+        write_addon(&temp, "Addon", "new");
+        write_addon(&addons, "Addon", "old");
+
+        let result = apply_install_plan(
+            &plan(
+                temp,
+                addons.clone(),
+                "Addon",
+                InstallPlanAction::WouldReplaceExisting,
+            ),
+            Some(&backup_root),
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallApplyError::BackupDirInsideAddons(_))
+        ));
+        assert!(addons.join("Addon").exists());
+        assert!(!backup_root.exists());
     }
 
     #[test]
