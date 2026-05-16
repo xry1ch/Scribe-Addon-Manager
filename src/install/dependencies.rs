@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::models::AddonSummary;
+use crate::install::dependency_graph::{
+    build_dependency_graph, DependencyEdgeKind, DependencyGraph, DependencyGraphOptions,
+    DependencyManifestSource, DependencyNode, DependencyResolutionStatus,
+    DEFAULT_MAX_DEPENDENCY_DEPTH,
+};
 use crate::install::zip_safety::ExtractedZip;
 use crate::local::LocalAddon;
 
@@ -19,6 +24,8 @@ pub enum DependencyStatus {
     NotInstalled,
     Unresolved,
     Ambiguous,
+    Circular,
+    MaxDepth,
 }
 
 impl DependencyStatus {
@@ -29,6 +36,8 @@ impl DependencyStatus {
             Self::NotInstalled => "not-installed",
             Self::Unresolved => "unresolved",
             Self::Ambiguous => "ambiguous",
+            Self::Circular => "circular",
+            Self::MaxDepth => "max-depth",
         }
     }
 }
@@ -38,10 +47,17 @@ pub struct DependencyPlanEntry {
     pub name: String,
     pub constraint: Option<String>,
     pub raw: String,
+    pub required: bool,
+    pub relation: DependencyEdgeKind,
+    pub depth: usize,
+    pub parent: Option<String>,
     pub status: DependencyStatus,
     pub remote_uid: Option<String>,
     pub remote_name: Option<String>,
+    pub remote_version: Option<String>,
     pub installed_folder: Option<String>,
+    pub installed_title: Option<String>,
+    pub installed_version: Option<String>,
     pub bundled_folder: Option<String>,
 }
 
@@ -86,6 +102,8 @@ pub struct DependencyPlan {
     pub required_dependencies: Vec<DependencyPlanEntry>,
     pub optional_dependencies: Vec<DependencyPlanEntry>,
     pub install_items: Vec<DependencyInstallItem>,
+    pub install_order: Vec<String>,
+    pub graph: DependencyGraph,
 }
 
 impl DependencyPlan {
@@ -93,32 +111,47 @@ impl DependencyPlan {
         self.required_dependencies.iter().any(|dependency| {
             matches!(
                 dependency.status,
-                DependencyStatus::Unresolved | DependencyStatus::Ambiguous
+                DependencyStatus::Unresolved
+                    | DependencyStatus::Ambiguous
+                    | DependencyStatus::Circular
+                    | DependencyStatus::MaxDepth
             )
         })
     }
 
     pub fn required_dependencies_to_install(&self) -> Vec<&DependencyPlanEntry> {
-        self.required_dependencies
+        self.install_items
             .iter()
-            .filter(|dependency| {
-                dependency.status == DependencyStatus::WillInstall
-                    && dependency.remote_uid.is_some()
+            .filter(|item| item.role == DependencyInstallRole::RequiredDependency)
+            .filter_map(|item| {
+                let remote_uid = item.remote_uid.as_deref()?;
+                self.required_dependencies.iter().find(|dependency| {
+                    dependency.status == DependencyStatus::WillInstall
+                        && dependency.remote_uid.as_deref() == Some(remote_uid)
+                })
             })
             .collect()
+    }
+
+    pub fn required_remote_manifests_to_fetch(
+        &self,
+        remote_sources: &BTreeMap<String, DependencyManifestSource>,
+    ) -> Vec<String> {
+        self.graph
+            .required_remote_uids_missing_sources(remote_sources)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DependencyRemoteCandidate {
-    uid: String,
-    name: Option<String>,
-    version: Option<String>,
+pub(crate) struct DependencyRemoteCandidate {
+    pub(crate) uid: String,
+    pub(crate) name: Option<String>,
+    pub(crate) version: Option<String>,
     library_category: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DependencyResolution {
+pub(crate) enum DependencyResolution {
     Resolved(DependencyRemoteCandidate),
     Unresolved,
     Ambiguous,
@@ -130,6 +163,8 @@ pub enum DependencyAvailability {
     Missing,
     Unknown,
     Ambiguous,
+    Circular,
+    MaxDepth,
 }
 
 impl DependencyAvailability {
@@ -139,6 +174,8 @@ impl DependencyAvailability {
             Self::Missing => "missing",
             Self::Unknown => "unknown",
             Self::Ambiguous => "ambiguous",
+            Self::Circular => "circular",
+            Self::MaxDepth => "max-depth",
         }
     }
 }
@@ -149,6 +186,9 @@ pub struct DependencyStatusEntry {
     pub raw: String,
     pub constraint: Option<String>,
     pub required: bool,
+    pub relation: DependencyEdgeKind,
+    pub depth: usize,
+    pub parent: Option<String>,
     pub installed: bool,
     pub installed_folder: Option<String>,
     pub installed_title: Option<String>,
@@ -231,40 +271,16 @@ pub fn resolve_manifest_dependencies(
     remote_addons: Option<&[AddonSummary]>,
     installed_remotes: &[InstalledRemoteAddon],
 ) -> DependencyStatusReport {
-    let required_dependencies = collect_dependencies(required_values.iter(), true);
-    let required_names = required_dependencies
-        .iter()
-        .map(|dependency| normalize_key(&dependency.name))
-        .collect::<BTreeSet<_>>();
-    let optional_dependencies = collect_dependencies(optional_values.iter(), false)
-        .into_iter()
-        .filter(|dependency| !required_names.contains(&normalize_key(&dependency.name)))
-        .collect::<Vec<_>>();
-
-    DependencyStatusReport {
-        required_dependencies: required_dependencies
-            .into_iter()
-            .map(|dependency| {
-                resolve_manifest_dependency_status(
-                    dependency,
-                    installed_addons,
-                    remote_addons,
-                    installed_remotes,
-                )
-            })
-            .collect(),
-        optional_dependencies: optional_dependencies
-            .into_iter()
-            .map(|dependency| {
-                resolve_manifest_dependency_status(
-                    dependency,
-                    installed_addons,
-                    remote_addons,
-                    installed_remotes,
-                )
-            })
-            .collect(),
-    }
+    build_dependency_status_report_from_source(
+        RemoteAddonRef {
+            uid: "installed-addon".to_owned(),
+            name: Some("Selected addon".to_owned()),
+        },
+        &DependencyManifestSource::from_dependency_values(required_values, optional_values),
+        installed_addons,
+        remote_addons,
+        installed_remotes,
+    )
 }
 
 pub fn build_dependency_plan(
@@ -274,53 +290,107 @@ pub fn build_dependency_plan(
     remote_addons: &[AddonSummary],
     installed_remotes: &[InstalledRemoteAddon],
 ) -> DependencyPlan {
-    let required = collect_dependencies(
-        extracted
-            .detected_addons
-            .iter()
-            .filter(|addon| addon.valid_manifest)
-            .flat_map(|addon| addon.depends_on.iter()),
-        true,
-    );
-    let required_names = required
-        .iter()
-        .map(|dependency| normalize_key(&dependency.name))
-        .collect::<BTreeSet<_>>();
-    let optional = collect_dependencies(
-        extracted
-            .detected_addons
-            .iter()
-            .filter(|addon| addon.valid_manifest)
-            .flat_map(|addon| addon.optional_depends_on.iter()),
-        false,
+    build_dependency_plan_with_remote_sources(
+        main_addon,
+        &DependencyManifestSource::from_extracted(extracted),
+        installed_addons,
+        remote_addons,
+        installed_remotes,
+        &BTreeMap::new(),
+        DEFAULT_MAX_DEPENDENCY_DEPTH,
     )
-    .into_iter()
-    .filter(|dependency| !required_names.contains(&normalize_key(&dependency.name)))
-    .collect::<Vec<_>>();
+}
 
-    let mut install_items = Vec::new();
-    let required_dependencies = required
+pub fn build_dependency_plan_with_remote_sources(
+    main_addon: RemoteAddonRef,
+    main_source: &DependencyManifestSource,
+    installed_addons: &[LocalAddon],
+    remote_addons: &[AddonSummary],
+    installed_remotes: &[InstalledRemoteAddon],
+    remote_sources: &BTreeMap<String, DependencyManifestSource>,
+    max_depth: usize,
+) -> DependencyPlan {
+    let graph = build_dependency_graph(
+        &main_addon,
+        main_source,
+        installed_addons,
+        remote_addons,
+        installed_remotes,
+        remote_sources,
+        DependencyGraphOptions { max_depth },
+    );
+    dependency_plan_from_graph(main_addon, graph)
+}
+
+pub fn build_dependency_status_report_from_source(
+    main_addon: RemoteAddonRef,
+    main_source: &DependencyManifestSource,
+    installed_addons: &[LocalAddon],
+    remote_addons: Option<&[AddonSummary]>,
+    installed_remotes: &[InstalledRemoteAddon],
+) -> DependencyStatusReport {
+    let remote_lookup_unavailable = remote_addons.is_none();
+    let remote_addons = remote_addons.unwrap_or(&[]);
+    let graph = build_dependency_graph(
+        &main_addon,
+        main_source,
+        installed_addons,
+        remote_addons,
+        installed_remotes,
+        &BTreeMap::new(),
+        DependencyGraphOptions {
+            max_depth: DEFAULT_MAX_DEPENDENCY_DEPTH,
+        },
+    );
+
+    let required_dependencies = graph
+        .nodes
+        .iter()
+        .filter(|node| node.required)
+        .map(|node| dependency_status_entry_from_node(node, remote_lookup_unavailable))
+        .collect();
+    let optional_dependencies = graph
+        .nodes
+        .iter()
+        .filter(|node| !node.required)
+        .map(|node| dependency_status_entry_from_node(node, remote_lookup_unavailable))
+        .collect();
+
+    DependencyStatusReport {
+        required_dependencies,
+        optional_dependencies,
+    }
+}
+
+fn dependency_plan_from_graph(
+    main_addon: RemoteAddonRef,
+    graph: DependencyGraph,
+) -> DependencyPlan {
+    let required_dependencies = graph
+        .nodes
+        .iter()
+        .filter(|node| node.required)
+        .map(dependency_plan_entry_from_node)
+        .collect::<Vec<_>>();
+    let optional_dependencies = graph
+        .nodes
+        .iter()
+        .filter(|node| !node.required)
+        .map(dependency_plan_entry_from_node)
+        .collect::<Vec<_>>();
+    let mut install_items = graph
+        .required_install_order()
         .into_iter()
-        .map(|dependency| {
-            let entry = plan_required_dependency(
-                dependency,
-                extracted,
-                installed_addons,
-                remote_addons,
-                installed_remotes,
-            );
-            if entry.status == DependencyStatus::WillInstall && entry.remote_uid.is_some() {
-                install_items.push(DependencyInstallItem {
-                    role: DependencyInstallRole::RequiredDependency,
-                    name: entry.name.clone(),
-                    remote_uid: entry.remote_uid.clone(),
-                    remote_name: entry.remote_name.clone(),
-                });
-            }
-            entry
+        .map(|node| DependencyInstallItem {
+            role: DependencyInstallRole::RequiredDependency,
+            name: node
+                .remote_name
+                .clone()
+                .unwrap_or_else(|| node.name.clone()),
+            remote_uid: node.remote_uid.clone(),
+            remote_name: node.remote_name.clone(),
         })
         .collect::<Vec<_>>();
-
     install_items.push(DependencyInstallItem {
         role: DependencyInstallRole::MainAddon,
         name: main_addon
@@ -330,168 +400,88 @@ pub fn build_dependency_plan(
         remote_uid: Some(main_addon.uid.clone()),
         remote_name: main_addon.name.clone(),
     });
-
-    let optional_dependencies = optional
-        .into_iter()
-        .map(|dependency| {
-            plan_optional_dependency(
-                dependency,
-                installed_addons,
-                remote_addons,
-                installed_remotes,
-            )
-        })
-        .collect();
+    let install_order = install_items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
 
     DependencyPlan {
         main_addon,
         required_dependencies,
         optional_dependencies,
         install_items,
+        install_order,
+        graph,
     }
 }
 
-fn plan_required_dependency(
-    dependency: ManifestDependency,
-    extracted: &ExtractedZip,
-    installed_addons: &[LocalAddon],
-    remote_addons: &[AddonSummary],
-    installed_remotes: &[InstalledRemoteAddon],
-) -> DependencyPlanEntry {
-    if let Some(folder) = find_matching_local_addon(&dependency.name, installed_addons) {
-        return entry(
-            dependency,
-            DependencyStatus::AlreadyInstalled,
-            None,
-            None,
-            Some(folder),
-            None,
-        );
-    }
-
-    if let Some(folder) = find_matching_local_addon(&dependency.name, &extracted.detected_addons) {
-        return entry(
-            dependency,
-            DependencyStatus::WillInstall,
-            None,
-            Some("Bundled in package".to_owned()),
-            None,
-            Some(folder),
-        );
-    }
-
-    match resolve_dependency(&dependency.name, remote_addons) {
-        DependencyResolution::Resolved(remote) => {
-            if let Some(folder) = find_installed_remote(&remote.uid, installed_remotes) {
-                entry(
-                    dependency,
-                    DependencyStatus::AlreadyInstalled,
-                    Some(remote.uid),
-                    remote.name,
-                    Some(folder),
-                    None,
-                )
-            } else {
-                entry(
-                    dependency,
-                    DependencyStatus::WillInstall,
-                    Some(remote.uid),
-                    remote.name,
-                    None,
-                    None,
-                )
-            }
-        }
-        DependencyResolution::Ambiguous => entry(
-            dependency,
-            DependencyStatus::Ambiguous,
-            None,
-            None,
-            None,
-            None,
-        ),
-        DependencyResolution::Unresolved => entry(
-            dependency,
-            DependencyStatus::Unresolved,
-            None,
-            None,
-            None,
-            None,
-        ),
-    }
-}
-
-fn plan_optional_dependency(
-    dependency: ManifestDependency,
-    installed_addons: &[LocalAddon],
-    remote_addons: &[AddonSummary],
-    installed_remotes: &[InstalledRemoteAddon],
-) -> DependencyPlanEntry {
-    if let Some(folder) = find_matching_local_addon(&dependency.name, installed_addons) {
-        return entry(
-            dependency,
-            DependencyStatus::AlreadyInstalled,
-            None,
-            None,
-            Some(folder),
-            None,
-        );
-    }
-
-    match resolve_dependency(&dependency.name, remote_addons) {
-        DependencyResolution::Resolved(remote) => {
-            if let Some(folder) = find_installed_remote(&remote.uid, installed_remotes) {
-                entry(
-                    dependency,
-                    DependencyStatus::AlreadyInstalled,
-                    Some(remote.uid),
-                    remote.name,
-                    Some(folder),
-                    None,
-                )
-            } else {
-                entry(
-                    dependency,
-                    DependencyStatus::NotInstalled,
-                    Some(remote.uid),
-                    remote.name,
-                    None,
-                    None,
-                )
-            }
-        }
-        DependencyResolution::Ambiguous | DependencyResolution::Unresolved => entry(
-            dependency,
-            DependencyStatus::Unresolved,
-            None,
-            None,
-            None,
-            None,
-        ),
-    }
-}
-
-fn entry(
-    dependency: ManifestDependency,
-    status: DependencyStatus,
-    remote_uid: Option<String>,
-    remote_name: Option<String>,
-    installed_folder: Option<String>,
-    bundled_folder: Option<String>,
-) -> DependencyPlanEntry {
+fn dependency_plan_entry_from_node(node: &DependencyNode) -> DependencyPlanEntry {
     DependencyPlanEntry {
-        name: dependency.name,
-        constraint: dependency.constraint,
-        raw: dependency.raw,
-        status,
-        remote_uid,
-        remote_name,
-        installed_folder,
-        bundled_folder,
+        name: node.name.clone(),
+        constraint: node.constraint.clone(),
+        raw: node.raw.clone(),
+        required: node.required,
+        relation: node.relation,
+        depth: node.depth,
+        parent: node.parent.clone(),
+        status: dependency_status_from_graph_status(node.status),
+        remote_uid: node.remote_uid.clone(),
+        remote_name: node.remote_name.clone(),
+        remote_version: node.remote_version.clone(),
+        installed_folder: node.installed_folder.clone(),
+        installed_title: node.installed_title.clone(),
+        installed_version: node.installed_version.clone(),
+        bundled_folder: node.bundled_folder.clone(),
     }
 }
 
-fn collect_dependencies<'a>(
+fn dependency_status_from_graph_status(status: DependencyResolutionStatus) -> DependencyStatus {
+    match status {
+        DependencyResolutionStatus::Installed => DependencyStatus::AlreadyInstalled,
+        DependencyResolutionStatus::Missing => DependencyStatus::NotInstalled,
+        DependencyResolutionStatus::WillInstall => DependencyStatus::WillInstall,
+        DependencyResolutionStatus::Unresolved => DependencyStatus::Unresolved,
+        DependencyResolutionStatus::Ambiguous => DependencyStatus::Ambiguous,
+        DependencyResolutionStatus::Circular => DependencyStatus::Circular,
+        DependencyResolutionStatus::MaxDepth => DependencyStatus::MaxDepth,
+    }
+}
+
+fn dependency_status_entry_from_node(
+    node: &DependencyNode,
+    remote_lookup_unavailable: bool,
+) -> DependencyStatusEntry {
+    let status = match node.status {
+        DependencyResolutionStatus::Installed => DependencyAvailability::Installed,
+        DependencyResolutionStatus::Ambiguous => DependencyAvailability::Ambiguous,
+        DependencyResolutionStatus::Circular => DependencyAvailability::Circular,
+        DependencyResolutionStatus::MaxDepth => DependencyAvailability::MaxDepth,
+        _ if remote_lookup_unavailable && node.remote_uid.is_none() => {
+            DependencyAvailability::Unknown
+        }
+        _ => DependencyAvailability::Missing,
+    };
+
+    DependencyStatusEntry {
+        name: node.name.clone(),
+        raw: node.raw.clone(),
+        constraint: node.constraint.clone(),
+        required: node.required,
+        relation: node.relation,
+        depth: node.depth,
+        parent: node.parent.clone(),
+        installed: status == DependencyAvailability::Installed,
+        installed_folder: node.installed_folder.clone(),
+        installed_title: node.installed_title.clone(),
+        installed_version: node.installed_version.clone(),
+        remote_uid: node.remote_uid.clone(),
+        remote_name: node.remote_name.clone(),
+        remote_version: node.remote_version.clone(),
+        status,
+    }
+}
+
+pub(crate) fn collect_dependencies<'a>(
     raw_values: impl Iterator<Item = &'a String>,
     required: bool,
 ) -> Vec<ManifestDependency> {
@@ -509,80 +499,10 @@ fn collect_dependencies<'a>(
     dependencies
 }
 
-fn resolve_manifest_dependency_status(
-    dependency: ManifestDependency,
-    installed_addons: &[LocalAddon],
-    remote_addons: Option<&[AddonSummary]>,
-    installed_remotes: &[InstalledRemoteAddon],
-) -> DependencyStatusEntry {
-    if let Some(local) = find_matching_local_addon_details(&dependency.name, installed_addons) {
-        let remote = remote_for_installed_addon(local, remote_addons, installed_remotes);
-        return dependency_status_entry(
-            dependency,
-            DependencyAvailability::Installed,
-            Some(local),
-            remote,
-        );
-    }
-
-    let Some(remote_addons) = remote_addons else {
-        return dependency_status_entry(dependency, DependencyAvailability::Unknown, None, None);
-    };
-
-    match resolve_dependency_exact(&dependency.name, remote_addons)
-        .unwrap_or(DependencyResolution::Unresolved)
-    {
-        DependencyResolution::Resolved(remote) => {
-            if let Some(local) =
-                find_installed_remote_addon(&remote.uid, installed_remotes, installed_addons)
-            {
-                dependency_status_entry(
-                    dependency,
-                    DependencyAvailability::Installed,
-                    Some(local),
-                    Some(remote),
-                )
-            } else {
-                dependency_status_entry(
-                    dependency,
-                    DependencyAvailability::Missing,
-                    None,
-                    Some(remote),
-                )
-            }
-        }
-        DependencyResolution::Ambiguous => {
-            dependency_status_entry(dependency, DependencyAvailability::Ambiguous, None, None)
-        }
-        DependencyResolution::Unresolved => {
-            dependency_status_entry(dependency, DependencyAvailability::Missing, None, None)
-        }
-    }
-}
-
-fn dependency_status_entry(
-    dependency: ManifestDependency,
-    status: DependencyAvailability,
-    installed: Option<&LocalAddon>,
-    remote: Option<DependencyRemoteCandidate>,
-) -> DependencyStatusEntry {
-    DependencyStatusEntry {
-        name: dependency.name,
-        raw: dependency.raw,
-        constraint: dependency.constraint,
-        required: dependency.required,
-        installed: status == DependencyAvailability::Installed,
-        installed_folder: installed.map(|addon| addon.folder_name.clone()),
-        installed_title: installed.and_then(|addon| addon.title.clone()),
-        installed_version: installed.and_then(local_addon_display_version),
-        remote_uid: remote.as_ref().map(|remote| remote.uid.clone()),
-        remote_name: remote.as_ref().and_then(|remote| remote.name.clone()),
-        remote_version: remote.and_then(|remote| remote.version),
-        status,
-    }
-}
-
-fn resolve_dependency(name: &str, remote_addons: &[AddonSummary]) -> DependencyResolution {
+pub(crate) fn resolve_dependency(
+    name: &str,
+    remote_addons: &[AddonSummary],
+) -> DependencyResolution {
     resolve_dependency_exact(name, remote_addons)
         .or_else(|| {
             let normalized = normalize_identity(name);
@@ -675,11 +595,7 @@ fn choose_candidate(candidates: Vec<DependencyRemoteCandidate>) -> Option<Depend
     }
 }
 
-fn find_matching_local_addon(name: &str, addons: &[LocalAddon]) -> Option<String> {
-    find_matching_local_addon_details(name, addons).map(|addon| addon.folder_name.clone())
-}
-
-fn find_matching_local_addon_details<'a>(
+pub(crate) fn find_matching_local_addon_details<'a>(
     name: &str,
     addons: &'a [LocalAddon],
 ) -> Option<&'a LocalAddon> {
@@ -692,14 +608,7 @@ fn find_matching_local_addon_details<'a>(
     })
 }
 
-fn find_installed_remote(uid: &str, installed_remotes: &[InstalledRemoteAddon]) -> Option<String> {
-    installed_remotes
-        .iter()
-        .find(|installed| installed.remote_uid == uid)
-        .map(|installed| installed.folder_name.clone())
-}
-
-fn find_installed_remote_addon<'a>(
+pub(crate) fn find_installed_remote_addon<'a>(
     uid: &str,
     installed_remotes: &[InstalledRemoteAddon],
     installed_addons: &'a [LocalAddon],
@@ -714,7 +623,7 @@ fn find_installed_remote_addon<'a>(
     })
 }
 
-fn remote_for_installed_addon(
+pub(crate) fn remote_for_installed_addon(
     addon: &LocalAddon,
     remote_addons: Option<&[AddonSummary]>,
     installed_remotes: &[InstalledRemoteAddon],
@@ -735,7 +644,7 @@ fn remote_for_installed_addon(
         .and_then(remote_candidate)
 }
 
-fn local_addon_display_version(addon: &LocalAddon) -> Option<String> {
+pub(crate) fn local_addon_display_version(addon: &LocalAddon) -> Option<String> {
     addon
         .addon_version
         .clone()
@@ -803,7 +712,7 @@ fn exact_ci(value: Option<&str>, expected: &str) -> bool {
     value.is_some_and(|value| value.trim().eq_ignore_ascii_case(expected.trim()))
 }
 
-fn normalize_key(value: &str) -> String {
+pub(crate) fn normalize_key(value: &str) -> String {
     value.trim().to_lowercase()
 }
 
@@ -831,9 +740,12 @@ mod tests {
 
     use crate::api::models::AddonSummary;
     use crate::install::dependencies::{
-        build_dependency_plan, parse_dependency_values, parse_optional_dependency_values,
-        resolve_manifest_dependencies, DependencyAvailability, DependencyInstallRole,
-        DependencyStatus, InstalledRemoteAddon, RemoteAddonRef,
+        build_dependency_plan, build_dependency_plan_with_remote_sources, parse_dependency_values,
+        parse_optional_dependency_values, resolve_manifest_dependencies, DependencyAvailability,
+        DependencyInstallRole, DependencyStatus, InstalledRemoteAddon, RemoteAddonRef,
+    };
+    use crate::install::dependency_graph::{
+        DependencyManifestSource, DEFAULT_MAX_DEPENDENCY_DEPTH,
     };
     use crate::install::zip_safety::{ExtractedZip, ZipInspection};
     use crate::local::LocalAddon;
@@ -900,6 +812,27 @@ mod tests {
             uid: "main".to_owned(),
             name: Some("Main Addon".to_owned()),
         }
+    }
+
+    fn source(addons: Vec<LocalAddon>) -> DependencyManifestSource {
+        DependencyManifestSource::from_addons(addons)
+    }
+
+    fn recursive_plan(
+        main_addon: LocalAddon,
+        remote_addons: &[AddonSummary],
+        remote_sources: BTreeMap<String, DependencyManifestSource>,
+        max_depth: usize,
+    ) -> crate::install::dependencies::DependencyPlan {
+        build_dependency_plan_with_remote_sources(
+            main_ref(),
+            &source(vec![main_addon]),
+            &[],
+            remote_addons,
+            &[],
+            &remote_sources,
+            max_depth,
+        )
     }
 
     #[test]
@@ -1217,5 +1150,292 @@ mod tests {
             DependencyStatus::Unresolved
         );
         assert!(plan.has_unresolved_required_dependencies());
+    }
+
+    #[test]
+    fn transitive_required_dependency_is_resolved() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibB"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        let lib_b = plan
+            .required_dependencies
+            .iter()
+            .find(|dependency| dependency.name == "LibB")
+            .expect("LibB dependency");
+        assert_eq!(lib_b.status, DependencyStatus::WillInstall);
+        assert_eq!(lib_b.depth, 2);
+        assert_eq!(lib_b.parent.as_deref(), Some("LibA"));
+    }
+
+    #[test]
+    fn install_order_is_deepest_dependency_first() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibB"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert_eq!(plan.install_order, vec!["LibB", "LibA", "Main Addon"]);
+        assert_eq!(
+            plan.required_dependencies_to_install()
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["LibB", "LibA"]
+        );
+    }
+
+    #[test]
+    fn optional_dependency_of_required_dependency_is_not_auto_installed() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &[], &["LibOptional"])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("opt", "LibOptional", &["LibOptional"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert_eq!(
+            plan.optional_dependencies[0].status,
+            DependencyStatus::NotInstalled
+        );
+        assert_eq!(
+            plan.install_order,
+            vec!["LibA".to_owned(), "Main Addon".to_owned()]
+        );
+    }
+
+    #[test]
+    fn required_dependency_of_required_dependency_is_auto_installed() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibB"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert_eq!(
+            plan.required_dependencies_to_install()
+                .iter()
+                .map(|dependency| dependency.remote_uid.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("b"), Some("a")]
+        );
+    }
+
+    #[test]
+    fn circular_dependency_is_detected_and_stops_branch() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibB"], &[])]),
+        );
+        remote_sources.insert(
+            "b".to_owned(),
+            source(vec![local("LibB", Some("LibB"), &["LibA"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert!(plan
+            .required_dependencies
+            .iter()
+            .any(|dependency| dependency.status == DependencyStatus::Circular));
+        assert!(plan.has_unresolved_required_dependencies());
+    }
+
+    #[test]
+    fn max_depth_is_enforced() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibB"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+            ],
+            remote_sources,
+            1,
+        );
+
+        assert!(plan
+            .required_dependencies
+            .iter()
+            .any(|dependency| dependency.name == "LibB"
+                && dependency.status == DependencyStatus::MaxDepth));
+        assert!(plan.has_unresolved_required_dependencies());
+    }
+
+    #[test]
+    fn transitive_ambiguous_dependency_blocks_auto_install() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibShared"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("one", "LibShared", &["LibShared"]),
+                remote("two", "LibShared", &["Other"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert!(plan
+            .required_dependencies
+            .iter()
+            .any(|dependency| dependency.name == "LibShared"
+                && dependency.status == DependencyStatus::Ambiguous));
+        assert!(plan.has_unresolved_required_dependencies());
+    }
+
+    #[test]
+    fn transitive_unresolved_dependency_blocks_auto_install() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["MissingLib"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA"], &[]),
+            &[remote("a", "LibA", &["LibA"])],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert!(plan
+            .required_dependencies
+            .iter()
+            .any(|dependency| dependency.name == "MissingLib"
+                && dependency.status == DependencyStatus::Unresolved));
+        assert!(plan.has_unresolved_required_dependencies());
+    }
+
+    #[test]
+    fn already_installed_transitive_dependency_is_not_reinstalled() {
+        let plan = build_dependency_plan_with_remote_sources(
+            main_ref(),
+            &source(vec![local("MainAddon", Some("Main"), &["LibA"], &[])]),
+            &[local("LibA", Some("LibA"), &["LibB"], &[])],
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+            ],
+            &[],
+            &BTreeMap::new(),
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert_eq!(
+            plan.required_dependencies
+                .iter()
+                .find(|dependency| dependency.name == "LibA")
+                .map(|dependency| &dependency.status),
+            Some(&DependencyStatus::AlreadyInstalled)
+        );
+        assert_eq!(
+            plan.required_dependencies_to_install()
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["LibB"]
+        );
+    }
+
+    #[test]
+    fn dependency_graph_does_not_duplicate_shared_dependencies() {
+        let mut remote_sources = BTreeMap::new();
+        remote_sources.insert(
+            "a".to_owned(),
+            source(vec![local("LibA", Some("LibA"), &["LibC"], &[])]),
+        );
+        remote_sources.insert(
+            "b".to_owned(),
+            source(vec![local("LibB", Some("LibB"), &["LibC"], &[])]),
+        );
+
+        let plan = recursive_plan(
+            local("MainAddon", Some("Main"), &["LibA LibB"], &[]),
+            &[
+                remote("a", "LibA", &["LibA"]),
+                remote("b", "LibB", &["LibB"]),
+                remote("c", "LibC", &["LibC"]),
+            ],
+            remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+
+        assert_eq!(
+            plan.required_dependencies
+                .iter()
+                .filter(|dependency| dependency.name == "LibC")
+                .count(),
+            1
+        );
+        assert_eq!(
+            plan.graph
+                .edges
+                .iter()
+                .filter(|edge| edge.child_name == "LibC")
+                .count(),
+            2
+        );
     }
 }

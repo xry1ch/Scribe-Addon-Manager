@@ -998,7 +998,7 @@ function renderPreviewDependencySection(
 function renderInstalledDependencyCard(dependency: AddonDependencyStatus) {
   const action = renderInstalledDependencyAction(dependency);
   return `
-    <article class="dependency-card ${dependencyAvailabilityClass(dependency)}">
+    <article class="dependency-card ${dependencyAvailabilityClass(dependency)}" style="--dependency-depth: ${dependencyDepthOffset(dependency)}">
       <span class="dependency-status-icon" aria-hidden="true">${dependencyAvailabilityIcon(dependency)}</span>
       <div class="dependency-card-main">
         <div class="dependency-card-title">
@@ -1014,7 +1014,7 @@ function renderInstalledDependencyCard(dependency: AddonDependencyStatus) {
 
 function renderPreviewDependencyCard(dependency: DependencyPlan["required_dependencies"][number], required: boolean) {
   return `
-    <article class="dependency-card ${previewDependencyClass(dependency, required)}">
+    <article class="dependency-card ${previewDependencyClass(dependency, required)}" style="--dependency-depth: ${dependencyDepthOffset(dependency)}">
       <span class="dependency-status-icon" aria-hidden="true">${previewDependencyIcon(dependency, required)}</span>
       <div class="dependency-card-main">
         <div class="dependency-card-title">
@@ -1031,13 +1031,23 @@ function renderInstalledDependencyLines(dependency: AddonDependencyStatus) {
   const installedName = plainEsoText(dependency.installed_title ?? dependency.installed_folder ?? dependency.name);
   const remoteName = plainEsoText(dependency.remote_name ?? dependency.name);
   const lines = [
+    dependencyLine(dependencyRelationText(dependency)),
     dependency.constraint ? dependencyLine(`Requires ${dependency.constraint}`) : "",
     dependency.installed ? dependencyLine(compactDependencySummary("Installed", installedName, formatInstalledDependencyVersion(dependency.installed_version))) : "",
     dependency.remote_uid || dependency.remote_name ? dependencyLine(compactDependencySummary("Remote", remoteName, dependency.remote_version)) : "",
   ].filter(Boolean);
 
-  if (lines.length === 0) {
-    const fallback = dependency.status === "ambiguous" ? "Multiple remote matches" : dependency.status === "unknown" ? "Remote lookup unavailable" : "No remote match";
+  if (lines.length === 1) {
+    const fallback =
+      dependency.status === "ambiguous"
+        ? "Multiple remote matches"
+        : dependency.status === "circular"
+          ? "Circular dependency"
+          : dependency.status === "max-depth"
+            ? "Max depth reached"
+            : dependency.status === "unknown"
+              ? "Remote lookup unavailable"
+              : "No remote match";
     lines.push(dependencyLine(fallback));
   }
 
@@ -1046,13 +1056,14 @@ function renderInstalledDependencyLines(dependency: AddonDependencyStatus) {
 
 function renderPreviewDependencyLines(dependency: DependencyPlan["required_dependencies"][number]) {
   const lines = [
+    dependencyLine(dependencyRelationText(dependency)),
     dependency.constraint ? dependencyLine(`Requires ${dependency.constraint}`) : "",
-    dependency.installed_folder ? dependencyLine(compactDependencySummary("Installed", dependency.installed_folder, null)) : "",
-    dependency.remote_name ? dependencyLine(compactDependencySummary("Remote", dependency.remote_name, null)) : "",
+    dependency.installed_folder ? dependencyLine(compactDependencySummary("Installed", dependency.installed_title ?? dependency.installed_folder, dependency.installed_version)) : "",
+    dependency.remote_name ? dependencyLine(compactDependencySummary("Remote", dependency.remote_name, dependency.remote_version)) : "",
     dependency.bundled_folder ? dependencyLine(compactDependencySummary("Bundled", dependency.bundled_folder, null)) : "",
   ].filter(Boolean);
 
-  if (lines.length === 0) {
+  if (lines.length === 1) {
     lines.push(dependencyLine(dependencyDetailText(dependency)));
   }
 
@@ -1067,6 +1078,19 @@ function dependencyLine(value: string) {
 
 function compactDependencySummary(label: string, name: string, version: string | null | undefined) {
   return `${label}: ${name}${version ? ` · ${version}` : ""}`;
+}
+
+function dependencyDepthOffset(dependency: { depth?: number }) {
+  return Math.max(0, (dependency.depth ?? 1) - 1);
+}
+
+function dependencyRelationText(dependency: { relation?: string; parent?: string | null; depth?: number; required?: boolean }) {
+  const relation = dependency.relation === "optional" || dependency.required === false ? "Optional" : "Required";
+  const parent = dependency.parent?.trim();
+  if (parent && (dependency.depth ?? 1) > 1) {
+    return `${relation === "Optional" ? "Optional for" : "Required by"} ${plainEsoText(parent)}`;
+  }
+  return relation;
 }
 
 function formatInstalledDependencyVersion(version: string | null) {
@@ -1092,6 +1116,8 @@ function dependencyAvailabilityText(dependency: AddonDependencyStatus) {
   if (dependency.status === "installed") return "Installed";
   if (dependency.status === "missing") return "Missing";
   if (dependency.status === "ambiguous") return "Ambiguous";
+  if (dependency.status === "circular") return "Circular";
+  if (dependency.status === "max-depth") return "Max depth";
   return "Unknown";
 }
 
@@ -1099,20 +1125,21 @@ function dependencyAvailabilityClass(dependency: AddonDependencyStatus) {
   if (dependency.status === "installed") return "is-installed";
   if (dependency.status === "missing" && dependency.required) return "is-required-missing";
   if (dependency.status === "missing") return "is-optional-missing";
-  if (dependency.status === "ambiguous") return "is-ambiguous";
+  if (dependency.status === "ambiguous" || dependency.status === "circular" || dependency.status === "max-depth") return "is-ambiguous";
   return "is-unknown";
 }
 
 function dependencyAvailabilityIcon(dependency: AddonDependencyStatus) {
   if (dependency.status === "installed") return resultCheckIcon();
   if (dependency.status === "missing") return resultWarningIcon();
+  if (dependency.status === "ambiguous" || dependency.status === "circular" || dependency.status === "max-depth") return resultWarningIcon();
   return neutralDependencyIcon();
 }
 
 function previewDependencyClass(dependency: DependencyPlan["required_dependencies"][number], required: boolean) {
   if (dependency.status === "already-installed") return "is-installed";
   if (dependency.status === "will-install") return "is-planned";
-  if (dependency.status === "ambiguous") return "is-ambiguous";
+  if (dependency.status === "ambiguous" || dependency.status === "circular" || dependency.status === "max-depth") return "is-ambiguous";
   if (dependency.status === "unresolved" || dependency.status === "not-installed") {
     return required ? "is-required-missing" : "is-optional-missing";
   }
@@ -1122,7 +1149,7 @@ function previewDependencyClass(dependency: DependencyPlan["required_dependencie
 function previewDependencyIcon(dependency: DependencyPlan["required_dependencies"][number], required: boolean) {
   if (dependency.status === "already-installed") return resultCheckIcon();
   if (dependency.status === "will-install") return neutralDependencyIcon();
-  if (dependency.status === "ambiguous" || dependency.status === "unresolved" || (required && dependency.status === "not-installed")) {
+  if (dependency.status === "ambiguous" || dependency.status === "circular" || dependency.status === "max-depth" || dependency.status === "unresolved" || (required && dependency.status === "not-installed")) {
     return resultWarningIcon();
   }
   return neutralDependencyIcon();
@@ -1173,6 +1200,7 @@ function renderInstallUpdateFooterAction() {
   if (!state.selectedLocal && addonId) {
     if (state.installPlan && !state.installResult) {
       if (isSafeNewInstallPlan(state.installPlan) || !hasInstallablePlanItems(state.installPlan)) return "";
+      if (hasRequiredDependencyIssues(state.installPlan.dependency_plan)) return "";
       return `<button class="danger" id="confirm-install" ${disabledAttr()}>${loadingButtonContent("Confirm Install", "Installing...", "install-apply")}</button>`;
     }
     if (!state.installResult) {
@@ -1185,6 +1213,7 @@ function renderInstallUpdateFooterAction() {
   const target = match.local.folder_name;
   const matchingPlan = state.singleUpdatePlan?.target.toLowerCase() === target.toLowerCase() ? state.singleUpdatePlan : null;
   if (matchingPlan?.should_install) {
+    if (hasRequiredDependencyIssues(matchingPlan.dependency_plan)) return "";
     const label = matchingPlan.decision === "forced-reinstall" ? "Reinstall" : "Update";
     return `<button class="danger" id="confirm-update" ${disabledAttr()}>${loadingButtonContent(`Confirm ${label}`, "Updating...", "update-apply", target)}</button>`;
   }
@@ -1390,7 +1419,7 @@ function renderInstallPlan() {
       ? "warning"
       : "info";
   const bannerText = requiredDependencyIssues
-    ? "Some required dependencies could not be resolved. Confirm only if you want to install the main addon anyway."
+    ? "Some required dependencies could not be resolved safely. Install is blocked until those dependencies are resolved."
     : dependencyReplacementReview
       ? "Review required: installing required libraries may replace existing addon folders after creating backups."
       : requiresReplacementReview
@@ -1513,8 +1542,10 @@ function renderSingleUpdatePlan() {
   if (isOperation("update-plan")) return renderPlanSkeletonPanel("Single Update Preview");
   const plan = state.singleUpdatePlan;
   if (!plan) return "";
+  const dependencyIssues = hasRequiredDependencyIssues(plan.dependency_plan);
   return `
     <section class="panel">
+      ${dependencyIssues ? `<div class="banner warning">Some required dependencies could not be resolved safely. Update is blocked until those dependencies are resolved.</div>` : ""}
       <div class="panel-heading">
         <div>
           <h3>Single Update Preview</h3>
@@ -1750,7 +1781,7 @@ function renderDependencyPlan(plan: DependencyPlan | null) {
   return `
     <div class="dependency-section">
       <div class="dependency-heading">
-        <h4>Required libraries</h4>
+        <h4>Dependency tree</h4>
         <span>${requiredDependencySummary(plan)}</span>
       </div>
       ${
@@ -1766,8 +1797,15 @@ function renderDependencyPlan(plan: DependencyPlan | null) {
             </details>`
           : ""
       }
+      ${renderDependencyInstallOrder(plan)}
     </div>
   `;
+}
+
+function renderDependencyInstallOrder(plan: DependencyPlan) {
+  const order = plan.install_order?.filter(Boolean) ?? [];
+  if (order.length <= 1) return "";
+  return `<p class="dependency-install-order">Install order: ${escapeHtml(order.join(" → "))}</p>`;
 }
 
 function renderRequiredDependencyRow(dependency: DependencyPlan["required_dependencies"][number]) {
@@ -1780,17 +1818,19 @@ function renderOptionalDependencyRow(dependency: DependencyPlan["optional_depend
 
 function renderDependencyRow(dependency: DependencyPlan["required_dependencies"][number], status: string, detail: string) {
   const constraint = dependency.constraint ? ` ${dependency.constraint}` : "";
+  const relation = dependencyRelationText(dependency);
+  const detailText = detail ? `${relation} · ${detail}` : relation;
   return `
-    <div class="dependency-row ${dependencyStatusClass(dependency.status)}">
+    <div class="dependency-row ${dependencyStatusClass(dependency.status)}" style="--dependency-depth: ${dependencyDepthOffset(dependency)}">
       <strong>${escapeHtml(dependency.name)}${escapeHtml(constraint)}</strong>
       <span>${escapeHtml(status)}</span>
-      <span>${escapeHtml(detail)}</span>
+      <span>${escapeHtml(detailText)}</span>
     </div>
   `;
 }
 
 function requiredDependencySummary(plan: DependencyPlan) {
-  if (hasRequiredDependencyIssues(plan)) return "Needs confirmation";
+  if (hasRequiredDependencyIssues(plan)) return "Blocked";
   const willInstall = plan.required_dependencies.filter((dependency) => dependency.status === "will-install").length;
   const installed = plan.required_dependencies.filter((dependency) => dependency.status === "already-installed").length;
   if (willInstall > 0) return `${willInstall} will install`;
@@ -1804,6 +1844,8 @@ function dependencyStatusText(dependency: DependencyPlan["required_dependencies"
   if (dependency.status === "not-installed") return "Not installed";
   if (dependency.status === "ambiguous") return "Ambiguous";
   if (dependency.status === "unresolved") return "Unresolved";
+  if (dependency.status === "circular") return "Circular";
+  if (dependency.status === "max-depth") return "Max depth";
   return dependency.status;
 }
 
@@ -1811,6 +1853,10 @@ function optionalDependencyStatusText(dependency: DependencyPlan["optional_depen
   if (dependency.status === "already-installed") return "Already installed";
   if (dependency.status === "not-installed") return "Not installed";
   if (dependency.status === "unresolved") return "Not resolved";
+  if (dependency.status === "ambiguous") return "Ambiguous";
+  if (dependency.status === "will-install") return dependency.bundled_folder ? "Bundled" : "Will install";
+  if (dependency.status === "circular") return "Circular";
+  if (dependency.status === "max-depth") return "Max depth";
   return dependency.status;
 }
 
@@ -1819,6 +1865,8 @@ function dependencyDetailText(dependency: DependencyPlan["required_dependencies"
   if (dependency.bundled_folder) return dependency.bundled_folder;
   if (dependency.remote_name) return dependency.remote_name;
   if (dependency.status === "ambiguous") return "Multiple remote matches";
+  if (dependency.status === "circular") return "Circular dependency";
+  if (dependency.status === "max-depth") return "Max depth reached";
   if (dependency.status === "unresolved") return "No safe remote match";
   return "Not installed automatically";
 }
@@ -1826,7 +1874,7 @@ function dependencyDetailText(dependency: DependencyPlan["required_dependencies"
 function dependencyStatusClass(status: string) {
   if (status === "already-installed") return "is-installed";
   if (status === "will-install") return "is-planned";
-  if (status === "ambiguous" || status === "unresolved") return "is-warning";
+  if (status === "ambiguous" || status === "unresolved" || status === "circular" || status === "max-depth") return "is-warning";
   return "is-muted";
 }
 
@@ -1865,7 +1913,15 @@ function isSafeDependencyPlan(plan: DependencyPlan) {
 }
 
 function hasRequiredDependencyIssues(plan: DependencyPlan | null) {
-  return Boolean(plan?.required_dependencies.some((dependency) => dependency.status === "unresolved" || dependency.status === "ambiguous"));
+  return Boolean(
+    plan?.required_dependencies.some(
+      (dependency) =>
+        dependency.status === "unresolved" ||
+        dependency.status === "ambiguous" ||
+        dependency.status === "circular" ||
+        dependency.status === "max-depth",
+    ),
+  );
 }
 
 function hasDependencyReplacementItems(plan: DependencyPlan | null) {
@@ -1873,7 +1929,13 @@ function hasDependencyReplacementItems(plan: DependencyPlan | null) {
 }
 
 function installDependencyConfirmText(plan: DependencyPlan) {
-  const unresolved = plan.required_dependencies.filter((dependency) => dependency.status === "unresolved" || dependency.status === "ambiguous");
+  const unresolved = plan.required_dependencies.filter(
+    (dependency) =>
+      dependency.status === "unresolved" ||
+      dependency.status === "ambiguous" ||
+      dependency.status === "circular" ||
+      dependency.status === "max-depth",
+  );
   if (unresolved.length > 0) {
     return `Some required dependencies could not be resolved: ${unresolved.map((dependency) => dependency.name).join(", ")}.`;
   }
@@ -2578,6 +2640,11 @@ function confirmInstall() {
     render();
     return;
   }
+  if (hasRequiredDependencyIssues(plan.dependency_plan)) {
+    state.error = "Some required dependencies could not be resolved safely. Nothing was installed.";
+    render();
+    return;
+  }
   const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
     ? "Existing addon folders may be backed up and replaced."
     : "No existing addon folder replacement is currently expected.";
@@ -2612,6 +2679,9 @@ function installDependency(remoteUid: string) {
 
     if (!hasInstallablePlanItems(plan)) {
       throw new Error("No valid addon folders were found in this dependency package. Nothing was installed.");
+    }
+    if (hasRequiredDependencyIssues(plan.dependency_plan)) {
+      throw new Error("Some required dependencies could not be resolved safely. Nothing was installed.");
     }
 
     let result: InstallRemoteAddonResponse | null = null;
@@ -2682,6 +2752,11 @@ function planSingleUpdate(target: string) {
 function confirmUpdate() {
   const plan = state.singleUpdatePlan;
   if (!plan || !plan.should_install || !plan.plan) return;
+  if (hasRequiredDependencyIssues(plan.dependency_plan)) {
+    state.error = "Some required dependencies could not be resolved safely. Nothing was installed.";
+    render();
+    return;
+  }
   const backupText = plan.plan.items.some((item) => item.action === "would-replace-existing")
     ? "Existing addon folders may be backed up and replaced."
     : "No existing addon folder replacement is currently expected.";

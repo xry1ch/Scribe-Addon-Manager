@@ -196,10 +196,17 @@ export interface DependencyPlanEntry {
   name: string;
   constraint: string | null;
   raw: string;
+  required: boolean;
+  relation: "required" | "optional" | string;
+  depth: number;
+  parent: string | null;
   status: "already-installed" | "will-install" | "not-installed" | "unresolved" | "ambiguous" | string;
   remote_uid: string | null;
   remote_name: string | null;
+  remote_version: string | null;
   installed_folder: string | null;
+  installed_title: string | null;
+  installed_version: string | null;
   bundled_folder: string | null;
 }
 
@@ -219,6 +226,7 @@ export interface DependencyPlan {
   required_dependencies: DependencyPlanEntry[];
   optional_dependencies: DependencyPlanEntry[];
   install_items: DependencyInstallItem[];
+  install_order: string[];
 }
 
 export interface AddonDependencyStatus {
@@ -226,6 +234,9 @@ export interface AddonDependencyStatus {
   raw: string;
   constraint: string | null;
   required: boolean;
+  relation: "required" | "optional" | string;
+  depth: number;
+  parent: string | null;
   installed: boolean;
   installed_folder: string | null;
   installed_title: string | null;

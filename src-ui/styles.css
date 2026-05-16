@@ -1657,6 +1657,7 @@ input::placeholder {
   gap: 10px;
   align-items: center;
   min-width: 0;
+  margin-left: calc(var(--dependency-depth, 0) * 18px);
   padding: 10px 11px;
   background: rgba(15, 23, 42, 0.64);
   border: 1px solid var(--border);
@@ -1823,6 +1824,7 @@ input::placeholder {
   gap: 10px;
   align-items: center;
   min-height: 40px;
+  margin-left: calc(var(--dependency-depth, 0) * 18px);
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -1864,6 +1866,13 @@ input::placeholder {
 
 .dependency-optional .dependency-list {
   margin-top: 8px;
+}
+
+.dependency-install-order {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .empty-state {

@@ -5,6 +5,7 @@ use thiserror::Error;
 pub mod apply;
 pub mod backup;
 pub mod dependencies;
+pub mod dependency_graph;
 pub mod plan;
 pub mod remote;
 pub mod remove;

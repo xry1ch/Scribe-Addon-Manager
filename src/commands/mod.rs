@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -12,6 +13,7 @@ use crate::api::ApiClient;
 use crate::error::AppError;
 use crate::install::apply::{self, InstallResult};
 use crate::install::dependencies::{self, DependencyPlan, DependencyStatus, RemoteAddonRef};
+use crate::install::dependency_graph::{DependencyManifestSource, DEFAULT_MAX_DEPENDENCY_DEPTH};
 use crate::install::plan::{self, InstallPlan, InstallPlanAction};
 use crate::install::remote;
 use crate::install::update;
@@ -42,6 +44,8 @@ struct PreparedDependencyInstall {
     remote_uid: String,
     plan: InstallPlan,
 }
+
+const MAX_RECURSIVE_DEPENDENCY_PACKAGES: usize = 64;
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
@@ -1046,40 +1050,73 @@ async fn prepare_remote_install_plan(
         quiet,
     )
     .await?;
-    let dependency_plan = dependencies::build_dependency_plan(
-        RemoteAddonRef {
-            uid: addon_id.to_owned(),
-            name: details.name.clone(),
-        },
-        &extracted,
-        installed_addons,
-        &remote_addons,
-        &[],
-    );
+    let main_source = DependencyManifestSource::from_extracted(&extracted);
+    let main_addon = RemoteAddonRef {
+        uid: addon_id.to_owned(),
+        name: details.name.clone(),
+    };
+    let mut remote_sources = BTreeMap::new();
+    let mut prepared_dependency_packages = BTreeMap::new();
+    let dependency_plan = loop {
+        let dependency_plan = dependencies::build_dependency_plan_with_remote_sources(
+            main_addon.clone(),
+            &main_source,
+            installed_addons,
+            &remote_addons,
+            &[],
+            &remote_sources,
+            DEFAULT_MAX_DEPENDENCY_DEPTH,
+        );
+        let dependency_uids = dependency_plan.required_remote_manifests_to_fetch(&remote_sources);
+        if dependency_uids.is_empty() {
+            break dependency_plan;
+        }
+
+        if remote_sources.len() + dependency_uids.len() > MAX_RECURSIVE_DEPENDENCY_PACKAGES {
+            return Err(anyhow!(
+                "recursive dependency resolution exceeded {MAX_RECURSIVE_DEPENDENCY_PACKAGES} packages"
+            ));
+        }
+
+        for remote_uid in dependency_uids {
+            if remote_sources.contains_key(&remote_uid) {
+                continue;
+            }
+            let dependency_details = client.eso_file_details_fresh(&remote_uid).await?;
+            let (plan, dependency_extracted, _) = prepare_remote_package(
+                client,
+                &dependency_details,
+                &remote_uid,
+                addons_dir,
+                installed_addons,
+                keep_download,
+                download_dir,
+                quiet,
+            )
+            .await?;
+            remote_sources.insert(
+                remote_uid.clone(),
+                DependencyManifestSource::from_extracted(&dependency_extracted),
+            );
+            prepared_dependency_packages.insert(
+                remote_uid.clone(),
+                PreparedDependencyInstall {
+                    details: dependency_details,
+                    remote_uid,
+                    plan,
+                },
+            );
+        }
+    };
 
     let mut dependency_installs = Vec::new();
     for dependency in dependency_plan.required_dependencies_to_install() {
-        let remote_uid = dependency
-            .remote_uid
-            .as_deref()
-            .expect("required dependency to install has remote UID");
-        let dependency_details = client.eso_file_details_fresh(remote_uid).await?;
-        let (plan, _, _) = prepare_remote_package(
-            client,
-            &dependency_details,
-            remote_uid,
-            addons_dir,
-            installed_addons,
-            keep_download,
-            download_dir,
-            quiet,
-        )
-        .await?;
-        dependency_installs.push(PreparedDependencyInstall {
-            details: dependency_details,
-            remote_uid: remote_uid.to_owned(),
-            plan,
-        });
+        let Some(remote_uid) = dependency.remote_uid.as_deref() else {
+            continue;
+        };
+        if let Some(prepared) = prepared_dependency_packages.remove(remote_uid) {
+            dependency_installs.push(prepared);
+        }
     }
 
     Ok(PreparedRemoteInstall {
@@ -1148,6 +1185,15 @@ fn apply_prepared_install(
     prepared: &PreparedRemoteInstall,
     backup_dir: Option<&Path>,
 ) -> Result<InstallResult> {
+    if prepared
+        .dependency_plan
+        .has_unresolved_required_dependencies()
+    {
+        return Err(anyhow!(
+            "some required dependencies could not be resolved safely"
+        ));
+    }
+
     let mut aggregate = InstallResult::default();
 
     for dependency in &prepared.dependency_installs {
@@ -1349,6 +1395,7 @@ fn dependency_plan_json(prepared: &PreparedRemoteInstall) -> Value {
         "required_dependencies": prepared.dependency_plan.required_dependencies.iter().map(dependency_entry_json).collect::<Vec<_>>(),
         "optional_dependencies": prepared.dependency_plan.optional_dependencies.iter().map(dependency_entry_json).collect::<Vec<_>>(),
         "install_items": dependency_install_items_json(prepared),
+        "install_order": prepared.dependency_plan.install_order,
     })
 }
 
@@ -1357,10 +1404,17 @@ fn dependency_entry_json(entry: &dependencies::DependencyPlanEntry) -> Value {
         "name": entry.name,
         "constraint": entry.constraint,
         "raw": entry.raw,
+        "required": entry.required,
+        "relation": entry.relation.as_str(),
+        "depth": entry.depth,
+        "parent": entry.parent,
         "status": entry.status.as_str(),
         "remote_uid": entry.remote_uid,
         "remote_name": entry.remote_name,
+        "remote_version": entry.remote_version,
         "installed_folder": entry.installed_folder,
+        "installed_title": entry.installed_title,
+        "installed_version": entry.installed_version,
         "bundled_folder": entry.bundled_folder,
     })
 }
@@ -2055,8 +2109,10 @@ fn print_dependency_plan(plan: &DependencyPlan) {
         println!("  -");
     } else {
         for dependency in &plan.required_dependencies {
+            let indent = "  ".repeat(dependency.depth.saturating_sub(1));
             println!(
-                "  {:<28} {:<18} {}",
+                "  {}{:<28} {:<18} {}",
+                indent,
                 truncate(&dependency.name, 28),
                 dependency.status.as_str(),
                 dependency_detail(dependency)
@@ -2073,13 +2129,20 @@ fn print_dependency_plan(plan: &DependencyPlan) {
         println!();
         println!("Optional dependencies (not installed automatically):");
         for dependency in &plan.optional_dependencies {
+            let indent = "  ".repeat(dependency.depth.saturating_sub(1));
             println!(
-                "  {:<28} {:<18} {}",
+                "  {}{:<28} {:<18} {}",
+                indent,
                 truncate(&dependency.name, 28),
                 dependency.status.as_str(),
                 dependency_detail(dependency)
             );
         }
+    }
+
+    if plan.install_order.len() > 1 {
+        println!();
+        println!("Install order: {}", plan.install_order.join(" -> "));
     }
 }
 
@@ -2098,6 +2161,10 @@ fn dependency_detail(dependency: &dependencies::DependencyPlanEntry) -> String {
     }
     if dependency.status == DependencyStatus::Ambiguous {
         "multiple remote matches; not installed automatically".to_owned()
+    } else if dependency.status == DependencyStatus::Circular {
+        "circular dependency; not installed automatically".to_owned()
+    } else if dependency.status == DependencyStatus::MaxDepth {
+        "max dependency depth reached; not installed automatically".to_owned()
     } else {
         "no remote match; not installed automatically".to_owned()
     }
