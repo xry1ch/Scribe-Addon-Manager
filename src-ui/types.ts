@@ -112,6 +112,36 @@ export interface RemoteCandidate {
   thumbnail_urls: string[];
 }
 
+export interface RemoteMatchCandidate {
+  remote_uid: string;
+  remote_name: string | null;
+  remote_author: string | null;
+  remote_category: string | null;
+  remote_version: string | null;
+  remote_downloads: number | null;
+  remote_updated: number | null;
+  remote_updated_display: string | null;
+  remote_info_url: string | null;
+  score: number;
+  confidence: "very-high" | "high" | "medium" | "low";
+  reason: string;
+}
+
+export interface RemoteMatchCandidatesResponse {
+  local: LocalAddon;
+  candidates: RemoteMatchCandidate[];
+  message: string | null;
+}
+
+export interface LinkInstalledAddonToRemoteResponse {
+  addons_dir: string;
+  local_folder: string;
+  remote_uid: string;
+  remote_name: string | null;
+  confidence: string;
+  linked_at: string;
+}
+
 export interface MatchResult {
   local: LocalAddon & { folder_name: string };
   status: string;

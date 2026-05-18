@@ -1,4 +1,4 @@
-import type { AddonSummary, LocalAddon, MatchResult, PlannedAction, RemoteCategory, RemoteCandidate } from "./types";
+import type { AddonSummary, LocalAddon, MatchResult, RemoteCategory, RemoteCandidate } from "./types";
 
 const LIBRARIES_CATEGORY_ID = "53";
 
@@ -27,11 +27,11 @@ export function shouldShowSearchAddon(
 export function shouldShowInstalledAddon(
   item: InstalledLibraryFilterItem,
   hideLibraries: boolean,
-  actions: PlannedAction[],
+  isActionableUpdate: (item: InstalledLibraryFilterItem) => boolean,
 ) {
   if (!hideLibraries) return true;
   if (!isInstalledAddonLibrary(item)) return true;
-  return hasActionableUpdate(item.addon.folder_name, actions);
+  return isActionableUpdate(item);
 }
 
 export function isSearchResultLibrary(addon: AddonSummary) {
@@ -64,16 +64,6 @@ function isLibrariesCategorySelected(categoryId: string, categories: RemoteCateg
   if (isLibraryCategory(selected, null)) return true;
   const category = categories.find((item) => item.id === selected);
   return category ? isLibraryCategory(category.id, category.name) : false;
-}
-
-function hasActionableUpdate(folderName: string, actions: PlannedAction[]) {
-  const normalizedFolder = folderName.toLowerCase();
-  return actions.some(
-    (action) =>
-      action.local_folder.toLowerCase() === normalizedFolder &&
-      action.action === "would-update" &&
-      action.update_confidence === "reliable-update",
-  );
 }
 
 function exactAddonQueryMatches(addon: AddonSummary, query: string) {

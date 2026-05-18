@@ -21,6 +21,7 @@ pub const INSTALLED_BY_DEPENDENCY_INSTALL: &str = "dependency-install";
 pub const INSTALLED_BY_ZIP_INSTALL: &str = "zip-install";
 pub const INSTALLED_BY_IMPORTED_CURRENT: &str = "imported-current";
 pub const INSTALLED_BY_FIRST_RUN_IMPORT: &str = "first-run-import";
+pub const INSTALLED_BY_LINKED_EXISTING: &str = "linked-existing";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,11 +85,13 @@ pub struct InstalledAddonMetadata {
     pub md5: Option<String>,
     #[serde(alias = "installed_timestamp")]
     pub installed_at: String,
+    pub linked_at: Option<String>,
     #[serde(alias = "source")]
     pub installed_by: String,
     pub local_title: Option<String>,
     pub local_version: Option<String>,
     pub source_addon_uid: Option<String>,
+    pub match_confidence: Option<String>,
 }
 
 impl InstalledAddonMetadata {
@@ -104,9 +107,11 @@ impl InstalledAddonMetadata {
         self.remote_download_url = normalize_optional_string(self.remote_download_url.take());
         self.file_name = normalize_optional_string(self.file_name.take());
         self.md5 = normalize_optional_string(self.md5.take());
+        self.linked_at = normalize_optional_string(self.linked_at.take());
         self.local_title = normalize_optional_string(self.local_title.take());
         self.local_version = normalize_optional_string(self.local_version.take());
         self.source_addon_uid = normalize_optional_string(self.source_addon_uid.take());
+        self.match_confidence = normalize_optional_string(self.match_confidence.take());
 
         if self.installed_by.trim().is_empty() {
             self.installed_by = if self.remote_uid.is_some() {
@@ -309,6 +314,7 @@ fn remote_metadata_entry(
         ),
         md5: normalize_optional_string(remote_metadata.details.md5.clone()),
         installed_at: installed_at.to_owned(),
+        linked_at: None,
         installed_by: remote_metadata.installed_by.to_owned(),
         local_title: plan_item.and_then(|item| normalize_optional_string(item.title.clone())),
         local_version: plan_item.and_then(|item| normalize_optional_string(item.version.clone())),
@@ -316,6 +322,7 @@ fn remote_metadata_entry(
             .source_addon_uid
             .map(ToOwned::to_owned)
             .and_then(normalize_string),
+        match_confidence: None,
     }
 }
 
@@ -335,10 +342,12 @@ fn zip_metadata_entry(
         file_name: None,
         md5: None,
         installed_at: installed_at.to_owned(),
+        linked_at: None,
         installed_by: INSTALLED_BY_ZIP_INSTALL.to_owned(),
         local_title: plan_item.and_then(|item| normalize_optional_string(item.title.clone())),
         local_version: plan_item.and_then(|item| normalize_optional_string(item.version.clone())),
         source_addon_uid: None,
+        match_confidence: None,
     }
 }
 

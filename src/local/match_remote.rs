@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::api::models::AddonSummary;
 use crate::local::metadata::{InstalledAddonMetadata, InstalledMetadata};
 use crate::local::version::{compare_versions, VersionComparison};
@@ -58,6 +60,42 @@ pub struct MatchResult {
     pub debug_candidates: Vec<RemoteCandidate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchCandidateConfidence {
+    VeryHigh,
+    High,
+    Medium,
+    Low,
+}
+
+impl MatchCandidateConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VeryHigh => "very-high",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::VeryHigh => 0,
+            Self::High => 1,
+            Self::Medium => 2,
+            Self::Low => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteMatchCandidate {
+    pub remote: RemoteCandidate,
+    pub score: usize,
+    pub confidence: MatchCandidateConfidence,
+    pub reason: String,
+}
+
 pub fn match_installed_addons(
     local_addons: &[LocalAddon],
     remote_addons: &[AddonSummary],
@@ -75,6 +113,54 @@ pub fn match_installed_addons_with_metadata(
         .iter()
         .map(|local| match_one_with_metadata(local, remote_addons, metadata))
         .collect()
+}
+
+pub fn remote_match_candidates_for_local(
+    local: &LocalAddon,
+    remote_addons: &[AddonSummary],
+) -> Vec<RemoteMatchCandidate> {
+    if !local.valid_manifest {
+        return Vec::new();
+    }
+
+    let mut by_uid: BTreeMap<String, RemoteMatchCandidate> = BTreeMap::new();
+    for remote in remote_addons {
+        let Some(uid) = remote
+            .uid
+            .as_deref()
+            .map(str::trim)
+            .filter(|uid| !uid.is_empty())
+        else {
+            continue;
+        };
+
+        let Some(candidate) = resolve_candidate_match(local, remote) else {
+            continue;
+        };
+
+        let replace = match by_uid.get(uid) {
+            Some(current) => compare_resolve_candidates(&candidate, current).is_lt(),
+            None => true,
+        };
+        if replace {
+            by_uid.insert(uid.to_owned(), candidate);
+        }
+    }
+
+    let mut candidates = by_uid.into_values().collect::<Vec<_>>();
+    candidates.sort_by(compare_resolve_candidates);
+    candidates.truncate(25);
+    candidates
+}
+
+pub fn remote_match_candidate_by_uid(
+    local: &LocalAddon,
+    remote_addons: &[AddonSummary],
+    remote_uid: &str,
+) -> Option<RemoteMatchCandidate> {
+    remote_match_candidates_for_local(local, remote_addons)
+        .into_iter()
+        .find(|candidate| candidate.remote.uid.as_deref() == Some(remote_uid))
 }
 
 #[cfg(test)]
@@ -286,6 +372,151 @@ fn metadata_candidates_result(
     }
 }
 
+fn compare_resolve_candidates(
+    left: &RemoteMatchCandidate,
+    right: &RemoteMatchCandidate,
+) -> std::cmp::Ordering {
+    left.confidence
+        .rank()
+        .cmp(&right.confidence.rank())
+        .then_with(|| right.score.cmp(&left.score))
+        .then_with(|| {
+            right
+                .remote
+                .downloads
+                .unwrap_or(-1)
+                .cmp(&left.remote.downloads.unwrap_or(-1))
+        })
+        .then_with(|| {
+            right
+                .remote
+                .updated
+                .unwrap_or(0)
+                .cmp(&left.remote.updated.unwrap_or(0))
+        })
+        .then_with(|| left.remote.name.cmp(&right.remote.name))
+}
+
+fn resolve_candidate_match(
+    local: &LocalAddon,
+    remote: &AddonSummary,
+) -> Option<RemoteMatchCandidate> {
+    let local_title = local
+        .title
+        .as_deref()
+        .map(normalize_identity)
+        .filter(|title| !title.is_empty());
+    let local_folder = normalize_identity(&local.folder_name);
+    let remote_name = remote
+        .name
+        .as_deref()
+        .map(normalize_identity)
+        .filter(|name| !name.is_empty());
+    let primary_directory = remote
+        .directories
+        .first()
+        .map(|directory| normalize_identity(directory))
+        .filter(|directory| !directory.is_empty());
+    let bundled_directories = remote
+        .directories
+        .iter()
+        .skip(1)
+        .map(|directory| normalize_identity(directory))
+        .filter(|directory| !directory.is_empty())
+        .collect::<Vec<_>>();
+    let same_author = authors_match(local.author.as_deref(), remote.author_name.as_deref());
+
+    let exact_title = local_title
+        .as_deref()
+        .zip(remote_name.as_deref())
+        .is_some_and(|(local_title, remote_name)| local_title == remote_name);
+    let exact_folder_name = remote_name
+        .as_deref()
+        .is_some_and(|remote_name| identities_match(&local_folder, remote_name));
+    let exact_primary_directory = primary_directory
+        .as_deref()
+        .is_some_and(|primary_directory| identities_match(&local_folder, primary_directory));
+    let exact_bundled_directory = bundled_directories
+        .iter()
+        .any(|directory| identities_match(&local_folder, directory));
+    let strong_fuzzy_title = local_title
+        .as_deref()
+        .zip(remote_name.as_deref())
+        .is_some_and(|(local_title, remote_name)| {
+            strong_title_similarity(local_title, remote_name)
+        });
+    let loose_folder_similarity = remote_name
+        .as_deref()
+        .is_some_and(|remote_name| loose_identity_similarity(&local_folder, remote_name))
+        || primary_directory
+            .as_deref()
+            .is_some_and(|primary_directory| {
+                loose_identity_similarity(&local_folder, primary_directory)
+            })
+        || bundled_directories
+            .iter()
+            .any(|directory| loose_identity_similarity(&local_folder, directory));
+
+    let (score, confidence, reason) = if exact_title && same_author {
+        (
+            1000,
+            MatchCandidateConfidence::VeryHigh,
+            "exact normalized title and same author",
+        )
+    } else if (exact_folder_name || exact_primary_directory) && same_author {
+        (
+            960,
+            MatchCandidateConfidence::VeryHigh,
+            "exact normalized folder/name and same author",
+        )
+    } else if exact_title {
+        (
+            880,
+            MatchCandidateConfidence::High,
+            "exact normalized title",
+        )
+    } else if exact_folder_name {
+        (
+            820,
+            MatchCandidateConfidence::High,
+            "exact normalized folder and remote name",
+        )
+    } else if same_author && strong_fuzzy_title {
+        (
+            700,
+            MatchCandidateConfidence::Medium,
+            "same author and strong fuzzy title",
+        )
+    } else if strong_fuzzy_title {
+        (610, MatchCandidateConfidence::Medium, "strong fuzzy title")
+    } else if exact_primary_directory {
+        (
+            430,
+            MatchCandidateConfidence::Low,
+            "folder matches primary remote directory",
+        )
+    } else if exact_bundled_directory {
+        (
+            380,
+            MatchCandidateConfidence::Low,
+            "folder matches bundled remote directory",
+        )
+    } else if loose_folder_similarity {
+        (300, MatchCandidateConfidence::Low, "folder similarity only")
+    } else {
+        return None;
+    };
+
+    let remote_candidate = remote_candidate_from_summary(remote, confidence.rank(), score, reason);
+
+    Some(RemoteMatchCandidate {
+        remote: remote_candidate,
+        score,
+        confidence,
+        reason: reason.to_owned(),
+    })
+}
+
 fn scored_candidates(local: &LocalAddon, remote_addons: &[AddonSummary]) -> Vec<RemoteCandidate> {
     let local_folder = normalize_identity(&local.folder_name);
     let local_title = local.title.as_deref().map(normalize_identity);
@@ -387,6 +618,122 @@ fn contains_either(left: &str, right: &str) -> bool {
         && (left == right || left.contains(right) || right.contains(left))
 }
 
+fn identities_match(left: &str, right: &str) -> bool {
+    left == right || compact_identity(left) == compact_identity(right)
+}
+
+fn loose_identity_similarity(left: &str, right: &str) -> bool {
+    let left_compact = compact_identity(left);
+    let right_compact = compact_identity(right);
+    if left_compact.len().min(right_compact.len()) < 5 {
+        return false;
+    }
+
+    contains_either(&left_compact, &right_compact)
+        && left_compact.len().min(right_compact.len()) * 100
+            >= left_compact.len().max(right_compact.len()) * 62
+}
+
+fn strong_title_similarity(left: &str, right: &str) -> bool {
+    let left_compact = compact_identity(left);
+    let right_compact = compact_identity(right);
+    if left_compact.len().min(right_compact.len()) < 5 {
+        return false;
+    }
+
+    let ratio = normalized_similarity(&left_compact, &right_compact);
+    if ratio >= 0.84 {
+        return true;
+    }
+
+    token_overlap_ratio(left, right) >= 0.75
+        && shared_token_count(left, right) >= 2
+        && left
+            .split_whitespace()
+            .count()
+            .min(right.split_whitespace().count())
+            >= 2
+}
+
+fn authors_match(local_author: Option<&str>, remote_author: Option<&str>) -> bool {
+    let Some(local_author) = local_author
+        .map(normalize_identity)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(remote_author) = remote_author
+        .map(normalize_identity)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    if local_author == remote_author {
+        return true;
+    }
+
+    let local_compact = compact_identity(&local_author);
+    let remote_compact = compact_identity(&remote_author);
+    local_compact.len().min(remote_compact.len()) >= 4
+        && contains_either(&local_compact, &remote_compact)
+}
+
+fn compact_identity(value: &str) -> String {
+    value.chars().filter(|ch| ch.is_alphanumeric()).collect()
+}
+
+fn normalized_similarity(left: &str, right: &str) -> f64 {
+    let max_len = left.chars().count().max(right.chars().count());
+    if max_len == 0 {
+        return 1.0;
+    }
+
+    1.0 - (levenshtein_distance(left, right) as f64 / max_len as f64)
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+
+    for (left_index, left_char) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_char != right_char);
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            current[right_index + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()]
+}
+
+fn token_overlap_ratio(left: &str, right: &str) -> f64 {
+    let left_tokens = left.split_whitespace().collect::<Vec<_>>();
+    let right_tokens = right.split_whitespace().collect::<Vec<_>>();
+    let denominator = left_tokens.len().min(right_tokens.len());
+    if denominator == 0 {
+        return 0.0;
+    }
+
+    shared_token_count(left, right) as f64 / denominator as f64
+}
+
+fn shared_token_count(left: &str, right: &str) -> usize {
+    let right_tokens = right.split_whitespace().collect::<Vec<_>>();
+    left.split_whitespace()
+        .filter(|left_token| {
+            right_tokens
+                .iter()
+                .any(|right_token| right_token == left_token)
+        })
+        .count()
+}
+
 fn version_status(local: &LocalAddon, remote: &AddonSummary) -> MatchStatus {
     let local_version = local.addon_version.as_deref().or(local.version.as_deref());
     let remote_version = remote.version.as_deref();
@@ -453,7 +800,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::api::models::AddonSummary;
-    use crate::local::match_remote::{match_one, MatchStatus};
+    use crate::local::match_remote::{
+        match_one, remote_match_candidates_for_local, MatchCandidateConfidence, MatchStatus,
+    };
     use crate::local::metadata::{InstalledAddonMetadata, InstalledMetadata};
     use crate::local::LocalAddon;
 
@@ -477,6 +826,17 @@ mod tests {
         }
     }
 
+    fn local_with_author(
+        folder_name: &str,
+        title: Option<&str>,
+        addon_version: Option<&str>,
+        author: Option<&str>,
+    ) -> LocalAddon {
+        let mut local = local(folder_name, title, addon_version);
+        local.author = author.map(ToOwned::to_owned);
+        local
+    }
+
     fn remote(uid: &str, name: &str, version: &str, directories: &[&str]) -> AddonSummary {
         AddonSummary {
             uid: Some(uid.to_owned()),
@@ -493,6 +853,18 @@ mod tests {
                 .collect(),
             _extra: BTreeMap::new(),
         }
+    }
+
+    fn remote_with_author(
+        uid: &str,
+        name: &str,
+        version: &str,
+        directories: &[&str],
+        author: Option<&str>,
+    ) -> AddonSummary {
+        let mut remote = remote(uid, name, version, directories);
+        remote.author_name = author.map(ToOwned::to_owned);
+        remote
     }
 
     fn metadata(folder_name: &str, remote_uid: Option<&str>) -> InstalledMetadata {
@@ -527,6 +899,84 @@ mod tests {
 
         assert_eq!(result.status, MatchStatus::Matched);
         assert_eq!(result.remote.unwrap().uid.as_deref(), Some("128"));
+    }
+
+    #[test]
+    fn no_match_addon_produces_resolve_candidates_from_title_folder_author() {
+        let local = local_with_author("BeamMeUp", Some("Beam Me Up"), Some("1"), Some("Dead Soon"));
+        let candidates = remote_match_candidates_for_local(
+            &local,
+            &[remote_with_author(
+                "42",
+                "Beam Me Up - Teleporter",
+                "2",
+                &["BeamMeUp"],
+                Some("Dead Soon"),
+            )],
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].remote.uid.as_deref(), Some("42"));
+        assert_eq!(candidates[0].confidence, MatchCandidateConfidence::VeryHigh);
+        assert!(candidates[0].reason.contains("same author"));
+    }
+
+    #[test]
+    fn exact_title_and_author_candidate_is_very_high_confidence() {
+        let local = local_with_author("SomeFolder", Some("SkyShards"), Some("1"), Some("Garkin"));
+        let candidates = remote_match_candidates_for_local(
+            &local,
+            &[remote_with_author(
+                "128",
+                "SkyShards",
+                "1",
+                &["SkyShards"],
+                Some("Garkin"),
+            )],
+        );
+
+        assert_eq!(candidates[0].confidence, MatchCandidateConfidence::VeryHigh);
+        assert_eq!(candidates[0].score, 1000);
+        assert_eq!(
+            candidates[0].reason,
+            "exact normalized title and same author"
+        );
+    }
+
+    #[test]
+    fn multiple_high_candidates_are_returned_for_user_selection() {
+        let local = local_with_author("Foo", Some("Foo"), Some("1"), Some("Author"));
+        let candidates = remote_match_candidates_for_local(
+            &local,
+            &[
+                remote_with_author("1", "Foo", "1", &["FooOne"], Some("Author")),
+                remote_with_author("2", "Foo", "1", &["FooTwo"], Some("Author")),
+            ],
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.confidence == MatchCandidateConfidence::VeryHigh));
+    }
+
+    #[test]
+    fn invalid_local_addon_returns_no_resolve_candidates() {
+        let mut local = local_with_author("Broken", Some("Broken"), None, Some("Author"));
+        local.valid_manifest = false;
+
+        let candidates = remote_match_candidates_for_local(
+            &local,
+            &[remote_with_author(
+                "1",
+                "Broken",
+                "1",
+                &["Broken"],
+                Some("Author"),
+            )],
+        );
+
+        assert!(candidates.is_empty());
     }
 
     #[test]

@@ -21,7 +21,9 @@ use eso_addon_manager::install::remove::{self, ClearSavedVariablesResult, Remove
 use eso_addon_manager::install::update;
 use eso_addon_manager::install::update_all;
 use eso_addon_manager::install::zip_safety;
-use eso_addon_manager::local::match_remote::{self, MatchResult, RemoteCandidate};
+use eso_addon_manager::local::match_remote::{
+    self, MatchResult, RemoteCandidate, RemoteMatchCandidate,
+};
 use eso_addon_manager::local::metadata::{
     self as manager_metadata, InstalledAddonMetadata, InstalledMetadata,
 };
@@ -194,6 +196,39 @@ struct RemoteCandidateDto {
     tier: u8,
     score: usize,
     reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteMatchCandidatesResponse {
+    local: LocalAddonDto,
+    candidates: Vec<RemoteMatchCandidateDto>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteMatchCandidateDto {
+    remote_uid: String,
+    remote_name: Option<String>,
+    remote_author: Option<String>,
+    remote_category: Option<String>,
+    remote_version: Option<String>,
+    remote_downloads: Option<i64>,
+    remote_updated: Option<i64>,
+    remote_updated_display: Option<String>,
+    remote_info_url: Option<String>,
+    score: usize,
+    confidence: String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkInstalledAddonToRemoteResponse {
+    addons_dir: String,
+    local_folder: String,
+    remote_uid: String,
+    remote_name: Option<String>,
+    confidence: String,
+    linked_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -667,6 +702,141 @@ async fn get_installed_addon_dependencies(
     Ok(installed_addon_dependencies_response(
         &report,
         join_warning_messages(warnings),
+    ))
+}
+
+#[tauri::command]
+async fn find_remote_match_candidates(
+    local_folder: String,
+    path: Option<String>,
+) -> Result<RemoteMatchCandidatesResponse, String> {
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let local_addon = installed_local_addon_by_folder(&local_addons, &local_folder)?;
+
+    if !local_addon.valid_manifest {
+        return Ok(RemoteMatchCandidatesResponse {
+            local: local_addon_dto(local_addon),
+            candidates: Vec::new(),
+            message: Some("No valid addon manifest was found for this folder.".to_owned()),
+        });
+    }
+
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let candidates = match_remote::remote_match_candidates_for_local(local_addon, &remote_addons);
+    let message = if candidates.is_empty() {
+        Some("No safe remote match candidates were found.".to_owned())
+    } else {
+        None
+    };
+
+    Ok(RemoteMatchCandidatesResponse {
+        local: local_addon_dto(local_addon),
+        candidates: candidates.iter().map(remote_match_candidate_dto).collect(),
+        message,
+    })
+}
+
+#[tauri::command]
+async fn link_installed_addon_to_remote(
+    local_folder: String,
+    remote_uid: String,
+    path: Option<String>,
+) -> Result<LinkInstalledAddonToRemoteResponse, String> {
+    let remote_uid = normalized_required_uid(&remote_uid)?;
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let local_addon = installed_local_addon_by_folder(&local_addons, &local_folder)?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    let candidate =
+        selected_remote_match_candidate(local_addon, &remote_addons, &remote_uid).map_err(to_string_error)?;
+    let details = client
+        .eso_file_details(&remote_uid)
+        .await
+        .map_err(to_string_error)?;
+    let linked_at = current_timestamp_string();
+    let linked_metadata = link_installed_addon_metadata(
+        &addons_dir,
+        local_addon,
+        &candidate,
+        &details,
+        &remote_uid,
+        &linked_at,
+    )
+    .map_err(to_string_error)?;
+
+    Ok(LinkInstalledAddonToRemoteResponse {
+        addons_dir: path_string(&addons_dir),
+        local_folder: local_addon.folder_name.clone(),
+        remote_uid,
+        remote_name: linked_metadata.remote_name,
+        confidence: candidate.confidence.as_str().to_owned(),
+        linked_at,
+    })
+}
+
+#[tauri::command]
+async fn reinstall_installed_addon_from_remote(
+    local_folder: String,
+    remote_uid: String,
+    path: Option<String>,
+    backup_dir: Option<String>,
+    keep_download: Option<bool>,
+    download_dir: Option<String>,
+) -> Result<InstallRemoteAddonResponse, String> {
+    let remote_uid = normalized_required_uid(&remote_uid)?;
+    let addons_dir = resolve_addons_dir(path.as_deref()).map_err(to_string_error)?;
+    let backup_dir = optional_path(backup_dir);
+    let download_dir = optional_path(download_dir);
+    let local_addons = local::scan_addons_dir(&addons_dir).map_err(to_string_error)?;
+    let local_addon = installed_local_addon_by_folder(&local_addons, &local_folder)?;
+    let client = ApiClient::new().map_err(to_string_error)?;
+    let remote_addons = client.eso_file_list().await.map_err(to_string_error)?;
+    selected_remote_match_candidate(local_addon, &remote_addons, &remote_uid)
+        .map_err(to_string_error)?;
+
+    let prepared = prepare_remote_install_plan(&client, &remote_uid, &addons_dir)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to plan reinstall for {}: {}",
+                local_addon.folder_name, error
+            )
+        })?;
+    validate_single_update_plan(&prepared.main_plan, &local_addon.folder_name).map_err(|error| {
+        format!(
+            "failed to plan reinstall for {}: {}",
+            local_addon.folder_name, error
+        )
+    })?;
+
+    if keep_download.unwrap_or(false) {
+        keep_remote_download(
+            &client,
+            &remote_uid,
+            &prepared.details,
+            download_dir.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("failed to reinstall {}: {}", local_addon.folder_name, error))?;
+    }
+
+    let result = apply_prepared_remote_install(
+        &addons_dir,
+        &prepared,
+        &remote_uid,
+        backup_dir.as_deref(),
+        manager_metadata::INSTALLED_BY_REMOTE_UPDATE,
+    )
+    .map_err(|error| format!("failed to reinstall {}: {}", local_addon.folder_name, error))?;
+
+    Ok(install_remote_addon_response(
+        &prepared.details,
+        &addons_dir,
+        &prepared,
+        &result,
     ))
 }
 
@@ -1514,6 +1684,9 @@ fn main() {
             import_existing_addons_as_current,
             get_installed_addons,
             get_installed_addon_dependencies,
+            find_remote_match_candidates,
+            link_installed_addon_to_remote,
+            reinstall_installed_addon_from_remote,
             remove_installed_addon,
             clear_saved_variables,
             create_compressed_backup,
@@ -2098,6 +2271,45 @@ fn remote_local_state(
     })
 }
 
+fn installed_local_addon_by_folder<'a>(
+    local_addons: &'a [LocalAddon],
+    folder_name: &str,
+) -> Result<&'a LocalAddon, String> {
+    local_addons
+        .iter()
+        .find(|addon| addon.folder_name.eq_ignore_ascii_case(folder_name))
+        .ok_or_else(|| format!("installed addon folder not found: {folder_name}"))
+}
+
+fn normalized_required_uid(remote_uid: &str) -> Result<String, String> {
+    let remote_uid = remote_uid.trim();
+    if remote_uid.is_empty() {
+        Err("selected remote UID is required".to_owned())
+    } else {
+        Ok(remote_uid.to_owned())
+    }
+}
+
+fn selected_remote_match_candidate(
+    local: &LocalAddon,
+    remote_addons: &[AddonSummary],
+    remote_uid: &str,
+) -> anyhow::Result<RemoteMatchCandidate> {
+    if !local.valid_manifest {
+        return Err(anyhow::anyhow!(
+            "No valid addon manifest was found for folder {}.",
+            local.folder_name
+        ));
+    }
+
+    match_remote::remote_match_candidate_by_uid(local, remote_addons, remote_uid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Selected remote addon {remote_uid} is not one of the safe candidates for {}.",
+            local.folder_name
+        )
+    })
+}
+
 fn remote_addon_match(
     addon_id: &str,
     remote_addons: &[AddonSummary],
@@ -2253,6 +2465,27 @@ fn remote_candidate_dto(candidate: &RemoteCandidate) -> RemoteCandidateDto {
         thumbnail_urls: candidate.thumbnail_urls.clone(),
         tier: candidate.tier,
         score: candidate.score,
+        reason: candidate.reason.clone(),
+    }
+}
+
+fn remote_match_candidate_dto(candidate: &RemoteMatchCandidate) -> RemoteMatchCandidateDto {
+    RemoteMatchCandidateDto {
+        remote_uid: candidate.remote.uid.clone().unwrap_or_default(),
+        remote_name: candidate.remote.name.clone(),
+        remote_author: candidate.remote.author_name.clone(),
+        remote_category: candidate
+            .remote
+            .category_name
+            .clone()
+            .or_else(|| candidate.remote.category_id.clone()),
+        remote_version: candidate.remote.version.clone(),
+        remote_downloads: candidate.remote.downloads,
+        remote_updated: candidate.remote.updated,
+        remote_updated_display: candidate.remote.updated.map(format_mmoui_date),
+        remote_info_url: candidate.remote.file_info_url.clone(),
+        score: candidate.score,
+        confidence: candidate.confidence.as_str().to_owned(),
         reason: candidate.reason.clone(),
     }
 }
@@ -3047,6 +3280,7 @@ fn first_run_metadata_for_match(
         file_name: None,
         md5: None,
         installed_at: installed_timestamp.to_owned(),
+        linked_at: None,
         installed_by: manager_metadata::INSTALLED_BY_IMPORTED_CURRENT.to_owned(),
         local_title: result.local.title.clone(),
         local_version: result
@@ -3055,6 +3289,72 @@ fn first_run_metadata_for_match(
             .clone()
             .or_else(|| result.local.version.clone()),
         source_addon_uid: None,
+        match_confidence: None,
+    }
+}
+
+fn linked_existing_metadata(
+    local: &LocalAddon,
+    candidate: &RemoteMatchCandidate,
+    details: &AddonDetails,
+    selected_remote_uid: &str,
+    linked_at: &str,
+) -> InstalledAddonMetadata {
+    InstalledAddonMetadata {
+        folder_name: local.folder_name.clone(),
+        remote_uid: normalize_optional_path(details.uid.clone())
+            .or_else(|| Some(selected_remote_uid.to_owned())),
+        remote_name: normalize_optional_path(details.name.clone())
+            .or_else(|| normalize_optional_path(candidate.remote.name.clone())),
+        remote_version: normalize_optional_path(details.version.clone())
+            .or_else(|| normalize_optional_path(candidate.remote.version.clone())),
+        remote_updated_date: details.date.or(candidate.remote.updated),
+        remote_info_url: normalize_optional_path(details.file_info_url.clone())
+            .or_else(|| normalize_optional_path(candidate.remote.file_info_url.clone())),
+        remote_download_url: None,
+        file_name: None,
+        md5: None,
+        installed_at: linked_at.to_owned(),
+        linked_at: Some(linked_at.to_owned()),
+        installed_by: manager_metadata::INSTALLED_BY_LINKED_EXISTING.to_owned(),
+        local_title: normalize_optional_path(local.title.clone()),
+        local_version: normalize_optional_path(
+            local.addon_version
+                .clone()
+                .or_else(|| local.version.clone()),
+        ),
+        source_addon_uid: None,
+        match_confidence: Some(candidate.confidence.as_str().to_owned()),
+    }
+}
+
+fn link_installed_addon_metadata(
+    addons_dir: &Path,
+    local: &LocalAddon,
+    candidate: &RemoteMatchCandidate,
+    details: &AddonDetails,
+    selected_remote_uid: &str,
+    linked_at: &str,
+) -> anyhow::Result<InstalledAddonMetadata> {
+    let mut metadata = load_installed_metadata(addons_dir);
+    let linked_metadata =
+        linked_existing_metadata(local, candidate, details, selected_remote_uid, linked_at);
+    remove_case_insensitive_metadata_entry(&mut metadata, &local.folder_name);
+    metadata
+        .addons
+        .insert(local.folder_name.clone(), linked_metadata.clone());
+    save_installed_metadata(addons_dir, &metadata)?;
+    Ok(linked_metadata)
+}
+
+fn remove_case_insensitive_metadata_entry(metadata: &mut InstalledMetadata, folder_name: &str) {
+    let matching_key = metadata
+        .addons
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(folder_name))
+        .cloned();
+    if let Some(key) = matching_key {
+        metadata.addons.remove(&key);
     }
 }
 
@@ -4372,10 +4672,12 @@ mod tests {
                 file_name: None,
                 md5: None,
                 installed_at: "2026-01-01T00:00:00Z".to_owned(),
+                linked_at: None,
                 installed_by: manager_metadata::INSTALLED_BY_REMOTE_INSTALL.to_owned(),
                 local_title: None,
                 local_version: None,
                 source_addon_uid: None,
+                match_confidence: None,
             },
         );
         let state = test_remote_local_state(local_addons, metadata, &remote_addons);
@@ -4432,10 +4734,12 @@ mod tests {
                 file_name: None,
                 md5: None,
                 installed_at: "1".to_owned(),
+                linked_at: None,
                 installed_by: manager_metadata::INSTALLED_BY_IMPORTED_CURRENT.to_owned(),
                 local_title: Some("Foo".to_owned()),
                 local_version: Some("1.0.0".to_owned()),
                 source_addon_uid: None,
+                match_confidence: None,
             },
         );
 
@@ -4569,6 +4873,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selected_remote_match_candidate_uses_selected_uid_only() {
+        let mut local = test_local_addon("ExampleAddon", true, false);
+        local.author = Some("Author".to_owned());
+        let remote_addons = vec![
+            test_addon_summary("42", "ExampleAddon", "10", 100, "17", "Graphic UI Mods"),
+            test_addon_summary("99", "DifferentAddon", "10", 100, "17", "Graphic UI Mods"),
+        ];
+
+        let selected =
+            selected_remote_match_candidate(&local, &remote_addons, "42").expect("safe candidate");
+        let rejected = selected_remote_match_candidate(&local, &remote_addons, "99")
+            .expect_err("unrelated remote UID is not a candidate");
+
+        assert_eq!(selected.remote.uid.as_deref(), Some("42"));
+        assert!(rejected
+            .to_string()
+            .contains("not one of the safe candidates"));
+    }
+
+    #[test]
+    fn link_only_writes_metadata_without_modifying_addon_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let addons_dir = dir.path().join("live").join("AddOns");
+        let addon_dir = addons_dir.join("ExampleAddon");
+        fs::create_dir_all(&addon_dir).unwrap();
+        let sentinel = addon_dir.join("sentinel.txt");
+        fs::write(&sentinel, "keep").unwrap();
+
+        let mut local = test_local_addon("ExampleAddon", true, false);
+        local.author = Some("Author".to_owned());
+        let remote_addons = vec![test_addon_summary_with_version(
+            "42",
+            "ExampleAddon",
+            "2.0.0",
+            "10",
+            100,
+            "17",
+            "Graphic UI Mods",
+            "",
+        )];
+        let candidate = match_remote::remote_match_candidate_by_uid(&local, &remote_addons, "42")
+            .expect("candidate");
+        let details = test_addon_details("42", "ExampleAddon", "2.0.0", 100);
+
+        link_installed_addon_metadata(&addons_dir, &local, &candidate, &details, "42", "123")
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep");
+        let metadata = manager_metadata::load_installed_metadata(&addons_dir).unwrap();
+        let addon = metadata.addons.get("ExampleAddon").unwrap();
+        assert_eq!(addon.remote_uid.as_deref(), Some("42"));
+        assert_eq!(addon.remote_name.as_deref(), Some("ExampleAddon"));
+        assert_eq!(addon.remote_version.as_deref(), Some("2.0.0"));
+        assert_eq!(addon.remote_updated_date, Some(100));
+        assert_eq!(addon.installed_by, manager_metadata::INSTALLED_BY_LINKED_EXISTING);
+        assert_eq!(addon.linked_at.as_deref(), Some("123"));
+        assert_eq!(addon.match_confidence.as_deref(), Some("very-high"));
+        assert_eq!(addon.remote_download_url, None);
+        assert_eq!(addon.file_name, None);
+        assert_eq!(addon.md5, None);
+    }
+
     fn test_local_addon(folder_name: &str, valid_manifest: bool, is_library: bool) -> LocalAddon {
         LocalAddon {
             folder_name: folder_name.to_owned(),
@@ -4587,6 +4954,18 @@ mod tests {
             description: None,
             valid_manifest,
         }
+    }
+
+    fn test_addon_details(uid: &str, name: &str, version: &str, date: i64) -> AddonDetails {
+        serde_json::from_value(serde_json::json!({
+            "UID": uid,
+            "UIName": name,
+            "UIAuthorName": "Author",
+            "UIVersion": version,
+            "UIDate": date,
+            "UIFileInfoURL": format!("https://www.esoui.com/downloads/info{uid}.html")
+        }))
+        .expect("valid addon details")
     }
 
     fn test_remote_candidate(uid: &str, version: &str) -> RemoteCandidate {

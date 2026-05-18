@@ -28,12 +28,14 @@ import type {
   InstalledAddonDependenciesResponse,
   LocalAddon,
   MatchResult,
-  PlannedAction,
   PlanRemoteInstallResponse,
   PlanUpdateAllResponse,
   PlanUpdatesResponse,
+  LinkInstalledAddonToRemoteResponse,
   RemoteCategory,
   RemoteAddonDetailsWithLocalStateResponse,
+  RemoteMatchCandidate,
+  RemoteMatchCandidatesResponse,
   RemoveInstalledAddonResponse,
   RestoreResult,
   SingleUpdateApplyResponse,
@@ -60,6 +62,9 @@ type OperationKind =
   | "install-plan"
   | "install-apply"
   | "dependency-install"
+  | "resolve-search"
+  | "resolve-link"
+  | "resolve-reinstall"
   | "update-apply"
   | "remove-apply"
   | "savedvariables-clear"
@@ -113,6 +118,10 @@ interface AppState {
   singleUpdatePhase: "preparing" | "updating" | null;
   singleUpdatePlan: SingleUpdatePlanResponse | null;
   singleUpdateResult: SingleUpdateApplyResponse | null;
+  resolveLocal: LocalAddon | null;
+  resolveCandidates: RemoteMatchCandidate[];
+  resolveSelectedUid: string | null;
+  resolveMessage: string | null;
   removeResult: RemoveInstalledAddonResponse | null;
   removeConfirmLocal: LocalAddon | null;
   removeSavedVariables: boolean;
@@ -212,6 +221,10 @@ const state: AppState = {
   singleUpdatePhase: null,
   singleUpdatePlan: null,
   singleUpdateResult: null,
+  resolveLocal: null,
+  resolveCandidates: [],
+  resolveSelectedUid: null,
+  resolveMessage: null,
   removeResult: null,
   removeConfirmLocal: null,
   removeSavedVariables: false,
@@ -314,6 +327,11 @@ window.addEventListener("keydown", (event) => {
     cancelRemoveAddon();
     return;
   }
+  if (state.resolveLocal && !guardedOperationRunning()) {
+    event.preventDefault();
+    closeResolveRemoteMatch();
+    return;
+  }
   if (state.lightboxImageUrl) {
     event.preventDefault();
     closeImageLightbox();
@@ -359,6 +377,7 @@ function render() {
         ${state.warning ? `<div class="banner warning">${escapeHtml(state.warning)}</div>` : ""}
         ${renderCurrentTab()}
         ${renderDetailsModal()}
+        ${renderResolveRemoteMatchModal()}
         ${renderRemoveConfirmationModal()}
         ${renderClearSavedVariablesConfirmationModal()}
         ${renderManualBackupConfirmationModal()}
@@ -545,6 +564,163 @@ function renderRestoreBackupModal() {
   `;
 }
 
+function renderResolveRemoteMatchModal() {
+  const local = state.resolveLocal;
+  if (!local) return "";
+  const selected = selectedResolveCandidate();
+  const searchLoading = isOperation("resolve-search", local.folder_name);
+  const actionDisabled = state.loading || !selected ? "disabled" : "";
+  const closeDisabled = guardedOperationRunning() ? "disabled" : "";
+  const resolveError = state.error && state.resolveLocal ? state.error : null;
+  return `
+    <div class="modal-backdrop resolve-modal-backdrop" role="presentation">
+      <section class="modal-panel resolve-modal-panel" role="dialog" aria-modal="true" aria-labelledby="resolve-remote-match-title">
+        <div class="resolve-modal-header">
+          <div class="modal-icon resolve-icon">${icon("search")}</div>
+          <h2 id="resolve-remote-match-title">Resolve remote match</h2>
+        </div>
+        <div class="resolve-modal-content">
+          <div class="resolve-local-grid">
+            ${resolveLocalItem("Local title", local.title ?? local.folder_name)}
+            ${resolveLocalItem("Folder", local.folder_name)}
+            ${resolveLocalItem("Author", local.author ?? "Author unknown")}
+            ${resolveLocalItem("Local version", local.display_version ?? "-")}
+          </div>
+          ${resolveError ? `<div class="banner error compact-banner resolve-inline-error">${escapeHtml(resolveError)}</div>` : ""}
+          ${!resolveError && state.resolveMessage && state.resolveCandidates.length > 0 ? `<div class="banner warning compact-banner">${escapeHtml(state.resolveMessage)}</div>` : ""}
+          ${searchLoading ? renderResolveCandidateSkeletons() : resolveError && state.resolveCandidates.length === 0 ? "" : renderResolveCandidates()}
+        </div>
+        <div class="modal-actions resolve-modal-actions">
+          <button class="secondary" id="cancel-resolve-remote-match" ${closeDisabled}>Close</button>
+          <button class="primary" id="link-resolve-candidate" ${actionDisabled}>${loadingButtonContent("Link only", "Linking...", "resolve-link", local.folder_name)}</button>
+          <button class="warning-action" id="reinstall-resolve-candidate" ${actionDisabled}>${loadingButtonContent("Reinstall from selected", "Reinstalling...", "resolve-reinstall", local.folder_name)}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function resolveLocalItem(label: string, value: string) {
+  return `
+    <div class="resolve-local-item">
+      <span>${escapeHtml(label)}</span>
+      <strong title="${escapeAttr(value)}">${renderInlineEsoMarkup(value)}</strong>
+    </div>
+  `;
+}
+
+function renderResolveCandidateSkeletons() {
+  return `
+    <div class="resolve-candidate-list" aria-label="Loading candidate matches">
+      ${Array.from({ length: 3 }, () => renderResolveCandidateSkeleton()).join("")}
+    </div>
+  `;
+}
+
+function renderResolveCandidateSkeleton() {
+  return `
+    <article class="resolve-candidate resolve-candidate-skeleton skeleton-card" aria-hidden="true">
+      ${skeletonIcon()}
+      <div class="resolve-candidate-main">
+        <div class="skeleton-stack skeleton-title-stack">
+          ${skeletonLine("skeleton-line-title")}
+          ${skeletonLine("skeleton-line-medium")}
+        </div>
+        ${renderSkeletonMetaGrid(3, "resolve-candidate-meta-row")}
+        ${skeletonLine("skeleton-line-long")}
+      </div>
+      <div class="resolve-candidate-actions">
+        ${skeletonLine("skeleton-chip")}
+        ${skeletonButton()}
+      </div>
+    </article>
+  `;
+}
+
+function renderResolveCandidates() {
+  const candidates = state.resolveCandidates;
+  if (candidates.length === 0) {
+    return `<div class="resolve-candidate-list resolve-empty-list">${emptyState("No remote matches found.", "Try searching manually from the Search page.")}</div>`;
+  }
+  return `
+    <div class="resolve-candidate-list" role="radiogroup" aria-label="Remote match candidates">
+      ${candidates.map(renderResolveCandidate).join("")}
+    </div>
+  `;
+}
+
+function renderResolveCandidate(candidate: RemoteMatchCandidate) {
+  const selected = state.resolveSelectedUid === candidate.remote_uid;
+  const selectedClass = selected ? "is-selected" : "";
+  const category = resolveCandidateCategory(candidate);
+  const remoteName = candidate.remote_name?.trim() || candidate.remote_uid;
+  const author = candidate.remote_author?.trim() || "Author unknown";
+  const websiteDisabled = candidate.remote_info_url ? "" : "disabled";
+  return `
+    <article class="resolve-candidate ${selectedClass}" role="radio" aria-checked="${selected ? "true" : "false"}" aria-disabled="${state.loading ? "true" : "false"}" tabindex="${state.loading ? "-1" : "0"}" data-resolve-candidate="${escapeAttr(candidate.remote_uid)}">
+      ${CategoryIcon(category)}
+      <div class="resolve-candidate-main">
+        <div class="resolve-candidate-title-row">
+          <h3>${renderInlineEsoMarkup(remoteName)}</h3>
+          <span class="resolve-confidence">${escapeHtml(resolveConfidenceLabel(candidate.confidence))}</span>
+        </div>
+        <p class="resolve-candidate-subtitle">${escapeHtml(plainEsoText(author))} &middot; ${escapeHtml(category.name)}</p>
+        <div class="resolve-candidate-meta-row">
+          ${resolveCandidateMeta("Version", candidate.remote_version)}
+          ${resolveCandidateMeta("Downloads", formatCount(candidate.remote_downloads))}
+          ${resolveCandidateMeta("Updated", candidate.remote_updated_display)}
+        </div>
+        <p class="resolve-candidate-reason">${escapeHtml(resolveReasonLabel(candidate.reason))}</p>
+      </div>
+      <div class="resolve-candidate-actions">
+        <span class="resolve-selected-indicator" aria-hidden="true">${selected ? icon("check") : ""}</span>
+        <button class="secondary small" data-resolve-website="${escapeAttr(candidate.remote_info_url ?? "")}" ${websiteDisabled}>${icon("external")} Website</button>
+      </div>
+    </article>
+  `;
+}
+
+function resolveConfidenceLabel(confidence: RemoteMatchCandidate["confidence"]) {
+  if (confidence === "very-high") return "Very high match";
+  if (confidence === "high") return "High match";
+  if (confidence === "medium") return "Possible match";
+  return "Low confidence";
+}
+
+function resolveCandidateMeta(label: string, value: string | null | undefined) {
+  return `
+    <span class="resolve-candidate-meta-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value?.trim() || "-")}</strong>
+    </span>
+  `;
+}
+
+function resolveCandidateCategory(candidate: RemoteMatchCandidate): CategoryMeta {
+  const rawCategory = candidate.remote_category?.trim() || null;
+  const id = rawCategory && /^\d+$/.test(rawCategory) ? rawCategory : null;
+  const name = rawCategory && !id ? rawCategory : null;
+  if (id && categoryKeyById[id]) return categoryMeta(null, id, false);
+  if (name) return categoryMeta(name, null, false);
+  return { ...categoryIconByKey.misc, name: "Unknown category" };
+}
+
+function resolveReasonLabel(reason: string) {
+  const normalized = reason.toLowerCase().replace(/[-_/]+/g, " ");
+  if (normalized.includes("exact normalized title") && normalized.includes("same author")) return "Exact name and author match";
+  if (normalized.includes("exact normalized folder") && normalized.includes("same author")) return "Folder name and author match";
+  if (normalized.includes("exact normalized title")) return "Exact name match";
+  if (normalized.includes("same author") && normalized.includes("fuzzy")) return "Similar name and same author";
+  if (normalized.includes("fuzzy title")) return "Similar name";
+  if (normalized.includes("folder matches") || normalized.includes("folder similarity") || normalized.includes("remote name")) return "Folder name match";
+  if (normalized.includes("same author")) return "Same author";
+  return reason.trim() || "Possible match";
+}
+
+function selectedResolveCandidate() {
+  return state.resolveCandidates.find((candidate) => candidate.remote_uid === state.resolveSelectedUid) ?? null;
+}
+
 function restorePreviewItem(label: string, value: string) {
   return `
     <div class="restore-preview-item">
@@ -588,7 +764,7 @@ function brandMark() {
 function renderInstalled() {
   const view = installedView();
   const updateAllButton = shouldShowUpdateAllButton()
-    ? `<button class="primary" id="apply-update-all-installed" ${disabledAttr()}>${loadingButtonContent("Update All", updateAllButtonLoadingLabel(), "update-all-apply")}</button>`
+    ? `<button class="primary" id="apply-update-all-installed" title="Updates all detected update candidates." ${disabledAttr()}>${loadingButtonContent("Update All", updateAllButtonLoadingLabel(), "update-all-apply")}</button>`
     : "";
   return `
     ${pageHeader(
@@ -634,11 +810,15 @@ function renderInstalledList(view = installedView()) {
 
 function shouldShowUpdateAllButton() {
   if (isInstalledLoading()) return false;
-  return (state.updatePlan?.actions ?? []).some(isActionableUpdateAction);
+  return installedItems().some(isActionableInstalledUpdate);
 }
 
-function isActionableUpdateAction(action: PlannedAction) {
-  return action.action === "would-update" && action.update_confidence === "reliable-update";
+function isActionableInstalledUpdate(item: InstalledViewModel) {
+  return isActionableUpdate(item.match);
+}
+
+function isActionableUpdate(match: MatchResult | null | undefined) {
+  return match?.update_confidence === "reliable-update";
 }
 
 function renderInstalledCard(item: InstalledViewModel) {
@@ -667,7 +847,7 @@ function renderInstalledCard(item: InstalledViewModel) {
           ${metaItem("Updated", remote?.updated_display ?? null)}
         </div>
       </div>
-      <div class="card-actions">${renderCardUpdateAction(item.match)}</div>
+      <div class="card-actions">${renderInstalledCardActions(item, status)}</div>
     </article>
   `;
 }
@@ -1327,7 +1507,7 @@ function renderInstallUpdateFooterAction() {
 
   if (!match) return "";
   const target = match.local.folder_name;
-  if (match.update_confidence === "reliable-update") {
+  if (isActionableUpdate(match)) {
     return `<button class="primary" data-apply-update-target="${escapeAttr(target)}" ${disabledAttr()}>${loadingButtonContent("Update", singleUpdateButtonLoadingLabel(target), "update-apply", target)}</button>`;
   }
   if (state.forceUpdate && ["matched", "unknown-update", "local-newer"].includes(match.status)) {
@@ -2310,6 +2490,27 @@ function bindTabEvents() {
   document.querySelectorAll<HTMLButtonElement>("[data-install-dependency]").forEach((button) => {
     button.addEventListener("click", () => installDependency(button.dataset.installDependency ?? ""));
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-resolve-folder]").forEach((button) => {
+    button.addEventListener("click", () => openResolveRemoteMatch(button.dataset.resolveFolder ?? ""));
+  });
+  document.querySelectorAll<HTMLElement>("[data-resolve-candidate]").forEach((card) => {
+    card.addEventListener("click", () => selectResolveCandidate(card.dataset.resolveCandidate ?? ""));
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      selectResolveCandidate(card.dataset.resolveCandidate ?? "");
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#cancel-resolve-remote-match")?.addEventListener("click", closeResolveRemoteMatch);
+  document.querySelector<HTMLButtonElement>("#link-resolve-candidate")?.addEventListener("click", linkResolveCandidate);
+  document.querySelector<HTMLButtonElement>("#reinstall-resolve-candidate")?.addEventListener("click", reinstallResolveCandidate);
+  document.querySelectorAll<HTMLButtonElement>("[data-resolve-website]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const url = button.dataset.resolveWebsite ?? "";
+      if (url) void openExternalUrl(url);
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-lightbox-url]").forEach((button) => {
     button.addEventListener("click", () => openImageLightbox(button.dataset.lightboxUrl ?? ""));
   });
@@ -2547,6 +2748,15 @@ function operationErrorMessage(operation: OperationKind, operationTarget: string
   if (operation === "update-all-apply") {
     return `Could not apply Update All. ${message}`;
   }
+  if (operation === "resolve-search") {
+    return operationTarget ? `Could not resolve ${operationTarget}. ${message}` : `Could not resolve remote match. ${message}`;
+  }
+  if (operation === "resolve-link") {
+    return operationTarget ? `Could not link ${operationTarget}. ${message}` : `Could not link remote match. ${message}`;
+  }
+  if (operation === "resolve-reinstall") {
+    return operationTarget ? `Could not reinstall ${operationTarget}. ${message}` : `Could not reinstall selected addon. ${message}`;
+  }
   return message;
 }
 
@@ -2595,6 +2805,12 @@ function bindCardEventsOnly() {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       applySingleUpdate(button.dataset.applyUpdateTarget ?? "");
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-resolve-folder]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openResolveRemoteMatch(button.dataset.resolveFolder ?? "");
     });
   });
 }
@@ -2857,6 +3073,104 @@ function openInstalledDetails(folderName: string) {
     render();
     void loadInstalledDependencies(folderName);
   }
+}
+
+function openResolveRemoteMatch(folderName: string) {
+  const addon = installedLocalByFolder(folderName);
+  if (!addon) {
+    state.error = "Addon is no longer installed.";
+    render();
+    return;
+  }
+
+  state.resolveLocal = addon;
+  state.resolveCandidates = [];
+  state.resolveSelectedUid = null;
+  state.resolveMessage = null;
+  state.removeResult = null;
+  closeAddonContextMenu(false);
+
+  return withLoading(async () => {
+    const response = await invoke<RemoteMatchCandidatesResponse>("find_remote_match_candidates", {
+      localFolder: folderName,
+      path: effectiveAddonsPath(),
+    });
+    if (state.resolveLocal?.folder_name.toLowerCase() !== folderName.toLowerCase()) return;
+    state.resolveLocal = response.local;
+    state.resolveCandidates = response.candidates;
+    state.resolveMessage = response.message;
+    state.resolveSelectedUid = defaultResolveSelectedUid(response.candidates);
+  }, "resolve-search", folderName);
+}
+
+function defaultResolveSelectedUid(candidates: RemoteMatchCandidate[]) {
+  if (candidates.length === 1 && candidates[0].confidence === "very-high") {
+    return candidates[0].remote_uid;
+  }
+  return null;
+}
+
+function selectResolveCandidate(remoteUid: string) {
+  if (state.loading || !remoteUid) return;
+  state.resolveSelectedUid = remoteUid;
+  render();
+}
+
+function closeResolveRemoteMatch() {
+  if (guardedOperationRunning()) return;
+  clearResolveRemoteMatch();
+  render();
+}
+
+function clearResolveRemoteMatch() {
+  state.resolveLocal = null;
+  state.resolveCandidates = [];
+  state.resolveSelectedUid = null;
+  state.resolveMessage = null;
+}
+
+async function linkResolveCandidate() {
+  const local = state.resolveLocal;
+  const selected = selectedResolveCandidate();
+  if (!local || !selected) return;
+
+  await withLoading(async () => {
+    const result = await invoke<LinkInstalledAddonToRemoteResponse>("link_installed_addon_to_remote", {
+      localFolder: local.folder_name,
+      remoteUid: selected.remote_uid,
+      path: effectiveAddonsPath(),
+    });
+    state.path = result.addons_dir;
+    await refreshInstalledData(true);
+    clearResolveRemoteMatch();
+    setSuccess(`Linked ${plainEsoText(local.title ?? local.folder_name)} to ${plainEsoText(result.remote_name ?? selected.remote_name ?? selected.remote_uid)}.`);
+  }, "resolve-link", local.folder_name);
+}
+
+async function reinstallResolveCandidate() {
+  const local = state.resolveLocal;
+  const selected = selectedResolveCandidate();
+  if (!local || !selected) return;
+
+  const confirmed = window.confirm(
+    `Reinstall ${selected.remote_name ?? selected.remote_uid} for ${local.folder_name}?\n\nThis will download fresh ESOUI metadata, verify the ZIP MD5, validate the ZIP, and replace only the selected addon folder if the package targets it. SavedVariables will not be touched.`,
+  );
+  if (!confirmed) return;
+
+  await withLoading(async () => {
+    const result = await invoke<InstallRemoteAddonResponse>("reinstall_installed_addon_from_remote", {
+      localFolder: local.folder_name,
+      remoteUid: selected.remote_uid,
+      path: effectiveAddonsPath(),
+      backupDir: state.settings?.backup_dir_override || null,
+      keepDownload: state.settings?.keep_downloads_default ?? false,
+      downloadDir: state.settings?.download_dir || null,
+    });
+    state.path = result.addons_dir;
+    await refreshInstalledData(true);
+    clearResolveRemoteMatch();
+    setSuccess(`Reinstalled ${plainEsoText(result.remote.name ?? selected.remote_name ?? selected.remote_uid)}.`);
+  }, "resolve-reinstall", local.folder_name);
 }
 
 function installedLocalByFolder(folderName: string) {
@@ -3466,22 +3780,21 @@ async function refreshUpdatePlan(refresh = false) {
   state.warning = updatePlan.cache_warning;
 }
 
-function actionableUpdateTargets() {
-  return (state.updatePlan?.actions ?? []).filter(isActionableUpdateAction);
-}
-
-function installedView(): InstalledViewModel[] {
+function installedItems(): InstalledViewModel[] {
   const matches = state.updates?.matches ?? [];
-  const query = state.installedQuery.trim().toLowerCase();
-  const items = (state.installed?.addons ?? []).map((addon) => ({
+  return (state.installed?.addons ?? []).map((addon) => ({
     addon,
     match: matches.find((match) => match.local.folder_name === addon.folder_name) ?? null,
   }));
+}
 
-  return items
+function installedView(): InstalledViewModel[] {
+  const query = state.installedQuery.trim().toLowerCase();
+
+  return installedItems()
     .filter((item) => {
       const status = installedStatus(item.match, item.addon);
-      if (!shouldShowInstalledAddon(item, state.settings?.hide_libraries_in_installed ?? false, state.updatePlan?.actions ?? [])) return false;
+      if (!shouldShowInstalledAddon(item, state.settings?.hide_libraries_in_installed ?? false, isActionableInstalledUpdate)) return false;
       if (state.installedFilter === "update" && status.kind !== "reliable-update") return false;
       if (state.installedFilter === "current" && status.kind !== "current") return false;
       if (state.installedFilter === "unknown" && !["unknown", "not-found", "ambiguous"].includes(status.kind)) return false;
@@ -3522,7 +3835,7 @@ function installedStatus(match: MatchResult | null, addon: LocalAddon) {
   if (!addon.valid_manifest) return { label: "Invalid folder", kind: "invalid", rank: 3 };
   if (match?.update_confidence === "current") return { label: "Current", kind: "current", rank: 4 };
   if (!match) return { label: "Unknown", kind: "unknown", rank: 2 };
-  if (match.update_confidence === "reliable-update") return { label: "Update candidate", kind: "reliable-update", rank: 1 };
+  if (isActionableUpdate(match)) return { label: "Update candidate", kind: "reliable-update", rank: 1 };
   if (match.update_confidence === "possible-update") return { label: "Version check uncertain", kind: "possible-update", rank: 2 };
   if (match.update_confidence === "local-newer") return { label: "Local newer", kind: "local-newer", rank: 5 };
   if (addon.is_library === true) return { label: "Unknown", kind: "unknown", rank: 2 };
@@ -3535,9 +3848,16 @@ function installedStatus(match: MatchResult | null, addon: LocalAddon) {
   return { label: "Unknown", kind: "unknown", rank: 2 };
 }
 
+function renderInstalledCardActions(item: InstalledViewModel, status: { label: string; kind: string }) {
+  const resolveAction = ["not-found", "ambiguous"].includes(status.kind)
+    ? `<button class="warning-action small" data-resolve-folder="${escapeAttr(item.addon.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Resolve", "Searching...", "resolve-search", item.addon.folder_name)}</button>`
+    : "";
+  return `${resolveAction}${renderCardUpdateAction(item.match)}`;
+}
+
 function renderCardUpdateAction(match: MatchResult | null) {
   if (!match) return "";
-  if (match.update_confidence === "reliable-update") {
+  if (isActionableUpdate(match)) {
     return `<button class="primary small" data-apply-update-target="${escapeAttr(match.local.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Update", singleUpdateButtonLoadingLabel(match.local.folder_name), "update-apply", match.local.folder_name)}</button>`;
   }
   if (state.forceUpdate && ["matched", "unknown-update", "local-newer"].includes(match.status)) {
@@ -3933,6 +4253,9 @@ function guardedOperationRunning() {
         "install-plan",
         "install-apply",
         "dependency-install",
+        "resolve-search",
+        "resolve-link",
+        "resolve-reinstall",
         "update-apply",
         "remove-apply",
         "savedvariables-clear",
