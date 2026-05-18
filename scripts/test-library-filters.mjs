@@ -159,31 +159,24 @@ const updatingLibrary = {
   match: match(libraryLocal, { status: "possible-update", update_confidence: "reliable-update" }),
 };
 
+function isActionableUpdate(item) {
+  return item.match?.update_confidence === "reliable-update";
+}
+
 assert.equal(
-  shouldShowInstalledAddon(currentLibrary, true, []),
+  shouldShowInstalledAddon(currentLibrary, true, isActionableUpdate),
   false,
   "installed filtering hides current libraries",
 );
 
 assert.equal(
-  shouldShowInstalledAddon(updatingLibrary, true, [
-    {
-      local_folder: "LibAddonMenu-2.0",
-      local_version: "1.0.0",
-      remote_name: "LibAddonMenu-2.0",
-      remote_uid: "53",
-      remote_version: "2.0.0",
-      action: "would-update",
-      update_confidence: "reliable-update",
-      update_reason: "remote version differs",
-    },
-  ]),
+  shouldShowInstalledAddon(updatingLibrary, true, isActionableUpdate),
   true,
   "installed filtering keeps libraries with actionable updates",
 );
 
 assert.equal(
-  shouldShowInstalledAddon({ addon: localAddon(), match: match(localAddon()) }, true, []),
+  shouldShowInstalledAddon({ addon: localAddon(), match: match(localAddon()) }, true, isActionableUpdate),
   true,
   "installed filtering keeps non-library addons visible",
 );
