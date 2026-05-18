@@ -869,11 +869,11 @@ async fn clear_saved_variables(
 #[tauri::command]
 async fn create_compressed_backup(
     addons_path: Option<String>,
-    backup_dir: String,
+    backup_dir: Option<String>,
     include_saved_variables: bool,
 ) -> Result<BackupResultResponse, String> {
     let addons_dir = resolve_addons_dir(addons_path.as_deref()).map_err(to_string_error)?;
-    let backup_dir = required_path(&backup_dir, "backup folder").map_err(to_string_error)?;
+    let backup_dir = resolve_backup_dir(backup_dir).map_err(to_string_error)?;
     let result = backup::create_compressed_backup_with_app_version(
         &addons_dir,
         &backup_dir,
@@ -883,6 +883,13 @@ async fn create_compressed_backup(
     .map_err(to_string_error)?;
 
     Ok(backup_result_response(&result))
+}
+
+#[tauri::command]
+fn get_default_backup_dir() -> Result<String, String> {
+    crate_app_default_backup_dir()
+        .map(|path| path_string(&path))
+        .map_err(to_string_error)
 }
 
 #[tauri::command]
@@ -936,7 +943,8 @@ async fn get_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> 
 
 #[tauri::command]
 async fn get_startup_info(app: tauri::AppHandle) -> Result<AppStartupInfo, String> {
-    let path = settings_path(&app).map_err(to_string_error)?;
+    let path = settings_path().map_err(to_string_error)?;
+    migrate_legacy_app_settings(&app, &path).map_err(to_string_error)?;
     let settings_exists = path.exists();
     let settings = load_app_settings_from_path(&path).map_err(to_string_error)?;
     let detected_addons_dir = local::detect_best_addons_dir().map(|path| path_string(&path));
@@ -950,17 +958,17 @@ async fn get_startup_info(app: tauri::AppHandle) -> Result<AppStartupInfo, Strin
 
 #[tauri::command]
 async fn save_app_settings(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     settings: AppSettingsInput,
 ) -> Result<AppSettings, String> {
     let saved = app_settings_from_input(settings);
-    save_app_settings_to_disk(&app, &saved).map_err(to_string_error)?;
+    save_app_settings_to_disk(&saved).map_err(to_string_error)?;
     Ok(saved)
 }
 
 #[tauri::command]
-async fn reset_app_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
-    let path = settings_path(&app).map_err(to_string_error)?;
+async fn reset_app_settings(_app: tauri::AppHandle) -> Result<AppSettings, String> {
+    let path = settings_path().map_err(to_string_error)?;
     reset_app_settings_at_path(&path).map_err(to_string_error)
 }
 
@@ -1690,6 +1698,7 @@ fn main() {
             remove_installed_addon,
             clear_saved_variables,
             create_compressed_backup,
+            get_default_backup_dir,
             inspect_backup_zip,
             restore_backup_zip,
             search_remote_addons,
@@ -1714,23 +1723,41 @@ fn main() {
         .expect("error while running Scribe Addon Manager");
 }
 
-fn settings_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-    let config_dir = app.path().app_config_dir()?;
-    Ok(app_settings_path(&config_dir))
+fn settings_path() -> anyhow::Result<PathBuf> {
+    Ok(eso_addon_manager::app_paths::settings_file_path()?)
 }
 
 fn load_app_settings(app: &tauri::AppHandle) -> anyhow::Result<AppSettings> {
-    let path = settings_path(app)?;
+    let path = settings_path()?;
+    migrate_legacy_app_settings(app, &path)?;
     load_app_settings_from_path(&path)
 }
 
-fn save_app_settings_to_disk(app: &tauri::AppHandle, settings: &AppSettings) -> anyhow::Result<()> {
-    let path = settings_path(app)?;
+fn save_app_settings_to_disk(settings: &AppSettings) -> anyhow::Result<()> {
+    let path = settings_path()?;
     save_app_settings_to_path(&path, settings)
 }
 
+#[cfg(test)]
 fn app_settings_path(config_dir: &Path) -> PathBuf {
     config_dir.join("settings.json")
+}
+
+fn migrate_legacy_app_settings(app: &tauri::AppHandle, target_path: &Path) -> anyhow::Result<()> {
+    if target_path.exists() {
+        return Ok(());
+    }
+
+    let legacy_path = app.path().app_config_dir()?.join("settings.json");
+    if legacy_path == target_path || !legacy_path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&legacy_path, target_path)?;
+    Ok(())
 }
 
 fn load_app_settings_from_path(path: &Path) -> anyhow::Result<AppSettings> {
@@ -1782,6 +1809,17 @@ fn normalize_optional_path(value: Option<String>) -> Option<String> {
 
 fn optional_path(value: Option<String>) -> Option<PathBuf> {
     normalize_optional_path(value).map(PathBuf::from)
+}
+
+fn resolve_backup_dir(value: Option<String>) -> anyhow::Result<PathBuf> {
+    match optional_path(value) {
+        Some(path) => Ok(path),
+        None => crate_app_default_backup_dir(),
+    }
+}
+
+fn crate_app_default_backup_dir() -> anyhow::Result<PathBuf> {
+    Ok(eso_addon_manager::app_paths::default_backup_dir()?)
 }
 
 fn required_path(value: &str, label: &str) -> anyhow::Result<PathBuf> {
@@ -3687,7 +3725,7 @@ async fn keep_remote_download(
 ) -> Result<(), String> {
     let download_url = remote::download_url(details).map_err(to_string_error)?;
     let file_name = remote::download_file_name(details, addon_id);
-    let path = remote::keep_download_path(download_dir, &file_name);
+    let path = remote::keep_download_path(download_dir, &file_name).map_err(to_string_error)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(to_string_error)?;
     }
@@ -4264,7 +4302,10 @@ mod tests {
             fs::read_to_string(&saved_variables).unwrap(),
             before_saved_variables
         );
-        assert!(manager_metadata::installed_metadata_path(&addons_dir).exists());
+        assert!(manager_metadata::installed_metadata_path()
+            .unwrap()
+            .exists());
+        assert!(!live_dir.join(".scribe-addon-manager").exists());
     }
 
     #[test]

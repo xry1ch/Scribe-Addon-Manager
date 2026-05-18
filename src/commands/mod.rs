@@ -1201,7 +1201,7 @@ async fn prepare_remote_package(
 
     let temp_file;
     let zip_path = if keep_download {
-        let path = remote::keep_download_path(download_dir, &file_name);
+        let path = remote::keep_download_path(download_dir, &file_name)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .await

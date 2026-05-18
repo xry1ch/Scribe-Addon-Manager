@@ -564,7 +564,7 @@ function renderManualBackupConfirmationModal() {
         <div class="modal-icon">${icon("folder")}</div>
         <div class="modal-content">
           <h2 id="manual-backup-title">Create backup?</h2>
-          <p>This will create a compressed ZIP backup in the selected backup folder.</p>
+          <p>This will create a compressed ZIP backup in the configured backup folder.</p>
           <div class="modal-option">
             <label class="checkbox-line" for="manual-backup-savedvariables">
               <input ${checkboxInputAttrs("manual-backup-savedvariables", "scribe-manual-backup-savedvariables")} type="checkbox" ${state.manualBackupIncludeSavedVariables ? "checked" : ""} ${disabledAttr()} />
@@ -1682,8 +1682,8 @@ function renderFolderSettings(settings: AppSettings | null) {
         })}
         ${settingField("Backup folder", TEXT_INPUT_IDS.settingsBackupFolder, settings?.backup_dir_override ?? "", {
           browse: true,
-          helper: "Where manual backups are saved.",
-          placeholder: "Choose backup folder",
+          helper: "Leave blank to store backups in Scribe's app data folder.",
+          placeholder: "Use Scribe's default backup folder",
         })}
         ${renderManualBackupSettings()}
       </div>
@@ -1751,7 +1751,6 @@ function renderDisplaySettings(settings: AppSettings | null) {
 }
 
 function renderManualBackupSettings() {
-  if (!state.settings?.backup_dir_override) return "";
   return `
     <div class="backup-actions">
       <button class="secondary icon-button" id="create-manual-backup" ${disabledAttr()}>${loadingButtonContent(`${icon("folder")} Create backup`, "Creating backup...", "manual-backup")}</button>
@@ -2947,7 +2946,11 @@ async function browseInitialSetupFolder() {
 async function browseSettingsFolder(targetId: string) {
   const input = document.querySelector<HTMLInputElement>(`#${targetId}`);
   if (!input) return;
-  const selected = await browseForFolder(input.value || state.detectedAddonsPath);
+  const fallbackPath = targetId === TEXT_INPUT_IDS.settingsBackupFolder
+    ? await defaultBackupDirectory()
+    : state.detectedAddonsPath;
+  if (targetId === TEXT_INPUT_IDS.settingsBackupFolder && !fallbackPath) return;
+  const selected = await browseForFolder(input.value || fallbackPath);
   if (!selected) return;
   input.value = selected;
   state.error = null;
@@ -2983,6 +2986,16 @@ async function browseForBackupZip(defaultPath: string | null | undefined) {
     return typeof selected === "string" ? selected : null;
   } catch (error) {
     state.manualBackupError = `Could not open backup picker. ${error instanceof Error ? error.message : String(error)}`;
+    render();
+    return null;
+  }
+}
+
+async function defaultBackupDirectory() {
+  try {
+    return await invoke<string>("get_default_backup_dir");
+  } catch (error) {
+    state.manualBackupError = `Could not resolve default backup folder. ${error instanceof Error ? error.message : String(error)}`;
     render();
     return null;
   }
@@ -3556,11 +3569,6 @@ function confirmClearSavedVariables() {
 }
 
 function requestManualBackup() {
-  if (!state.settings?.backup_dir_override) {
-    state.manualBackupError = "Choose a backup folder to enable manual backups.";
-    render();
-    return;
-  }
   state.manualBackupError = null;
   state.restoreResult = null;
   state.manualBackupConfirmOpen = true;
@@ -3575,13 +3583,7 @@ function cancelManualBackup() {
 }
 
 function confirmManualBackup() {
-  const backupDir = state.settings?.backup_dir_override;
-  if (!backupDir) {
-    state.manualBackupError = "Choose a backup folder to enable manual backups.";
-    state.manualBackupConfirmOpen = false;
-    render();
-    return;
-  }
+  const backupDir = state.settings?.backup_dir_override ?? null;
 
   state.manualBackupResult = null;
   state.manualBackupError = null;
@@ -3599,16 +3601,12 @@ function confirmManualBackup() {
 }
 
 async function requestRestoreBackup() {
-  if (!state.settings?.backup_dir_override) {
-    state.manualBackupError = "Choose a backup folder to enable restore.";
-    render();
-    return;
-  }
-
   state.manualBackupError = null;
   state.manualBackupResult = null;
   state.restoreResult = null;
-  const selected = await browseForBackupZip(state.settings.backup_dir_override);
+  const defaultBackupDir = state.settings?.backup_dir_override ?? await defaultBackupDirectory();
+  if (!defaultBackupDir) return;
+  const selected = await browseForBackupZip(defaultBackupDir);
   if (!selected) return;
 
   if (!selected.toLowerCase().endsWith(".zip")) {

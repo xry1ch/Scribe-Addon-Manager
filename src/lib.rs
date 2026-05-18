@@ -1,7 +1,9 @@
 pub mod api;
+pub mod app_paths;
 pub mod cache;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod hash;
 pub mod install;
 pub mod local;

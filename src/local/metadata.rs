@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -9,12 +10,14 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::api::models::AddonDetails;
+use crate::app_paths;
+use crate::hash::sha256_hex;
 use crate::install::apply::{InstallActionPerformed, InstallResult, InstalledItem};
 use crate::install::dependencies::InstalledRemoteAddon;
 use crate::install::plan::{InstallPlan, InstallPlanItem};
 use crate::install::remote;
 
-pub const INSTALLED_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const INSTALLED_METADATA_SCHEMA_VERSION: u32 = 2;
 pub const INSTALLED_BY_REMOTE_INSTALL: &str = "remote-install";
 pub const INSTALLED_BY_REMOTE_UPDATE: &str = "remote-update";
 pub const INSTALLED_BY_DEPENDENCY_INSTALL: &str = "dependency-install";
@@ -22,6 +25,8 @@ pub const INSTALLED_BY_ZIP_INSTALL: &str = "zip-install";
 pub const INSTALLED_BY_IMPORTED_CURRENT: &str = "imported-current";
 pub const INSTALLED_BY_FIRST_RUN_IMPORT: &str = "first-run-import";
 pub const INSTALLED_BY_LINKED_EXISTING: &str = "linked-existing";
+
+static METADATA_STORE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,9 +59,7 @@ impl InstalledMetadata {
     }
 
     pub fn normalize(mut self) -> Self {
-        if self.schema_version == 0 {
-            self.schema_version = INSTALLED_METADATA_SCHEMA_VERSION;
-        }
+        self.schema_version = INSTALLED_METADATA_SCHEMA_VERSION;
 
         let keys = self.addons.keys().cloned().collect::<Vec<_>>();
         for key in keys {
@@ -143,7 +146,11 @@ pub struct RemoteInstallMetadata<'a> {
     pub source_addon_uid: Option<&'a str>,
 }
 
-pub fn installed_metadata_path(addons_dir: &Path) -> PathBuf {
+pub fn installed_metadata_path() -> Result<PathBuf, InstalledMetadataError> {
+    Ok(app_paths::metadata_file_path()?)
+}
+
+pub fn legacy_installed_metadata_path(addons_dir: &Path) -> PathBuf {
     addons_dir
         .parent()
         .unwrap_or(addons_dir)
@@ -151,29 +158,58 @@ pub fn installed_metadata_path(addons_dir: &Path) -> PathBuf {
         .join("installed.json")
 }
 
+pub fn installed_metadata_key(addons_dir: &Path) -> Result<String, InstalledMetadataError> {
+    let path = normalized_absolute_path(addons_dir)?;
+    Ok(sha256_hex(path_key_string(&path).as_bytes()))
+}
+
 pub fn load_installed_metadata(
     addons_dir: &Path,
 ) -> Result<InstalledMetadata, InstalledMetadataError> {
-    let path = installed_metadata_path(addons_dir);
+    let _guard = lock_metadata_store()?;
+    load_installed_metadata_locked(addons_dir)
+}
+
+fn load_installed_metadata_locked(
+    addons_dir: &Path,
+) -> Result<InstalledMetadata, InstalledMetadataError> {
+    let mut store = load_metadata_store()?;
+    let migrated = migrate_legacy_metadata(addons_dir, &mut store)?;
+    if migrated {
+        save_metadata_store(&store)?;
+    }
+
+    let key = installed_metadata_key(addons_dir)?;
+    let Some(installation) = store.installations.get(&key) else {
+        return Ok(InstalledMetadata::default());
+    };
+
+    Ok(installation.clone().into_installed_metadata())
+}
+
+fn load_metadata_store() -> Result<InstalledMetadataStore, InstalledMetadataError> {
+    let path = installed_metadata_path()?;
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(InstalledMetadata::default());
+            return Ok(InstalledMetadataStore::default());
         }
         Err(error) => return Err(error.into()),
     };
 
-    Ok(serde_json::from_str::<InstalledMetadata>(&contents)?.normalize())
+    Ok(serde_json::from_str::<InstalledMetadataStore>(&contents)?.normalize())
 }
 
 pub fn load_installed_metadata_or_default(addons_dir: &Path) -> InstalledMetadata {
     match load_installed_metadata(addons_dir) {
         Ok(metadata) => metadata,
         Err(error) => {
+            let path = installed_metadata_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|path_error| format!("app data metadata path ({path_error})"));
             warn!(
                 "could not load installed addon metadata from {}: {}",
-                installed_metadata_path(addons_dir).display(),
-                error
+                path, error
             );
             InstalledMetadata::default()
         }
@@ -184,20 +220,103 @@ pub fn save_installed_metadata(
     addons_dir: &Path,
     metadata: &InstalledMetadata,
 ) -> Result<(), InstalledMetadataError> {
-    let path = installed_metadata_path(addons_dir);
+    let _guard = lock_metadata_store()?;
+    save_installed_metadata_locked(addons_dir, metadata)
+}
+
+fn save_installed_metadata_locked(
+    addons_dir: &Path,
+    metadata: &InstalledMetadata,
+) -> Result<(), InstalledMetadataError> {
+    let mut store = load_metadata_store()?;
+    let _ = migrate_legacy_metadata(addons_dir, &mut store)?;
+    let normalized_path = normalized_addons_path_string(addons_dir)?;
+    let key = installed_metadata_key(addons_dir)?;
+    store.installations.insert(
+        key,
+        InstalledInstallationMetadata::from_installed_metadata(normalized_path, metadata.clone()),
+    );
+    save_metadata_store(&store)
+}
+
+fn save_metadata_store(store: &InstalledMetadataStore) -> Result<(), InstalledMetadataError> {
+    let path = installed_metadata_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let metadata = metadata.clone().normalize();
-    fs::write(path, serde_json::to_string_pretty(&metadata)?)?;
+    let store = store.clone().normalize();
+    fs::write(path, serde_json::to_string_pretty(&store)?)?;
     Ok(())
+}
+
+fn migrate_legacy_metadata(
+    addons_dir: &Path,
+    store: &mut InstalledMetadataStore,
+) -> Result<bool, InstalledMetadataError> {
+    let legacy_path = legacy_installed_metadata_path(addons_dir);
+    let contents = match fs::read_to_string(&legacy_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            warn!(
+                "could not read legacy installed addon metadata from {}: {}",
+                legacy_path.display(),
+                error
+            );
+            return Ok(false);
+        }
+    };
+
+    let legacy = match serde_json::from_str::<InstalledMetadata>(&contents) {
+        Ok(metadata) => metadata.normalize(),
+        Err(error) => {
+            warn!(
+                "could not parse legacy installed addon metadata from {}: {}",
+                legacy_path.display(),
+                error
+            );
+            return Ok(false);
+        }
+    };
+
+    if legacy.addons.is_empty() && !legacy.first_run_baseline_complete {
+        return Ok(false);
+    }
+
+    let key = installed_metadata_key(addons_dir)?;
+    let normalized_path = normalized_addons_path_string(addons_dir)?;
+    let installation =
+        store
+            .installations
+            .entry(key)
+            .or_insert_with(|| InstalledInstallationMetadata {
+                addons_path: normalized_path,
+                addons: BTreeMap::new(),
+                first_run_baseline_complete: false,
+            });
+
+    let mut changed = false;
+    for (folder_name, addon) in legacy.addons {
+        if !installation.addons.contains_key(&folder_name) {
+            installation.addons.insert(folder_name, addon);
+            changed = true;
+        }
+    }
+
+    if legacy.first_run_baseline_complete && !installation.first_run_baseline_complete {
+        installation.first_run_baseline_complete = true;
+        changed = true;
+    }
+
+    Ok(changed)
 }
 
 pub fn remove_installed_metadata(
     addons_dir: &Path,
     folder_name: &str,
 ) -> Result<(), InstalledMetadataError> {
-    let mut metadata = load_installed_metadata(addons_dir)?;
+    let _guard = lock_metadata_store()?;
+    let mut metadata = load_installed_metadata_locked(addons_dir)?;
     let matching_key = metadata
         .addons
         .keys()
@@ -206,7 +325,7 @@ pub fn remove_installed_metadata(
 
     if let Some(key) = matching_key {
         metadata.addons.remove(&key);
-        save_installed_metadata(addons_dir, &metadata)?;
+        save_installed_metadata_locked(addons_dir, &metadata)?;
     }
 
     Ok(())
@@ -234,11 +353,21 @@ pub fn record_remote_install_metadata(
     result: &InstallResult,
     remote_metadata: RemoteInstallMetadata<'_>,
 ) -> Result<(), InstalledMetadataError> {
+    let _guard = lock_metadata_store()?;
+    record_remote_install_metadata_locked(addons_dir, plan, result, remote_metadata)
+}
+
+fn record_remote_install_metadata_locked(
+    addons_dir: &Path,
+    plan: &InstallPlan,
+    result: &InstallResult,
+    remote_metadata: RemoteInstallMetadata<'_>,
+) -> Result<(), InstalledMetadataError> {
     if !install_result_applied(result) {
         return Ok(());
     }
 
-    let mut metadata = load_installed_metadata(addons_dir)?;
+    let mut metadata = load_installed_metadata_locked(addons_dir)?;
     let installed_at = current_timestamp_string();
 
     for item in applied_items(result) {
@@ -253,10 +382,19 @@ pub fn record_remote_install_metadata(
         );
     }
 
-    save_installed_metadata(addons_dir, &metadata)
+    save_installed_metadata_locked(addons_dir, &metadata)
 }
 
 pub fn record_zip_install_metadata(
+    addons_dir: &Path,
+    plan: &InstallPlan,
+    result: &InstallResult,
+) -> Result<(), InstalledMetadataError> {
+    let _guard = lock_metadata_store()?;
+    record_zip_install_metadata_locked(addons_dir, plan, result)
+}
+
+fn record_zip_install_metadata_locked(
     addons_dir: &Path,
     plan: &InstallPlan,
     result: &InstallResult,
@@ -265,7 +403,7 @@ pub fn record_zip_install_metadata(
         return Ok(());
     }
 
-    let mut metadata = load_installed_metadata(addons_dir)?;
+    let mut metadata = load_installed_metadata_locked(addons_dir)?;
     let installed_at = current_timestamp_string();
 
     for item in applied_items(result) {
@@ -280,7 +418,7 @@ pub fn record_zip_install_metadata(
         );
     }
 
-    save_installed_metadata(addons_dir, &metadata)
+    save_installed_metadata_locked(addons_dir, &metadata)
 }
 
 fn remote_metadata_entry(
@@ -323,6 +461,91 @@ fn remote_metadata_entry(
             .map(ToOwned::to_owned)
             .and_then(normalize_string),
         match_confidence: None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct InstalledMetadataStore {
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    installations: BTreeMap<String, InstalledInstallationMetadata>,
+    #[serde(default, skip_serializing)]
+    addons: BTreeMap<String, InstalledAddonMetadata>,
+    #[serde(default, skip_serializing)]
+    first_run_baseline_complete: bool,
+}
+
+impl Default for InstalledMetadataStore {
+    fn default() -> Self {
+        Self {
+            schema_version: INSTALLED_METADATA_SCHEMA_VERSION,
+            installations: BTreeMap::new(),
+            addons: BTreeMap::new(),
+            first_run_baseline_complete: false,
+        }
+    }
+}
+
+impl InstalledMetadataStore {
+    fn normalize(mut self) -> Self {
+        self.schema_version = INSTALLED_METADATA_SCHEMA_VERSION;
+
+        for (key, installation) in &mut self.installations {
+            installation.normalize(key);
+        }
+
+        if !self.addons.is_empty() || self.first_run_baseline_complete {
+            let mut legacy = InstalledInstallationMetadata {
+                addons_path: String::new(),
+                addons: std::mem::take(&mut self.addons),
+                first_run_baseline_complete: self.first_run_baseline_complete,
+            };
+            legacy.normalize("");
+            self.installations
+                .entry("legacy-unscoped".to_owned())
+                .or_insert(legacy);
+        }
+
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct InstalledInstallationMetadata {
+    addons_path: String,
+    addons: BTreeMap<String, InstalledAddonMetadata>,
+    #[serde(skip_serializing_if = "is_false")]
+    first_run_baseline_complete: bool,
+}
+
+impl InstalledInstallationMetadata {
+    fn normalize(&mut self, _key: &str) {
+        let keys = self.addons.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            if let Some(addon) = self.addons.get_mut(&key) {
+                addon.normalize(&key);
+            }
+        }
+    }
+
+    fn from_installed_metadata(addons_path: String, metadata: InstalledMetadata) -> Self {
+        let metadata = metadata.normalize();
+        Self {
+            addons_path,
+            addons: metadata.addons,
+            first_run_baseline_complete: metadata.first_run_baseline_complete,
+        }
+    }
+
+    fn into_installed_metadata(self) -> InstalledMetadata {
+        InstalledMetadata {
+            schema_version: INSTALLED_METADATA_SCHEMA_VERSION,
+            addons: self.addons,
+            first_run_baseline_complete: self.first_run_baseline_complete,
+        }
+        .normalize()
     }
 }
 
@@ -408,6 +631,43 @@ fn normalize_string(value: String) -> Option<String> {
     }
 }
 
+fn normalized_addons_path_string(addons_dir: &Path) -> Result<String, InstalledMetadataError> {
+    Ok(normalized_absolute_path(addons_dir)?.display().to_string())
+}
+
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf, InstalledMetadataError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(normalize_components(&absolute))
+}
+
+fn normalize_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(value) => normalized.push(value),
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn path_key_string(path: &Path) -> String {
+    let value = path.display().to_string();
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    }
+}
+
 fn default_schema_version() -> u32 {
     INSTALLED_METADATA_SCHEMA_VERSION
 }
@@ -424,22 +684,39 @@ pub fn current_timestamp_string() -> String {
         .to_string()
 }
 
+fn lock_metadata_store() -> Result<MutexGuard<'static, ()>, InstalledMetadataError> {
+    METADATA_STORE_LOCK.lock().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "installed metadata store lock is poisoned",
+        )
+        .into()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use tempfile::tempdir;
 
     use super::{
-        installed_metadata_path, load_installed_metadata, load_installed_metadata_or_default,
+        installed_metadata_key, installed_metadata_path, legacy_installed_metadata_path,
+        load_installed_metadata, load_installed_metadata_or_default,
         record_remote_install_metadata, record_zip_install_metadata, remove_installed_metadata,
         save_installed_metadata, InstalledAddonMetadata, InstalledMetadata, RemoteInstallMetadata,
         INSTALLED_BY_REMOTE_INSTALL, INSTALLED_BY_REMOTE_UPDATE, INSTALLED_BY_ZIP_INSTALL,
     };
     use crate::api::models::AddonDetails;
+    use crate::app_paths::with_app_data_dir_for_test;
     use crate::install::apply::{InstallActionPerformed, InstallResult, InstalledItem};
     use crate::install::plan::{InstallPlan, InstallPlanAction, InstallPlanItem};
+
+    fn with_temp_app_data<T>(test: impl FnOnce(&Path) -> T) -> T {
+        let dir = tempdir().unwrap();
+        with_app_data_dir_for_test(dir.path(), || test(dir.path()))
+    }
 
     fn plan(addons_dir: PathBuf, folder_name: &str, version: &str) -> InstallPlan {
         InstallPlan {
@@ -484,184 +761,316 @@ mod tests {
     }
 
     #[test]
-    fn metadata_path_is_derived_from_addons_parent() {
-        let addons_dir = PathBuf::from("/Users/Unai/Documents/Elder Scrolls Online/live/AddOns");
+    fn metadata_path_uses_app_data_not_addons_parent() {
+        with_temp_app_data(|app_data| {
+            let addons_dir =
+                PathBuf::from("/Users/Unai/Documents/Elder Scrolls Online/live/AddOns");
 
-        assert_eq!(
-            installed_metadata_path(&addons_dir),
-            PathBuf::from(
-                "/Users/Unai/Documents/Elder Scrolls Online/live/.scribe-addon-manager/installed.json"
-            )
-        );
+            assert_eq!(
+                installed_metadata_path().unwrap(),
+                app_data.join("metadata").join("installed.json")
+            );
+            assert_eq!(
+                legacy_installed_metadata_path(&addons_dir),
+                PathBuf::from(
+                    "/Users/Unai/Documents/Elder Scrolls Online/live/.scribe-addon-manager/installed.json"
+                )
+            );
+            assert!(!installed_metadata_path()
+                .unwrap()
+                .starts_with(addons_dir.parent().unwrap()));
+        });
     }
 
     #[test]
     fn metadata_save_and_load_round_trip() {
-        let dir = tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
-        let mut metadata = InstalledMetadata::default();
-        metadata.addons.insert(
-            "ExampleAddon".to_owned(),
-            InstalledAddonMetadata {
-                folder_name: "ExampleAddon".to_owned(),
-                remote_uid: Some("42".to_owned()),
-                installed_at: "1".to_owned(),
-                installed_by: INSTALLED_BY_REMOTE_INSTALL.to_owned(),
-                ..InstalledAddonMetadata::default()
-            },
-        );
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let mut metadata = InstalledMetadata::default();
+            metadata.addons.insert(
+                "ExampleAddon".to_owned(),
+                InstalledAddonMetadata {
+                    folder_name: "ExampleAddon".to_owned(),
+                    remote_uid: Some("42".to_owned()),
+                    installed_at: "1".to_owned(),
+                    installed_by: INSTALLED_BY_REMOTE_INSTALL.to_owned(),
+                    ..InstalledAddonMetadata::default()
+                },
+            );
 
-        save_installed_metadata(&addons_dir, &metadata).unwrap();
-        let loaded = load_installed_metadata(&addons_dir).unwrap();
+            save_installed_metadata(&addons_dir, &metadata).unwrap();
+            let loaded = load_installed_metadata(&addons_dir).unwrap();
 
-        assert_eq!(loaded.schema_version, 1);
-        assert_eq!(
-            loaded
-                .addons
-                .get("ExampleAddon")
-                .unwrap()
-                .remote_uid
-                .as_deref(),
-            Some("42")
-        );
+            assert_eq!(loaded.schema_version, 2);
+            assert_eq!(
+                loaded
+                    .addons
+                    .get("ExampleAddon")
+                    .unwrap()
+                    .remote_uid
+                    .as_deref(),
+                Some("42")
+            );
+        });
     }
 
     #[test]
     fn missing_and_corrupt_metadata_load_as_empty_with_default_helper() {
-        let dir = tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
 
-        assert!(load_installed_metadata_or_default(&addons_dir)
-            .addons
-            .is_empty());
+            assert!(load_installed_metadata_or_default(&addons_dir)
+                .addons
+                .is_empty());
 
-        let path = installed_metadata_path(&addons_dir);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "{not json").unwrap();
+            let path = installed_metadata_path().unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "{not json").unwrap();
 
-        assert!(load_installed_metadata_or_default(&addons_dir)
-            .addons
-            .is_empty());
+            assert!(load_installed_metadata_or_default(&addons_dir)
+                .addons
+                .is_empty());
+        });
     }
 
     #[test]
     fn install_writes_metadata_for_installed_folder() {
-        let dir = tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
-        let plan = plan(addons_dir.clone(), "ExampleAddon", "1");
-        let result = result(&addons_dir, "ExampleAddon");
-        let details = details("42", "Remote Example", "1.0.0");
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let plan = plan(addons_dir.clone(), "ExampleAddon", "1");
+            let result = result(&addons_dir, "ExampleAddon");
+            let details = details("42", "Remote Example", "1.0.0");
 
-        record_remote_install_metadata(
-            &addons_dir,
-            &plan,
-            &result,
-            RemoteInstallMetadata {
-                details: &details,
-                remote_uid: "42",
-                installed_by: INSTALLED_BY_REMOTE_INSTALL,
-                source_addon_uid: None,
-            },
-        )
-        .unwrap();
+            record_remote_install_metadata(
+                &addons_dir,
+                &plan,
+                &result,
+                RemoteInstallMetadata {
+                    details: &details,
+                    remote_uid: "42",
+                    installed_by: INSTALLED_BY_REMOTE_INSTALL,
+                    source_addon_uid: None,
+                },
+            )
+            .unwrap();
 
-        let metadata = load_installed_metadata(&addons_dir).unwrap();
-        let addon = metadata.addons.get("ExampleAddon").unwrap();
-        assert_eq!(addon.folder_name, "ExampleAddon");
-        assert_eq!(addon.remote_uid.as_deref(), Some("42"));
-        assert_eq!(addon.remote_name.as_deref(), Some("Remote Example"));
-        assert_eq!(addon.remote_version.as_deref(), Some("1.0.0"));
-        assert_eq!(addon.remote_updated_date, Some(1_700_000_000));
-        assert_eq!(
-            addon.remote_info_url.as_deref(),
-            Some("https://www.esoui.com/downloads/info42.html")
-        );
-        assert_eq!(
-            addon.remote_download_url.as_deref(),
-            Some("https://cdn.esoui.com/addons/example.zip")
-        );
-        assert_eq!(addon.file_name.as_deref(), Some("Example.zip"));
-        assert_eq!(addon.md5.as_deref(), Some("abc123"));
-        assert_eq!(addon.installed_by, INSTALLED_BY_REMOTE_INSTALL);
-        assert_eq!(addon.local_title.as_deref(), Some("Local Title"));
-        assert_eq!(addon.local_version.as_deref(), Some("1"));
+            let metadata = load_installed_metadata(&addons_dir).unwrap();
+            let addon = metadata.addons.get("ExampleAddon").unwrap();
+            assert_eq!(addon.folder_name, "ExampleAddon");
+            assert_eq!(addon.remote_uid.as_deref(), Some("42"));
+            assert_eq!(addon.remote_name.as_deref(), Some("Remote Example"));
+            assert_eq!(addon.remote_version.as_deref(), Some("1.0.0"));
+            assert_eq!(addon.remote_updated_date, Some(1_700_000_000));
+            assert_eq!(
+                addon.remote_info_url.as_deref(),
+                Some("https://www.esoui.com/downloads/info42.html")
+            );
+            assert_eq!(
+                addon.remote_download_url.as_deref(),
+                Some("https://cdn.esoui.com/addons/example.zip")
+            );
+            assert_eq!(addon.file_name.as_deref(), Some("Example.zip"));
+            assert_eq!(addon.md5.as_deref(), Some("abc123"));
+            assert_eq!(addon.installed_by, INSTALLED_BY_REMOTE_INSTALL);
+            assert_eq!(addon.local_title.as_deref(), Some("Local Title"));
+            assert_eq!(addon.local_version.as_deref(), Some("1"));
+        });
     }
 
     #[test]
     fn update_overwrites_metadata() {
-        let dir = tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
-        let plan = plan(addons_dir.clone(), "ExampleAddon", "2");
-        let result = result(&addons_dir, "ExampleAddon");
-        let old_details = details("42", "Remote Example", "1.0.0");
-        let new_details = details("42", "Remote Example", "2.0.0");
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let plan = plan(addons_dir.clone(), "ExampleAddon", "2");
+            let result = result(&addons_dir, "ExampleAddon");
+            let old_details = details("42", "Remote Example", "1.0.0");
+            let new_details = details("42", "Remote Example", "2.0.0");
 
-        record_remote_install_metadata(
-            &addons_dir,
-            &plan,
-            &result,
-            RemoteInstallMetadata {
-                details: &old_details,
-                remote_uid: "42",
-                installed_by: INSTALLED_BY_REMOTE_INSTALL,
-                source_addon_uid: None,
-            },
-        )
-        .unwrap();
-        record_remote_install_metadata(
-            &addons_dir,
-            &plan,
-            &result,
-            RemoteInstallMetadata {
-                details: &new_details,
-                remote_uid: "42",
-                installed_by: INSTALLED_BY_REMOTE_UPDATE,
-                source_addon_uid: None,
-            },
-        )
-        .unwrap();
+            record_remote_install_metadata(
+                &addons_dir,
+                &plan,
+                &result,
+                RemoteInstallMetadata {
+                    details: &old_details,
+                    remote_uid: "42",
+                    installed_by: INSTALLED_BY_REMOTE_INSTALL,
+                    source_addon_uid: None,
+                },
+            )
+            .unwrap();
+            record_remote_install_metadata(
+                &addons_dir,
+                &plan,
+                &result,
+                RemoteInstallMetadata {
+                    details: &new_details,
+                    remote_uid: "42",
+                    installed_by: INSTALLED_BY_REMOTE_UPDATE,
+                    source_addon_uid: None,
+                },
+            )
+            .unwrap();
 
-        let metadata = load_installed_metadata(&addons_dir).unwrap();
-        let addon = metadata.addons.get("ExampleAddon").unwrap();
-        assert_eq!(addon.remote_version.as_deref(), Some("2.0.0"));
-        assert_eq!(addon.installed_by, INSTALLED_BY_REMOTE_UPDATE);
-        assert_eq!(addon.local_version.as_deref(), Some("2"));
+            let metadata = load_installed_metadata(&addons_dir).unwrap();
+            let addon = metadata.addons.get("ExampleAddon").unwrap();
+            assert_eq!(addon.remote_version.as_deref(), Some("2.0.0"));
+            assert_eq!(addon.installed_by, INSTALLED_BY_REMOTE_UPDATE);
+            assert_eq!(addon.local_version.as_deref(), Some("2"));
+        });
     }
 
     #[test]
     fn remove_deletes_metadata_entry() {
-        let dir = tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
-        let mut metadata = InstalledMetadata::default();
-        metadata.addons.insert(
-            "ExampleAddon".to_owned(),
-            InstalledAddonMetadata {
-                folder_name: "ExampleAddon".to_owned(),
-                installed_at: "1".to_owned(),
-                installed_by: INSTALLED_BY_ZIP_INSTALL.to_owned(),
-                ..InstalledAddonMetadata::default()
-            },
-        );
-        save_installed_metadata(&addons_dir, &metadata).unwrap();
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let mut metadata = InstalledMetadata::default();
+            metadata.addons.insert(
+                "ExampleAddon".to_owned(),
+                InstalledAddonMetadata {
+                    folder_name: "ExampleAddon".to_owned(),
+                    installed_at: "1".to_owned(),
+                    installed_by: INSTALLED_BY_ZIP_INSTALL.to_owned(),
+                    ..InstalledAddonMetadata::default()
+                },
+            );
+            save_installed_metadata(&addons_dir, &metadata).unwrap();
 
-        remove_installed_metadata(&addons_dir, "exampleaddon").unwrap();
+            remove_installed_metadata(&addons_dir, "exampleaddon").unwrap();
 
-        let metadata = load_installed_metadata(&addons_dir).unwrap();
-        assert!(!metadata.addons.contains_key("ExampleAddon"));
+            let metadata = load_installed_metadata(&addons_dir).unwrap();
+            assert!(!metadata.addons.contains_key("ExampleAddon"));
+        });
     }
 
     #[test]
     fn zip_install_writes_local_metadata_without_remote_uid() {
-        let dir = tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
-        let plan = plan(addons_dir.clone(), "ZipAddon", "1");
-        let result = result(&addons_dir, "ZipAddon");
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let plan = plan(addons_dir.clone(), "ZipAddon", "1");
+            let result = result(&addons_dir, "ZipAddon");
 
-        record_zip_install_metadata(&addons_dir, &plan, &result).unwrap();
+            record_zip_install_metadata(&addons_dir, &plan, &result).unwrap();
 
-        let metadata = load_installed_metadata(&addons_dir).unwrap();
-        let addon = metadata.addons.get("ZipAddon").unwrap();
-        assert_eq!(addon.remote_uid, None);
-        assert_eq!(addon.installed_by, INSTALLED_BY_ZIP_INSTALL);
+            let metadata = load_installed_metadata(&addons_dir).unwrap();
+            let addon = metadata.addons.get("ZipAddon").unwrap();
+            assert_eq!(addon.remote_uid, None);
+            assert_eq!(addon.installed_by, INSTALLED_BY_ZIP_INSTALL);
+        });
+    }
+
+    #[test]
+    fn metadata_is_scoped_per_addons_path() {
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let live_addons = dir.path().join("live").join("AddOns");
+            let pts_addons = dir.path().join("pts").join("AddOns");
+            let mut live_metadata = InstalledMetadata::default();
+            let mut pts_metadata = InstalledMetadata::default();
+            live_metadata.addons.insert(
+                "LiveAddon".to_owned(),
+                InstalledAddonMetadata {
+                    folder_name: "LiveAddon".to_owned(),
+                    installed_at: "1".to_owned(),
+                    installed_by: INSTALLED_BY_ZIP_INSTALL.to_owned(),
+                    ..InstalledAddonMetadata::default()
+                },
+            );
+            pts_metadata.addons.insert(
+                "PtsAddon".to_owned(),
+                InstalledAddonMetadata {
+                    folder_name: "PtsAddon".to_owned(),
+                    installed_at: "2".to_owned(),
+                    installed_by: INSTALLED_BY_ZIP_INSTALL.to_owned(),
+                    ..InstalledAddonMetadata::default()
+                },
+            );
+
+            save_installed_metadata(&live_addons, &live_metadata).unwrap();
+            save_installed_metadata(&pts_addons, &pts_metadata).unwrap();
+
+            let live_loaded = load_installed_metadata(&live_addons).unwrap();
+            let pts_loaded = load_installed_metadata(&pts_addons).unwrap();
+            assert!(live_loaded.addons.contains_key("LiveAddon"));
+            assert!(!live_loaded.addons.contains_key("PtsAddon"));
+            assert!(pts_loaded.addons.contains_key("PtsAddon"));
+            assert!(!pts_loaded.addons.contains_key("LiveAddon"));
+
+            let store: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(installed_metadata_path().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(store["schema_version"], 2);
+            assert_eq!(store["installations"].as_object().unwrap().len(), 2);
+            assert_eq!(installed_metadata_key(&live_addons).unwrap().len(), 64);
+        });
+    }
+
+    #[test]
+    fn legacy_metadata_is_migrated_without_deleting_old_file() {
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let legacy_path = legacy_installed_metadata_path(&addons_dir);
+            fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+            fs::write(
+                &legacy_path,
+                r#"{
+  "schema_version": 1,
+  "first_run_baseline_complete": true,
+  "addons": {
+    "LegacyAddon": {
+      "folder_name": "LegacyAddon",
+      "remote_uid": "42",
+      "installed_at": "1",
+      "installed_by": "remote-install"
+    }
+  }
+}"#,
+            )
+            .unwrap();
+
+            let metadata = load_installed_metadata(&addons_dir).unwrap();
+
+            assert_eq!(
+                metadata
+                    .addons
+                    .get("LegacyAddon")
+                    .and_then(|addon| addon.remote_uid.as_deref()),
+                Some("42")
+            );
+            assert!(metadata.first_run_baseline_complete);
+            assert!(legacy_path.exists());
+            assert!(installed_metadata_path().unwrap().is_file());
+        });
+    }
+
+    #[test]
+    fn save_does_not_create_legacy_metadata_folder_in_live_dir() {
+        with_temp_app_data(|_| {
+            let dir = tempdir().unwrap();
+            let live_dir = dir.path().join("live");
+            let addons_dir = live_dir.join("AddOns");
+            let mut metadata = InstalledMetadata::default();
+            metadata.addons.insert(
+                "ExampleAddon".to_owned(),
+                InstalledAddonMetadata {
+                    folder_name: "ExampleAddon".to_owned(),
+                    installed_at: "1".to_owned(),
+                    installed_by: INSTALLED_BY_ZIP_INSTALL.to_owned(),
+                    ..InstalledAddonMetadata::default()
+                },
+            );
+
+            save_installed_metadata(&addons_dir, &metadata).unwrap();
+
+            assert!(installed_metadata_path().unwrap().is_file());
+            assert!(!live_dir.join(".scribe-addon-manager").exists());
+        });
     }
 }

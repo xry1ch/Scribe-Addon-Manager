@@ -313,12 +313,10 @@ fn create_backup_session_dir(
     addons_dir: &Path,
     backup_root: Option<&Path>,
 ) -> Result<PathBuf, InstallApplyError> {
-    let root = backup_root.map(Path::to_path_buf).unwrap_or_else(|| {
-        addons_dir
-            .parent()
-            .map(|parent| parent.join(".eso-addon-manager-backups"))
-            .unwrap_or_else(|| PathBuf::from(".eso-addon-manager-backups"))
-    });
+    let root = match backup_root {
+        Some(path) => path.to_path_buf(),
+        None => crate::app_paths::default_backup_dir()?,
+    };
     validate_backup_root_location(&root, addons_dir)?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -446,12 +444,18 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use crate::app_paths::with_app_data_dir_for_test;
     use tempfile::tempdir;
 
     use crate::install::apply::{
         apply_install_plan, apply_install_plan_sequence, InstallActionPerformed, InstallApplyError,
     };
     use crate::install::plan::{InstallPlan, InstallPlanAction, InstallPlanItem};
+
+    fn with_temp_app_data<T>(test: impl FnOnce(&Path) -> T) -> T {
+        let dir = tempdir().unwrap();
+        with_app_data_dir_for_test(dir.path(), || test(dir.path()))
+    }
 
     fn plan(
         temp_dir: PathBuf,
@@ -510,37 +514,69 @@ mod tests {
 
     #[test]
     fn replace_existing_addon_and_create_backup() {
-        let dir = tempdir().unwrap();
-        let temp = dir.path().join("temp");
-        let addons = dir.path().join("AddOns");
-        write_addon(&temp, "Addon", "new");
-        write_addon(&addons, "Addon", "old");
+        with_temp_app_data(|app_data| {
+            let dir = tempdir().unwrap();
+            let live_dir = dir.path().join("live");
+            let temp = dir.path().join("temp");
+            let addons = live_dir.join("AddOns");
+            write_addon(&temp, "Addon", "new");
+            write_addon(&addons, "Addon", "old");
 
-        let result = apply_install_plan(
-            &plan(
-                temp.clone(),
-                addons.clone(),
-                "Addon",
-                InstallPlanAction::WouldReplaceExisting,
-            ),
-            None,
-        )
-        .unwrap();
+            let result = apply_install_plan(
+                &plan(
+                    temp.clone(),
+                    addons.clone(),
+                    "Addon",
+                    InstallPlanAction::WouldReplaceExisting,
+                ),
+                None,
+            )
+            .unwrap();
 
-        assert_eq!(result.replaced, 1);
-        assert_eq!(
-            result.items[0].action,
-            InstallActionPerformed::ReplacedExisting
-        );
-        assert_eq!(
-            fs::read_to_string(addons.join("Addon").join("marker.txt")).unwrap(),
-            "new"
-        );
-        let backup = result.items[0].backup_folder.as_ref().unwrap();
-        assert_eq!(
-            fs::read_to_string(backup.join("marker.txt")).unwrap(),
-            "old"
-        );
+            assert_eq!(result.replaced, 1);
+            assert_eq!(
+                result.items[0].action,
+                InstallActionPerformed::ReplacedExisting
+            );
+            assert_eq!(
+                fs::read_to_string(addons.join("Addon").join("marker.txt")).unwrap(),
+                "new"
+            );
+            let backup = result.items[0].backup_folder.as_ref().unwrap();
+            assert!(backup.starts_with(app_data.join("backups")));
+            assert_eq!(
+                fs::read_to_string(backup.join("marker.txt")).unwrap(),
+                "old"
+            );
+            assert!(!live_dir.join(".eso-addon-manager-backups").exists());
+        });
+    }
+
+    #[test]
+    fn custom_backup_root_overrides_default() {
+        with_temp_app_data(|app_data| {
+            let dir = tempdir().unwrap();
+            let temp = dir.path().join("temp");
+            let addons = dir.path().join("live").join("AddOns");
+            let custom_backup = dir.path().join("custom-backups");
+            write_addon(&temp, "Addon", "new");
+            write_addon(&addons, "Addon", "old");
+
+            let result = apply_install_plan(
+                &plan(
+                    temp.clone(),
+                    addons.clone(),
+                    "Addon",
+                    InstallPlanAction::WouldReplaceExisting,
+                ),
+                Some(&custom_backup),
+            )
+            .unwrap();
+
+            let backup = result.items[0].backup_folder.as_ref().unwrap();
+            assert!(backup.starts_with(&custom_backup));
+            assert!(!backup.starts_with(app_data.join("backups")));
+        });
     }
 
     #[test]

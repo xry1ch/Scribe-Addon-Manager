@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
 use thiserror::Error;
 
 use crate::api::models::AddonDetails;
@@ -45,17 +44,19 @@ pub fn verify_md5(bytes: &[u8], expected: Option<&str>) -> Result<(), RemoteInst
     }
 }
 
-pub fn keep_download_path(download_dir: Option<&Path>, file_name: &str) -> PathBuf {
+pub fn keep_download_path(
+    download_dir: Option<&Path>,
+    file_name: &str,
+) -> std::io::Result<PathBuf> {
     let dir = download_dir
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_download_dir);
-    unique_path(&dir.join(file_name))
+        .map(Ok)
+        .unwrap_or_else(default_download_dir)?;
+    Ok(unique_path(&dir.join(file_name)))
 }
 
-pub fn default_download_dir() -> PathBuf {
-    ProjectDirs::from("dev", "eso-addon-manager", "eso-addon-manager")
-        .map(|dirs| dirs.cache_dir().join("downloads"))
-        .unwrap_or_else(|| PathBuf::from("downloads"))
+pub fn default_download_dir() -> std::io::Result<PathBuf> {
+    crate::app_paths::download_cache_dir()
 }
 
 pub fn sanitize_remote_file_name(value: &str) -> Option<String> {
@@ -146,7 +147,7 @@ mod tests {
         let existing = dir.path().join("Addon.zip");
         std::fs::write(&existing, "already here").unwrap();
 
-        let path = keep_download_path(Some(dir.path()), "Addon.zip");
+        let path = keep_download_path(Some(dir.path()), "Addon.zip").unwrap();
 
         assert_eq!(path.file_name().unwrap().to_string_lossy(), "Addon-1.zip");
     }
