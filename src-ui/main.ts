@@ -51,6 +51,7 @@ type InstalledSort = "name" | "updated" | "downloads" | "status";
 type SearchMode = "most_downloaded" | "recent";
 type IconName = "check" | "external" | "folder" | "installed" | "rotate" | "search" | "settings" | "target";
 type AddonContextAction = "uninstall" | "clear-savedvariables" | "open-folder";
+type ToastType = "success" | "error" | "warning" | "info";
 type OperationKind =
   | "general"
   | "startup"
@@ -81,8 +82,7 @@ interface AppState {
   operation: OperationKind | null;
   operationTarget: string | null;
   error: string | null;
-  success: string | null;
-  successDetail: string | null;
+  toasts: ToastNotification[];
   warning: string | null;
   installed: InstalledAddonsResponse | null;
   searchQuery: string;
@@ -165,6 +165,13 @@ interface AddonContextMenuState {
   y: number;
 }
 
+interface ToastNotification {
+  id: number;
+  type: ToastType;
+  title: string;
+  message: string | null;
+}
+
 interface UpdateAllProgress {
   index: number;
   total: number;
@@ -186,8 +193,7 @@ const state: AppState = {
   operation: null,
   operationTarget: null,
   error: null,
-  success: null,
-  successDetail: null,
+  toasts: [],
   warning: null,
   installed: null,
   searchQuery: "",
@@ -271,6 +277,7 @@ const ADDON_CONTEXT_MENU_HEIGHT = 132;
 const CONTEXT_MENU_MARGIN = 8;
 const SEARCH_SCROLL_THRESHOLD_PX = 300;
 const UPDATE_ALL_PROGRESS_EVENT = "scribe-update-all-progress";
+const TOAST_AUTO_DISMISS_MS = 4200;
 const TEXT_INPUT_IDS = {
   setupAddonsPath: "scribe-setup-addons-path",
   installedFilter: "scribe-installed-filter",
@@ -292,6 +299,8 @@ const disableDevToolsShortcuts = false;
 
 let searchScrollContainer: HTMLElement | null = null;
 let searchScrollHandler: (() => void) | null = null;
+let nextToastId = 1;
+const toastTimers = new Map<number, number>();
 
 document.addEventListener("contextmenu", handleGlobalContextMenu);
 document.addEventListener("pointerdown", (event) => {
@@ -383,7 +392,6 @@ function render() {
       </aside>
       <section class="content">
         ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
-        ${state.success ? `<div class="banner success compact-banner">${escapeHtml(state.success)}${state.successDetail ? `<p class="banner-helper">${escapeHtml(state.successDetail)}</p>` : ""}</div>` : ""}
         ${state.warning ? `<div class="banner warning">${escapeHtml(state.warning)}</div>` : ""}
         ${renderCurrentTab()}
         ${renderDetailsModal()}
@@ -394,10 +402,35 @@ function render() {
         ${renderRestoreBackupModal()}
         ${renderAddonContextMenu()}
       </section>
+      ${renderToastContainer()}
     </main>
   `;
   bindCommonEvents();
   bindTabEvents();
+}
+
+function renderToastContainer() {
+  if (state.toasts.length === 0) return "";
+  return `
+    <div class="toast-stack" role="region" aria-label="Notifications">
+      ${state.toasts.map(renderToast).join("")}
+    </div>
+  `;
+}
+
+function renderToast(toast: ToastNotification) {
+  const role = toast.type === "error" ? "alert" : "status";
+  const iconMarkup = toast.type === "success" ? resultCheckIcon() : toast.type === "error" || toast.type === "warning" ? resultWarningIcon() : neutralDependencyIcon();
+  return `
+    <article class="toast toast-${toast.type}" role="${role}" aria-live="${toast.type === "error" ? "assertive" : "polite"}">
+      <span class="toast-icon" aria-hidden="true">${iconMarkup}</span>
+      <div class="toast-copy">
+        <strong>${escapeHtml(toast.title)}</strong>
+        ${toast.message ? `<p>${escapeHtml(toast.message)}</p>` : ""}
+      </div>
+      <button class="toast-close" type="button" aria-label="Dismiss notification" data-toast-close="${toast.id}">Close</button>
+    </article>
+  `;
 }
 
 function renderStartupLoader() {
@@ -481,6 +514,7 @@ function renderInitialSetup() {
         </div>
       </section>
       ${renderInitialImportModal()}
+      ${renderToastContainer()}
     </main>
   `;
 }
@@ -854,8 +888,6 @@ function renderInstalled() {
     </section>
     <section class="addon-list" id="installed-list">${renderInstalledList(view)}</section>
     ${renderUpdateAllProgress()}
-    ${renderUpdateAllResult()}
-    ${hasDetailsOpen() ? "" : renderSingleUpdateResult()}
   `;
 }
 
@@ -869,6 +901,7 @@ function renderInstalledList(view = installedView()) {
 
 function shouldShowUpdateAllButton() {
   if (isInstalledLoading()) return false;
+  if (state.updateAllResult) return false;
   return installedItems().some(isActionableInstalledUpdate);
 }
 
@@ -1183,7 +1216,6 @@ function renderDetailsActionPanels() {
   return `
     ${renderInstallPlan()}
     ${renderInstallResult()}
-    ${renderSingleUpdateResult()}
     ${renderRemoveResult()}
   `;
 }
@@ -1534,9 +1566,6 @@ function renderScreenshotGallery() {
 }
 
 function renderDetailsFooterActions() {
-  if (hasResultSuccess()) {
-    return `<button class="primary" id="close-details-footer" ${guardedOperationRunning() ? "disabled" : ""}>Close</button>`;
-  }
   const removeAddon = state.selectedLocal
     ? `<button class="danger" id="remove-addon" ${disabledAttr()}>${loadingButtonContent("Uninstall", "Uninstalling...", "remove-apply")}</button>`
     : "";
@@ -1566,6 +1595,7 @@ function renderInstallUpdateFooterAction() {
 
   if (!match) return "";
   const target = match.local.folder_name;
+  if (state.singleUpdateResult?.local.folder_name.toLowerCase() === target.toLowerCase()) return "";
   if (isActionableUpdate(match)) {
     return `<button class="primary" data-apply-update-target="${escapeAttr(target)}" ${disabledAttr()}>${loadingButtonContent("Update", singleUpdateButtonLoadingLabel(target), "update-apply", target)}</button>`;
   }
@@ -1582,7 +1612,7 @@ function selectedDetailsStatusNote() {
   if (!local) {
     if (isOperation("install-apply")) return "Installing...";
     if (state.installPlan && !state.installResult) return "Install preview ready";
-    if (state.installResult) return "Installed successfully";
+    if (state.installResult) return "Installed locally";
     return "Not installed locally";
   }
   if (state.singleUpdateResult) return "Update completed";
@@ -1772,6 +1802,7 @@ function renderManualBackupStatus() {
   }
   if (!state.manualBackupResult) return "";
   const hasSkippedFiles = state.manualBackupResult.skipped_files_count > 0;
+  if (!hasSkippedFiles) return "";
   const label = hasSkippedFiles ? "Backup created with warnings" : "Backup created";
 
   return `
@@ -1901,6 +1932,7 @@ function renderInstallPlan() {
 function renderInstallResult() {
   const result = state.installResult;
   if (!result) return "";
+  if (isPlainInstallSuccess(result)) return "";
   return renderCompactInstallResult(result);
 }
 
@@ -1962,58 +1994,6 @@ function renderUpdateAllActionCard(action: UpdateAllAction) {
   `;
 }
 
-function renderUpdateAllResult() {
-  const result = state.updateAllResult;
-  if (!result) return "";
-  const failure = result.failure;
-  const updatedCount = result.results.length;
-  const title = failure
-    ? `Stopped at ${failure.local_folder}: ${failure.message}`
-    : updatedCount > 0
-      ? `Updated ${updatedCount} addon${updatedCount === 1 ? "" : "s"}`
-      : "Already current";
-  return `
-    <section class="panel">
-      <div class="banner ${failure ? "warning" : result.applied ? "success" : "warning"}">${escapeHtml(title)}</div>
-      <div class="summary">
-        ${summaryItem("Updated", updatedCount)}
-        ${summaryItem("Previewed", result.summary.planned_updates)}
-        ${summaryItem("Stopped", failure ? 1 : 0)}
-      </div>
-      ${result.results.length === 0 ? emptyState("No updates applied", "No addons were updated.") : result.results.map(renderUpdateAllResultCard).join("")}
-    </section>
-  `;
-}
-
-function renderUpdateAllResultCard(item: ApplyUpdateAllResponse["results"][number]) {
-  return `
-    <article class="addon-card compact-card">
-      ${CategoryIcon(categoryMeta(item.remote_details.category_name, item.remote_details.category_id, item.remote_details.is_library))}
-      <div class="addon-main">
-        <div class="addon-title-row">
-          <div>
-            <h3>${renderEsoText(item.target.local_folder)}</h3>
-            <p>${renderEsoText(item.remote_details.name ?? item.target.remote_name ?? "Updated addon")}</p>
-          </div>
-          ${statusBadge("Updated", "current")}
-        </div>
-        <div class="meta-grid">
-          ${metaItem("Installed", String(item.installed_new))}
-          ${metaItem("Replaced", String(item.replaced))}
-          ${metaItem("Skipped", String(item.skipped))}
-          ${metaItem("Backup", item.backup_dir)}
-        </div>
-      </div>
-    </article>
-  `;
-}
-
-function renderSingleUpdateResult() {
-  const result = state.singleUpdateResult;
-  if (!result) return "";
-  return renderCompactUpdateResult(result);
-}
-
 type CompactResultKind = "success" | "warning";
 
 interface CompactResultInput {
@@ -2027,6 +2007,8 @@ interface CompactResultInput {
 }
 
 function renderCompactInstallResult(result: InstallRemoteAddonResponse) {
+  if (isPlainInstallSuccess(result)) return "";
+
   if (!result.applied) {
     return renderCompactResultPanel({
       kind: "warning",
@@ -2048,63 +2030,21 @@ function renderCompactInstallResult(result: InstallRemoteAddonResponse) {
     });
   }
 
-  if (result.replaced > 0) {
-    return renderCompactResultPanel({
-      kind: "success",
-      title: "Replaced successfully",
-      message: result.backup_dir ? "A backup was created." : "The addon was replaced.",
-      backupDir: result.backup_dir,
-    });
-  }
-
-  return renderCompactResultPanel({
-    kind: "success",
-    title: "Installed successfully",
-    message: installSuccessMessage(result),
-  });
+  return "";
 }
 
-function installSuccessMessage(result: InstallRemoteAddonResponse) {
-  const requiredInstalled = result.dependency_plan.required_dependencies.filter((dependency) => dependency.status === "will-install").length;
-  if (requiredInstalled > 0) {
-    return `Installed 1 addon and ${requiredInstalled} required ${requiredInstalled === 1 ? "library" : "libraries"}.`;
-  }
-  return "The addon is ready to use in ESO.";
+function isPlainInstallSuccess(result: InstallRemoteAddonResponse) {
+  return result.applied && result.skipped === 0 && !(result.installed_new > 0 && result.replaced > 0);
 }
 
-function renderCompactUpdateResult(result: SingleUpdateApplyResponse) {
-  if (!result.applied) {
-    return renderCompactResultPanel({
-      kind: "warning",
-      title: "Update finished without file changes",
-      message: singleUpdateNoChangeMessage(result),
-      detailsTitle: "Details",
-      details: renderUpdateResultDetails(result),
-    });
-  }
-
-  if (result.skipped > 0 || (result.installed_new > 0 && result.replaced > 0)) {
-    return renderCompactResultPanel({
-      kind: "warning",
-      title: "Updated with warnings",
-      message: "Some items were skipped.",
-      backupDir: result.backup_dir,
-      detailsTitle: "Details",
-      details: renderUpdateResultDetails(result),
-    });
-  }
-
-  return renderCompactResultPanel({
-    kind: "success",
-    title: "Updated successfully",
-    message: result.backup_dir ? "A backup was created." : "The addon is ready to use in ESO.",
-    backupDir: result.backup_dir,
-  });
+function isPlainSingleUpdateSuccess(result: SingleUpdateApplyResponse) {
+  return result.applied && result.skipped === 0 && !(result.installed_new > 0 && result.replaced > 0);
 }
 
 function renderRemoveResult() {
   const result = state.removeResult;
   if (!result) return "";
+  if (result.removed_addon) return "";
 
   return renderCompactResultPanel({
     kind: result.removed_addon ? "success" : "warning",
@@ -2157,7 +2097,7 @@ function renderCompactResultPanel(result: CompactResultInput) {
 function renderBackupDetails(backupDir: string) {
   return `
     <details class="result-details">
-      <summary>Details</summary>
+      <summary>Backup details</summary>
       <p class="technical-path" title="${escapeAttr(backupDir)}">${escapeHtml(backupDir)}</p>
     </details>
   `;
@@ -2185,17 +2125,11 @@ function renderInstallResultDetails(result: InstallRemoteAddonResponse) {
   `;
 }
 
-function renderUpdateResultDetails(result: SingleUpdateApplyResponse) {
-  return `
-    <div class="summary compact-summary">
-      ${summaryItem("Installed", result.installed_new)}
-      ${summaryItem("Replaced", result.replaced)}
-      ${summaryItem("Skipped", result.skipped)}
-      ${summaryItem("Applied", result.applied ? 1 : 0)}
-    </div>
-    <p class="technical-path" title="${escapeAttr(result.addons_dir)}">Target AddOns path: ${escapeHtml(result.addons_dir)}</p>
-    ${renderInstalledItems(result.items)}
-  `;
+function updateAllStoppedMessage(result: ApplyUpdateAllResponse) {
+  const failure = result.failure;
+  const updatedCount = result.results.length;
+  const updatedText = `${updatedCount} addon${updatedCount === 1 ? "" : "s"}`;
+  return `Scribe updated ${updatedText} before stopping at ${plainEsoText(failure?.local_folder ?? "the next addon")}.`;
 }
 
 function resultCheckIcon() {
@@ -2420,11 +2354,11 @@ function renderInstalledItems(items: { target_folder: string | null; action: str
 
 function bindCommonEvents() {
   bindAddonContextMenuEvents();
+  bindToastEvents();
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => {
       state.tab = button.dataset.tab as Tab;
       state.error = null;
-      clearSuccess();
       state.warning = null;
       closeAddonContextMenu(false);
       render();
@@ -2436,6 +2370,7 @@ function bindCommonEvents() {
 }
 
 function bindInitialSetupEvents() {
+  bindToastEvents();
   document.querySelector<HTMLInputElement>(`#${TEXT_INPUT_IDS.setupAddonsPath}`)?.addEventListener("input", (event) => {
     state.setupAddonsPath = (event.currentTarget as HTMLInputElement).value;
     clearPendingInitialImport();
@@ -2453,6 +2388,12 @@ function bindInitialSetupEvents() {
     render();
   });
   document.querySelector<HTMLButtonElement>("#confirm-initial-import")?.addEventListener("click", confirmInitialImport);
+}
+
+function bindToastEvents() {
+  document.querySelectorAll<HTMLButtonElement>("[data-toast-close]").forEach((button) => {
+    button.addEventListener("click", () => dismissToast(Number(button.dataset.toastClose)));
+  });
 }
 
 function bindAddonContextMenuEvents() {
@@ -2654,15 +2595,41 @@ function singleUpdateNoChangeMessage(result: SingleUpdateApplyResponse) {
   return result.reason ?? "No addon folders were updated.";
 }
 
-function singleUpdateSuccessMessage(result: SingleUpdateApplyResponse) {
-  if (!result.applied) return singleUpdateNoChangeMessage(result);
-  return `Updated ${plainEsoText(result.remote_details?.name ?? result.remote?.name ?? result.local.folder_name)}.`;
-}
-
 function updateAllSuccessMessage(result: ApplyUpdateAllResponse) {
   const count = result.results.length;
   if (count === 0) return "Already current.";
   return `Updated ${count} addon${count === 1 ? "" : "s"}.`;
+}
+
+function notifyInstallResult(result: InstallRemoteAddonResponse) {
+  if (!isPlainInstallSuccess(result)) return;
+  const addonName = plainEsoText(result.remote.name ?? "The addon");
+  addToast("success", "Addon installed", `${addonName} was installed successfully.`);
+}
+
+function notifySingleUpdateResult(result: SingleUpdateApplyResponse) {
+  if (!result.applied) {
+    addToast("info", "No update applied", singleUpdateNoChangeMessage(result));
+    return;
+  }
+  if (!isPlainSingleUpdateSuccess(result)) {
+    addToast("warning", "Update finished with warnings", "Some items were skipped.");
+    return;
+  }
+  const addonName = plainEsoText(result.remote_details?.name ?? result.remote?.name ?? result.local.folder_name);
+  addToast("success", "Addon updated", `${addonName} was updated successfully.`);
+}
+
+function notifyUpdateAllResult(result: ApplyUpdateAllResponse) {
+  if (result.failure) {
+    addToast("error", "Update stopped", `${updateAllStoppedMessage(result)} ${result.failure.message}`);
+    return;
+  }
+  if (result.results.length === 0) {
+    addToast("info", "No updates applied", "No actionable updates were applied.");
+    return;
+  }
+  addToast("success", "Updates complete", updateAllSuccessMessage(result));
 }
 
 function preventProductionDevToolsShortcut(event: KeyboardEvent) {
@@ -2743,7 +2710,7 @@ function runAddonContextAction(action: AddonContextAction) {
   state.addonContextMenu = null;
 
   if (!local) {
-    state.error = "Addon is no longer installed.";
+    setError("Addon is no longer installed.");
     render();
     return;
   }
@@ -2760,12 +2727,37 @@ function runAddonContextAction(action: AddonContextAction) {
 }
 
 function setSuccess(message: string | null, detail: string | null = null) {
-  state.success = message;
-  state.successDetail = message ? detail : null;
+  if (message) addToast("success", message, detail);
 }
 
-function clearSuccess() {
-  setSuccess(null);
+function setError(message: string) {
+  state.error = message;
+  addToast("error", "Error", message);
+}
+
+function addToast(type: ToastType, title: string, message: string | null = null) {
+  const id = nextToastId++;
+  state.toasts = [...state.toasts, { id, type, title, message }].slice(-5);
+  scheduleToastDismiss(id);
+  render();
+  return id;
+}
+
+function dismissToast(id: number) {
+  if (!Number.isFinite(id)) return;
+  const timer = toastTimers.get(id);
+  if (timer !== undefined) {
+    window.clearTimeout(timer);
+    toastTimers.delete(id);
+  }
+  const previousLength = state.toasts.length;
+  state.toasts = state.toasts.filter((toast) => toast.id !== id);
+  if (state.toasts.length !== previousLength) render();
+}
+
+function scheduleToastDismiss(id: number) {
+  const timer = window.setTimeout(() => dismissToast(id), TOAST_AUTO_DISMISS_MS);
+  toastTimers.set(id, timer);
 }
 
 async function withLoading(task: () => Promise<void>, operation: OperationKind = "general", operationTarget: string | null = null) {
@@ -2773,7 +2765,6 @@ async function withLoading(task: () => Promise<void>, operation: OperationKind =
   state.operation = operation;
   state.operationTarget = operationTarget;
   state.error = null;
-  clearSuccess();
   if (operation === "manual-backup" || operation === "backup-restore") {
     state.manualBackupError = null;
   }
@@ -2788,8 +2779,9 @@ async function withLoading(task: () => Promise<void>, operation: OperationKind =
       state.restoreInspection = null;
       state.restoreZipPath = null;
       state.manualBackupError = message;
+      addToast("error", "Error", message);
     } else {
-      state.error = operationErrorMessage(operation, operationTarget, message);
+      setError(operationErrorMessage(operation, operationTarget, message));
     }
   } finally {
     state.loading = false;
@@ -2968,7 +2960,7 @@ async function browseForFolder(defaultPath: string | null | undefined) {
 
     return typeof selected === "string" ? selected : null;
   } catch (error) {
-    state.error = `Could not open folder browser. ${error instanceof Error ? error.message : String(error)}`;
+    setError(`Could not open folder browser. ${error instanceof Error ? error.message : String(error)}`);
     render();
     return null;
   }
@@ -2986,6 +2978,7 @@ async function browseForBackupZip(defaultPath: string | null | undefined) {
     return typeof selected === "string" ? selected : null;
   } catch (error) {
     state.manualBackupError = `Could not open backup picker. ${error instanceof Error ? error.message : String(error)}`;
+    addToast("error", "Error", state.manualBackupError);
     render();
     return null;
   }
@@ -2996,6 +2989,7 @@ async function defaultBackupDirectory() {
     return await invoke<string>("get_default_backup_dir");
   } catch (error) {
     state.manualBackupError = `Could not resolve default backup folder. ${error instanceof Error ? error.message : String(error)}`;
+    addToast("error", "Error", state.manualBackupError);
     render();
     return null;
   }
@@ -3029,6 +3023,20 @@ async function refreshInstalledData(refresh = false) {
     state.updates = null;
     state.warning = `Remote metadata could not be loaded. Showing local addons only. ${error instanceof Error ? error.message : String(error)}`;
   }
+}
+
+function refreshInstalledAfterUpdate(target?: string) {
+  void (async () => {
+    try {
+      await refreshInstalledData(true);
+      syncSelectedStateAfterUpdate(target);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      state.warning = `Update completed, but Scribe could not refresh installed addons. ${message}`;
+      addToast("warning", "Refresh failed", "Update completed, but Scribe could not refresh installed addons.");
+    }
+    render();
+  })();
 }
 
 function runSearch() {
@@ -3150,7 +3158,7 @@ function openInstalledDetails(folderName: string) {
 function openResolveRemoteMatch(folderName: string) {
   const addon = installedLocalByFolder(folderName);
   if (!addon) {
-    state.error = "Addon is no longer installed.";
+    setError("Addon is no longer installed.");
     render();
     return;
   }
@@ -3348,6 +3356,7 @@ function planInstall() {
         throw error;
       }
       state.path = state.installResult.addons_dir;
+      notifyInstallResult(state.installResult);
       await refreshInstalledData(true);
       syncInstalledStateAfterInstall(state.installResult);
     }
@@ -3359,12 +3368,12 @@ function confirmInstall() {
   const plan = state.installPlan;
   if (!addonId || !plan) return;
   if (!hasInstallablePlanItems(plan)) {
-    state.error = "No valid addon folders were found in this package. Nothing was installed.";
+    setError("No valid addon folders were found in this package. Nothing was installed.");
     render();
     return;
   }
   if (hasRequiredDependencyIssues(plan.dependency_plan)) {
-    state.error = "Some required dependencies could not be resolved safely. Nothing was installed.";
+    setError("Some required dependencies could not be resolved safely. Nothing was installed.");
     render();
     return;
   }
@@ -3386,6 +3395,7 @@ function confirmInstall() {
       downloadDir: state.settings?.download_dir || null,
     });
     state.path = state.installResult.addons_dir;
+    notifyInstallResult(state.installResult);
     await refreshInstalledData(true);
     syncInstalledStateAfterInstall(state.installResult);
   }, "install-apply");
@@ -3463,10 +3473,10 @@ async function applySingleUpdate(target: string) {
   state.operationTarget = target;
   state.singleUpdatePhase = "preparing";
   state.error = null;
-  clearSuccess();
   closeAddonContextMenu(false);
   render();
 
+  let finalizedWithResult = false;
   try {
     await nextFrame();
     state.singleUpdatePhase = "updating";
@@ -3482,18 +3492,19 @@ async function applySingleUpdate(target: string) {
     state.path = state.singleUpdateResult.addons_dir;
     state.updateAllPlan = null;
     state.updateAllResult = null;
-    setSuccess(singleUpdateSuccessMessage(state.singleUpdateResult));
-    await refreshInstalledData(true);
-    syncSelectedStateAfterUpdate(target);
+    notifySingleUpdateResult(state.singleUpdateResult);
+    finalizedWithResult = true;
+    finishUpdateOperation();
+    render();
+    refreshInstalledAfterUpdate(target);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    state.error = operationErrorMessage("update-apply", target, message);
+    setError(operationErrorMessage("update-apply", target, message));
   } finally {
-    state.loading = false;
-    state.operation = null;
-    state.operationTarget = null;
-    state.singleUpdatePhase = null;
-    render();
+    if (!finalizedWithResult) {
+      finishUpdateOperation();
+      render();
+    }
   }
 }
 
@@ -3534,7 +3545,7 @@ function confirmRemoveAddon() {
     });
     state.removeConfirmLocal = null;
     state.removeSavedVariables = false;
-    setSuccess(removeSuccessMessage(state.removeResult), removeSavedVariablesStatusText(state.removeResult));
+    setSuccess("Addon uninstalled", removeSuccessMessage(state.removeResult));
     state.installed = await invoke<InstalledAddonsResponse>("get_installed_addons", { path: effectiveAddonsPath() });
     state.path = state.installed.addons_dir;
     syncInstalledStateAfterRemove(state.removeResult);
@@ -3564,7 +3575,11 @@ function confirmClearSavedVariables() {
     });
     state.clearSavedVariablesResult = result;
     state.clearSavedVariablesConfirmLocal = null;
-    setSuccess(result.deleted_count > 0 ? "SavedVariables cleared." : "No SavedVariables files were found.");
+    if (result.deleted_count > 0) {
+      setSuccess("SavedVariables cleared");
+    } else {
+      addToast("info", "No SavedVariables files found");
+    }
   }, "savedvariables-clear");
 }
 
@@ -3597,6 +3612,11 @@ function confirmManualBackup() {
     state.manualBackupError = null;
     state.restoreResult = null;
     state.manualBackupConfirmOpen = false;
+    if (result.skipped_files_count > 0 || result.backup_status === "completed_with_warnings") {
+      addToast("warning", "Backup created with warnings", "Some files could not be copied.");
+    } else {
+      setSuccess("Backup created");
+    }
   }, "manual-backup");
 }
 
@@ -3611,6 +3631,7 @@ async function requestRestoreBackup() {
 
   if (!selected.toLowerCase().endsWith(".zip")) {
     state.manualBackupError = "Only ZIP backups are supported.";
+    addToast("error", "Error", state.manualBackupError);
     render();
     return;
   }
@@ -3622,6 +3643,7 @@ async function requestRestoreBackup() {
     });
     if (!inspection.valid) {
       state.manualBackupError = inspection.warnings[0] || "Backup ZIP is invalid.";
+      addToast("error", "Error", state.manualBackupError);
       return;
     }
 
@@ -3645,6 +3667,7 @@ function confirmRestoreBackup() {
   if (!zipPath || !inspection) return;
   if (!state.restoreAddons && !state.restoreSavedVariables) {
     state.manualBackupError = "Choose at least one folder to restore.";
+    addToast("error", "Error", state.manualBackupError);
     render();
     return;
   }
@@ -3675,13 +3698,13 @@ async function openCreatedBackupFolder() {
     await invoke("open_path_location", { path: result.backup_zip_path });
   } catch (error) {
     state.manualBackupError = `Could not open backup location. ${error instanceof Error ? error.message : String(error)}`;
+    addToast("error", "Error", state.manualBackupError);
     render();
   }
 }
 
 async function openAddonFolder(local: LocalAddon) {
   state.error = null;
-  clearSuccess();
   render();
   try {
     await invoke("open_addon_folder", {
@@ -3689,7 +3712,7 @@ async function openAddonFolder(local: LocalAddon) {
       path: effectiveAddonsPath(),
     });
   } catch (error) {
-    state.error = `Could not open addon folder. ${error instanceof Error ? error.message : String(error)}`;
+    setError(`Could not open addon folder. ${error instanceof Error ? error.message : String(error)}`);
     render();
   }
 }
@@ -3788,11 +3811,11 @@ async function applyUpdateAll() {
   state.operation = "update-all-apply";
   state.operationTarget = null;
   state.error = null;
-  clearSuccess();
   closeAddonContextMenu(false);
   render();
 
   let unlistenProgress: (() => void) | null = null;
+  let finalizedWithResult = false;
   try {
     unlistenProgress = await listen<UpdateAllProgress>(UPDATE_ALL_PROGRESS_EVENT, (event) => {
       state.updateAllProgress = event.payload;
@@ -3809,19 +3832,22 @@ async function applyUpdateAll() {
     });
     state.path = state.updateAllResult.addons_dir;
     state.updateAllPlan = null;
-    setSuccess(state.updateAllResult.failure ? null : updateAllSuccessMessage(state.updateAllResult));
-    await refreshInstalledData(true);
-    syncSelectedStateAfterUpdate();
+    notifyUpdateAllResult(state.updateAllResult);
+    finalizedWithResult = true;
+    unlistenProgress?.();
+    unlistenProgress = null;
+    finishUpdateOperation();
+    render();
+    refreshInstalledAfterUpdate();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    state.error = operationErrorMessage("update-all-apply", null, message);
+    setError(operationErrorMessage("update-all-apply", null, message));
   } finally {
     unlistenProgress?.();
-    state.loading = false;
-    state.operation = null;
-    state.operationTarget = null;
-    state.updateAllProgress = null;
-    render();
+    if (!finalizedWithResult) {
+      finishUpdateOperation();
+      render();
+    }
   }
 }
 
@@ -3914,6 +3940,8 @@ function renderInstalledCardActions(item: InstalledViewModel, status: { label: s
 
 function renderCardUpdateAction(match: MatchResult | null) {
   if (!match) return "";
+  if (state.singleUpdateResult?.local.folder_name.toLowerCase() === match.local.folder_name.toLowerCase()) return "";
+  if (state.updateAllResult && !state.updateAllResult.failure) return "";
   if (isActionableUpdate(match)) {
     return `<button class="primary small" data-apply-update-target="${escapeAttr(match.local.folder_name)}" ${disabledAttr()}>${loadingButtonContent("Update", singleUpdateButtonLoadingLabel(match.local.folder_name), "update-apply", match.local.folder_name)}</button>`;
   }
@@ -4274,6 +4302,14 @@ function disabledAttr() {
   return state.loading ? "disabled" : "";
 }
 
+function finishUpdateOperation() {
+  state.loading = false;
+  state.operation = null;
+  state.operationTarget = null;
+  state.singleUpdatePhase = null;
+  state.updateAllProgress = null;
+}
+
 function isOperation(operation: OperationKind, target?: string) {
   if (!state.loading || state.operation !== operation) return false;
   if (target === undefined) return true;
@@ -4290,13 +4326,6 @@ function isSearchLoading() {
 
 function isDetailsLoading() {
   return isOperation("details");
-}
-
-function hasResultSuccess() {
-  return Boolean(
-    (state.installResult?.applied || state.singleUpdateResult?.applied || state.removeResult?.removed_addon) &&
-      !guardedOperationRunning(),
-  );
 }
 
 function hasDetailsOpen() {
@@ -4402,7 +4431,7 @@ async function openExternalUrl(url: string) {
   try {
     await invoke("open_external_url", { url });
   } catch (error) {
-    state.error = `Could not open website. ${error instanceof Error ? error.message : String(error)}`;
+    setError(`Could not open website. ${error instanceof Error ? error.message : String(error)}`);
     render();
   }
 }
@@ -4423,7 +4452,6 @@ async function initializeApp() {
   state.operation = "startup";
   state.operationTarget = null;
   state.error = null;
-  clearSuccess();
   closeAddonContextMenu(false);
   render();
 
@@ -4503,7 +4531,7 @@ function readSettingsDraft(): AppSettings {
 function saveInitialSetup() {
   const selectedPath = state.setupAddonsPath.trim();
   if (!selectedPath) {
-    state.error = "Enter an ESO AddOns path before continuing.";
+    setError("Enter an ESO AddOns path before continuing.");
     render();
     return;
   }
@@ -4609,7 +4637,7 @@ function clearHttpCache() {
   return withLoading(async () => {
     state.httpCacheStats = await invoke<HttpCacheStatsResponse>("clear_http_cache");
     state.httpCacheStatsLoaded = true;
-    setSuccess("Cache cleared.");
+    setSuccess("Cache cleared");
   }, "cache");
 }
 

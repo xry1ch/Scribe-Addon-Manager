@@ -1364,6 +1364,127 @@ input::placeholder {
   gap: 10px;
 }
 
+.toast-stack {
+  position: fixed;
+  top: 18px;
+  right: 20px;
+  z-index: 120;
+  display: grid;
+  gap: 10px;
+  width: min(380px, calc(100vw - 40px));
+  pointer-events: none;
+}
+
+.toast {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 11px;
+  align-items: start;
+  padding: 12px;
+  color: var(--text);
+  pointer-events: auto;
+  background: rgba(15, 23, 42, 0.97);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.38);
+  backdrop-filter: blur(14px);
+}
+
+.toast-success {
+  border-color: rgba(45, 212, 191, 0.56);
+}
+
+.toast-error {
+  border-color: rgba(248, 113, 113, 0.62);
+}
+
+.toast-warning {
+  border-color: rgba(250, 204, 21, 0.58);
+}
+
+.toast-info {
+  border-color: rgba(96, 165, 250, 0.5);
+}
+
+.toast-icon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+}
+
+.toast-success .toast-icon {
+  color: #99f6e4;
+  background: rgba(45, 212, 191, 0.13);
+}
+
+.toast-error .toast-icon {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.13);
+}
+
+.toast-warning .toast-icon {
+  color: #fde68a;
+  background: rgba(250, 204, 21, 0.12);
+}
+
+.toast-info .toast-icon {
+  color: #bfdbfe;
+  background: rgba(96, 165, 250, 0.13);
+}
+
+.toast-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.toast-copy {
+  min-width: 0;
+}
+
+.toast-copy strong {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--text-strong);
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.toast-copy p {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--muted-strong);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.toast-close {
+  padding: 3px 5px;
+  color: var(--muted);
+  font-size: 0;
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+}
+
+.toast-close::before {
+  display: block;
+  color: currentColor;
+  font-size: 18px;
+  line-height: 1;
+  content: "x";
+}
+
+.toast-close:hover {
+  color: var(--text-strong);
+}
+
 .link-button {
   padding: 0;
   color: #99f6e4;
