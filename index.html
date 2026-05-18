@@ -5,9 +5,161 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="./src-ui/assets/LOGO.png" />
     <title>Scribe Addon Manager</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        background: #0b1120;
+      }
+
+      html,
+      body,
+      #app {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: #0b1120;
+      }
+
+      body {
+        min-width: 900px;
+        min-height: 640px;
+        overflow: hidden;
+        color: #e5edf7;
+        font-family:
+          "Aptos", "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+
+      .startup-loader {
+        display: grid;
+        width: 100%;
+        min-height: 100%;
+        place-items: center;
+        color: #e5edf7;
+        background:
+          radial-gradient(circle at 10% 0%, rgba(45, 212, 191, 0.17), transparent 360px),
+          radial-gradient(circle at 92% 8%, rgba(59, 130, 246, 0.12), transparent 340px),
+          linear-gradient(180deg, #0b1120 0%, #0f172a 100%);
+      }
+
+      .startup-loader-content {
+        display: grid;
+        justify-items: center;
+        gap: 14px;
+        padding: 32px;
+        text-align: center;
+      }
+
+      .startup-logo-frame {
+        display: grid;
+        width: 72px;
+        height: 72px;
+        place-items: center;
+        border-radius: 18px;
+        box-shadow:
+          0 22px 48px rgba(0, 0, 0, 0.36),
+          0 0 30px rgba(45, 212, 191, 0.18);
+        animation: startup-logo-pulse 2.4s ease-in-out infinite;
+      }
+
+      .startup-logo {
+        display: block;
+        width: 72px;
+        height: 72px;
+        border-radius: 18px;
+        object-fit: cover;
+      }
+
+      .startup-loader h1 {
+        margin: 2px 0 0;
+        color: #f8fafc;
+        font-size: 30px;
+        line-height: 1.1;
+      }
+
+      .startup-loader p {
+        margin: 0;
+      }
+
+      .startup-subtitle {
+        color: #94a3b8;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .startup-shimmer {
+        position: relative;
+        width: 184px;
+        height: 2px;
+        margin-top: 8px;
+        overflow: hidden;
+        background: rgba(148, 163, 184, 0.16);
+        border-radius: 999px;
+      }
+
+      .startup-shimmer::before {
+        position: absolute;
+        inset: 0;
+        content: "";
+        background: linear-gradient(90deg, transparent, rgba(45, 212, 191, 0.86), transparent);
+        transform: translateX(-100%);
+        animation: startup-shimmer 1.55s ease-in-out infinite;
+      }
+
+      .startup-loading-text {
+        color: #b6c3d2;
+        font-size: 13px;
+      }
+
+      @keyframes startup-logo-pulse {
+        50% {
+          box-shadow:
+            0 22px 48px rgba(0, 0, 0, 0.36),
+            0 0 42px rgba(45, 212, 191, 0.3);
+          transform: translateY(-1px);
+        }
+      }
+
+      @keyframes startup-shimmer {
+        100% {
+          transform: translateX(100%);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .startup-logo-frame,
+        .startup-shimmer::before {
+          animation: none;
+        }
+
+        .startup-shimmer::before {
+          transform: none;
+          opacity: 0.55;
+        }
+      }
+
+      @media (max-width: 980px) {
+        body {
+          min-width: 0;
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <main id="startup-loader" class="startup-loader" role="status" aria-live="polite" aria-label="Loading Scribe">
+        <div class="startup-loader-content">
+          <span class="startup-logo-frame" aria-hidden="true">
+            <img class="startup-logo" src="./src-ui/assets/LOGO.png" alt="" />
+          </span>
+          <div>
+            <h1>Scribe</h1>
+            <p class="startup-subtitle">ESO Addon Manager</p>
+          </div>
+          <span class="startup-shimmer" aria-hidden="true"></span>
+          <p class="startup-loading-text">Loading addon manager...</p>
+        </div>
+      </main>
+    </div>
     <script type="module" src="/src-ui/main.ts"></script>
   </body>
 </html>

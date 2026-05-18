@@ -75,6 +75,8 @@ type OperationKind =
 interface AppState {
   tab: Tab;
   path: string;
+  startupViewReady: boolean;
+  startupFatalError: string | null;
   loading: boolean;
   operation: OperationKind | null;
   operationTarget: string | null;
@@ -178,6 +180,8 @@ interface CategoryMeta {
 const state: AppState = {
   tab: "installed",
   path: "",
+  startupViewReady: false,
+  startupFatalError: null,
   loading: false,
   operation: null,
   operationTarget: null,
@@ -346,6 +350,12 @@ window.addEventListener("keydown", (event) => {
 function render() {
   unbindSearchScrollListener();
 
+  if (!state.startupViewReady) {
+    app.innerHTML = state.startupFatalError ? renderStartupError() : renderStartupLoader();
+    bindStartupEvents();
+    return;
+  }
+
   if (state.needsInitialSetup) {
     app.innerHTML = renderInitialSetup();
     bindInitialSetupEvents();
@@ -388,6 +398,55 @@ function render() {
   `;
   bindCommonEvents();
   bindTabEvents();
+}
+
+function renderStartupLoader() {
+  return `
+    <main id="startup-loader" class="startup-loader" role="status" aria-live="polite" aria-label="Loading Scribe">
+      <div class="startup-loader-content">
+        <span class="startup-logo-frame" aria-hidden="true">
+          <img class="startup-logo" src="${escapeAttr(logoUrl)}" alt="" />
+        </span>
+        <div>
+          <h1>Scribe</h1>
+          <p class="startup-subtitle">ESO Addon Manager</p>
+        </div>
+        <span class="startup-shimmer" aria-hidden="true"></span>
+        <p class="startup-loading-text">${escapeHtml(startupLoadingText())}</p>
+      </div>
+    </main>
+  `;
+}
+
+function renderStartupError() {
+  return `
+    <main id="startup-loader" class="startup-loader startup-error-screen" role="alert">
+      <div class="startup-loader-content">
+        <span class="startup-logo-frame" aria-hidden="true">
+          <img class="startup-logo" src="${escapeAttr(logoUrl)}" alt="" />
+        </span>
+        <div>
+          <h1>Scribe</h1>
+          <p class="startup-subtitle">ESO Addon Manager</p>
+        </div>
+        <div class="startup-error-box">
+          <h2>Could not start Scribe</h2>
+          <p>${escapeHtml(state.startupFatalError ?? "An unknown startup error occurred.")}</p>
+          <button class="secondary startup-retry-button" id="retry-startup" type="button">Retry</button>
+        </div>
+      </div>
+    </main>
+  `;
+}
+
+function startupLoadingText() {
+  return state.operation === "installed" ? "Preparing your addons..." : "Loading addon manager...";
+}
+
+function bindStartupEvents() {
+  document.querySelector<HTMLButtonElement>("#retry-startup")?.addEventListener("click", () => {
+    void initializeApp();
+  });
 }
 
 function renderInitialSetup() {
@@ -4359,15 +4418,44 @@ function updatesFromPlan(plan: PlanUpdatesResponse): CheckAddonsResponse {
   };
 }
 
-function loadStartup() {
-  return withLoading(async () => {
-    const startup = await invoke<AppStartupInfo>("get_startup_info");
-    state.settings = startup.settings;
-    state.detectedAddonsPath = startup.detected_addons_dir;
-    state.needsInitialSetup = !startup.settings_exists;
-    state.setupAddonsPath = startup.settings.addons_dir_override ?? startup.detected_addons_dir ?? "";
-    applySettingsToState(startup.settings);
-  }, "startup");
+async function initializeApp() {
+  state.startupViewReady = false;
+  state.startupFatalError = null;
+  state.loading = true;
+  state.operation = "startup";
+  state.operationTarget = null;
+  state.error = null;
+  clearSuccess();
+  closeAddonContextMenu(false);
+  render();
+
+  try {
+    await loadStartup();
+    if (!state.needsInitialSetup) {
+      state.operation = "installed";
+      render();
+      await refreshInstalledData(false);
+    }
+    state.startupViewReady = true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    state.startupFatalError =
+      state.operation === "installed" ? `Could not prepare your addons. ${message}` : `Could not load startup settings. ${message}`;
+  } finally {
+    state.loading = false;
+    state.operation = null;
+    state.operationTarget = null;
+    render();
+  }
+}
+
+async function loadStartup() {
+  const startup = await invoke<AppStartupInfo>("get_startup_info");
+  state.settings = startup.settings;
+  state.detectedAddonsPath = startup.detected_addons_dir;
+  state.needsInitialSetup = !startup.settings_exists;
+  state.setupAddonsPath = startup.settings.addons_dir_override ?? startup.detected_addons_dir ?? "";
+  applySettingsToState(startup.settings);
 }
 
 function applySettingsToState(settings: AppSettings) {
@@ -4634,9 +4722,4 @@ function renderEsoText(value: string) {
   return output;
 }
 
-render();
-loadStartup().then(() => {
-  if (!state.needsInitialSetup) {
-    loadInstalled(false);
-  }
-});
+void initializeApp();
