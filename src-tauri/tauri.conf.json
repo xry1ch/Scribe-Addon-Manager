@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Scribe Addon Manager",
+  "productName": "Crux Addon Manager",
   "version": "1.0.0",
-  "identifier": "dev.scribe.addon-manager",
+  "identifier": "dev.crux.addon-manager",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Scribe Addon Manager",
+        "title": "Crux Addon Manager",
         "width": 1360,
         "height": 840,
         "minWidth": 900,

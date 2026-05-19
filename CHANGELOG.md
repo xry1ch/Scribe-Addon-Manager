@@ -2,7 +2,7 @@
 
 ## v1.0.0 - 2026-05-18
 
-Initial GitHub 1.0 release of Scribe Addon Manager.
+Initial GitHub 1.0 release of Crux Addon Manager.
 
 ### Added
 

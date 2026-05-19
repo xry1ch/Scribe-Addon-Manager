@@ -150,14 +150,6 @@ pub fn installed_metadata_path() -> Result<PathBuf, InstalledMetadataError> {
     Ok(app_paths::metadata_file_path()?)
 }
 
-pub fn legacy_installed_metadata_path(addons_dir: &Path) -> PathBuf {
-    addons_dir
-        .parent()
-        .unwrap_or(addons_dir)
-        .join(".scribe-addon-manager")
-        .join("installed.json")
-}
-
 pub fn installed_metadata_key(addons_dir: &Path) -> Result<String, InstalledMetadataError> {
     let path = normalized_absolute_path(addons_dir)?;
     Ok(sha256_hex(path_key_string(&path).as_bytes()))
@@ -173,12 +165,7 @@ pub fn load_installed_metadata(
 fn load_installed_metadata_locked(
     addons_dir: &Path,
 ) -> Result<InstalledMetadata, InstalledMetadataError> {
-    let mut store = load_metadata_store()?;
-    let migrated = migrate_legacy_metadata(addons_dir, &mut store)?;
-    if migrated {
-        save_metadata_store(&store)?;
-    }
-
+    let store = load_metadata_store()?;
     let key = installed_metadata_key(addons_dir)?;
     let Some(installation) = store.installations.get(&key) else {
         return Ok(InstalledMetadata::default());
@@ -229,7 +216,6 @@ fn save_installed_metadata_locked(
     metadata: &InstalledMetadata,
 ) -> Result<(), InstalledMetadataError> {
     let mut store = load_metadata_store()?;
-    let _ = migrate_legacy_metadata(addons_dir, &mut store)?;
     let normalized_path = normalized_addons_path_string(addons_dir)?;
     let key = installed_metadata_key(addons_dir)?;
     store.installations.insert(
@@ -247,68 +233,6 @@ fn save_metadata_store(store: &InstalledMetadataStore) -> Result<(), InstalledMe
     let store = store.clone().normalize();
     fs::write(path, serde_json::to_string_pretty(&store)?)?;
     Ok(())
-}
-
-fn migrate_legacy_metadata(
-    addons_dir: &Path,
-    store: &mut InstalledMetadataStore,
-) -> Result<bool, InstalledMetadataError> {
-    let legacy_path = legacy_installed_metadata_path(addons_dir);
-    let contents = match fs::read_to_string(&legacy_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            warn!(
-                "could not read legacy installed addon metadata from {}: {}",
-                legacy_path.display(),
-                error
-            );
-            return Ok(false);
-        }
-    };
-
-    let legacy = match serde_json::from_str::<InstalledMetadata>(&contents) {
-        Ok(metadata) => metadata.normalize(),
-        Err(error) => {
-            warn!(
-                "could not parse legacy installed addon metadata from {}: {}",
-                legacy_path.display(),
-                error
-            );
-            return Ok(false);
-        }
-    };
-
-    if legacy.addons.is_empty() && !legacy.first_run_baseline_complete {
-        return Ok(false);
-    }
-
-    let key = installed_metadata_key(addons_dir)?;
-    let normalized_path = normalized_addons_path_string(addons_dir)?;
-    let installation =
-        store
-            .installations
-            .entry(key)
-            .or_insert_with(|| InstalledInstallationMetadata {
-                addons_path: normalized_path,
-                addons: BTreeMap::new(),
-                first_run_baseline_complete: false,
-            });
-
-    let mut changed = false;
-    for (folder_name, addon) in legacy.addons {
-        if !installation.addons.contains_key(&folder_name) {
-            installation.addons.insert(folder_name, addon);
-            changed = true;
-        }
-    }
-
-    if legacy.first_run_baseline_complete && !installation.first_run_baseline_complete {
-        installation.first_run_baseline_complete = true;
-        changed = true;
-    }
-
-    Ok(changed)
 }
 
 pub fn remove_installed_metadata(
@@ -702,10 +626,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        installed_metadata_key, installed_metadata_path, legacy_installed_metadata_path,
-        load_installed_metadata, load_installed_metadata_or_default,
-        record_remote_install_metadata, record_zip_install_metadata, remove_installed_metadata,
-        save_installed_metadata, InstalledAddonMetadata, InstalledMetadata, RemoteInstallMetadata,
+        installed_metadata_key, installed_metadata_path, load_installed_metadata,
+        load_installed_metadata_or_default, record_remote_install_metadata,
+        record_zip_install_metadata, remove_installed_metadata, save_installed_metadata,
+        InstalledAddonMetadata, InstalledMetadata, RemoteInstallMetadata,
         INSTALLED_BY_REMOTE_INSTALL, INSTALLED_BY_REMOTE_UPDATE, INSTALLED_BY_ZIP_INSTALL,
     };
     use crate::api::models::AddonDetails;
@@ -769,12 +693,6 @@ mod tests {
             assert_eq!(
                 installed_metadata_path().unwrap(),
                 app_data.join("metadata").join("installed.json")
-            );
-            assert_eq!(
-                legacy_installed_metadata_path(&addons_dir),
-                PathBuf::from(
-                    "/Users/Unai/Documents/Elder Scrolls Online/live/.scribe-addon-manager/installed.json"
-                )
             );
             assert!(!installed_metadata_path()
                 .unwrap()
@@ -1012,46 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_metadata_is_migrated_without_deleting_old_file() {
-        with_temp_app_data(|_| {
-            let dir = tempdir().unwrap();
-            let addons_dir = dir.path().join("live").join("AddOns");
-            let legacy_path = legacy_installed_metadata_path(&addons_dir);
-            fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-            fs::write(
-                &legacy_path,
-                r#"{
-  "schema_version": 1,
-  "first_run_baseline_complete": true,
-  "addons": {
-    "LegacyAddon": {
-      "folder_name": "LegacyAddon",
-      "remote_uid": "42",
-      "installed_at": "1",
-      "installed_by": "remote-install"
-    }
-  }
-}"#,
-            )
-            .unwrap();
-
-            let metadata = load_installed_metadata(&addons_dir).unwrap();
-
-            assert_eq!(
-                metadata
-                    .addons
-                    .get("LegacyAddon")
-                    .and_then(|addon| addon.remote_uid.as_deref()),
-                Some("42")
-            );
-            assert!(metadata.first_run_baseline_complete);
-            assert!(legacy_path.exists());
-            assert!(installed_metadata_path().unwrap().is_file());
-        });
-    }
-
-    #[test]
-    fn save_does_not_create_legacy_metadata_folder_in_live_dir() {
+    fn save_does_not_create_metadata_folder_in_live_dir() {
         with_temp_app_data(|_| {
             let dir = tempdir().unwrap();
             let live_dir = dir.path().join("live");
@@ -1070,7 +949,7 @@ mod tests {
             save_installed_metadata(&addons_dir, &metadata).unwrap();
 
             assert!(installed_metadata_path().unwrap().is_file());
-            assert!(!live_dir.join(".scribe-addon-manager").exists());
+            assert!(!live_dir.join(".crux-addon-manager").exists());
         });
     }
 }

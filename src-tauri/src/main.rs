@@ -633,7 +633,7 @@ struct PreparedDependencyInstall {
 }
 
 const MAX_RECURSIVE_DEPENDENCY_PACKAGES: usize = 64;
-const UPDATE_ALL_PROGRESS_EVENT: &str = "scribe-update-all-progress";
+const UPDATE_ALL_PROGRESS_EVENT: &str = "crux-update-all-progress";
 
 struct RemoteLocalState {
     local_addons: Vec<LocalAddon>,
@@ -1720,7 +1720,7 @@ fn main() {
             apply_single_update
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Scribe Addon Manager");
+        .expect("error while running Crux Addon Manager");
 }
 
 fn settings_path() -> anyhow::Result<PathBuf> {
@@ -3990,6 +3990,29 @@ fn to_string_error(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::Mutex;
+
+    static APP_DATA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_temp_app_data<T>(test: impl FnOnce(&Path) -> T) -> T {
+        let _guard = APP_DATA_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(eso_addon_manager::app_paths::APP_DATA_DIR_ENV);
+        std::env::set_var(eso_addon_manager::app_paths::APP_DATA_DIR_ENV, dir.path());
+
+        let result = catch_unwind(AssertUnwindSafe(|| test(dir.path())));
+
+        match previous {
+            Some(value) => std::env::set_var(eso_addon_manager::app_paths::APP_DATA_DIR_ENV, value),
+            None => std::env::remove_var(eso_addon_manager::app_paths::APP_DATA_DIR_ENV),
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
 
     #[test]
     fn app_settings_loads_defaults_when_file_is_missing() {
@@ -4156,229 +4179,243 @@ mod tests {
 
     #[test]
     fn first_run_import_records_matched_addons_as_current_baseline() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let local = test_local_addon("ExampleAddon", true, false);
-        let matches = vec![MatchResult {
-            local,
-            status: match_remote::MatchStatus::PossibleUpdate,
-            remote: Some(test_remote_candidate("42", "2.0.0")),
-            candidates: Vec::new(),
-            debug_candidates: Vec::new(),
-        }];
-
-        let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
-        let metadata = load_installed_metadata(&addons_dir);
-        let imported = metadata.addons.get("ExampleAddon").unwrap();
-
-        assert_eq!(result.detected_addons, 1);
-        assert_eq!(result.imported, 1);
-        assert_eq!(imported.remote_uid.as_deref(), Some("42"));
-        assert_eq!(imported.remote_name.as_deref(), Some("Example Addon"));
-        assert_eq!(imported.remote_version.as_deref(), Some("2.0.0"));
-        assert_eq!(imported.remote_updated_date, Some(1_700_000_000));
-        assert_eq!(
-            imported.remote_info_url.as_deref(),
-            Some("https://www.esoui.com/downloads/info42.html")
-        );
-        assert_eq!(
-            imported.installed_by,
-            manager_metadata::INSTALLED_BY_IMPORTED_CURRENT
-        );
-        assert!(!imported.installed_at.is_empty());
-        assert_eq!(imported.local_title.as_deref(), Some("ExampleAddon"));
-        assert_eq!(imported.local_version.as_deref(), Some("1.0.0"));
-        assert!(metadata.first_run_baseline_complete);
-    }
-
-    #[test]
-    fn first_run_import_skips_matched_addons_without_remote_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let mut remote = test_remote_candidate("42", "2.0.0");
-        remote.version = None;
-        let matches = vec![MatchResult {
-            local: test_local_addon("ExampleAddon", true, false),
-            status: match_remote::MatchStatus::UnknownUpdate,
-            remote: Some(remote),
-            candidates: Vec::new(),
-            debug_candidates: Vec::new(),
-        }];
-
-        let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
-        let metadata = load_installed_metadata(&addons_dir);
-
-        assert_eq!(result.detected_addons, 1);
-        assert_eq!(result.imported, 0);
-        assert_eq!(result.skipped_missing_remote_version, 1);
-        assert!(!metadata.addons.contains_key("ExampleAddon"));
-        assert!(metadata.first_run_baseline_complete);
-    }
-
-    #[test]
-    fn first_run_import_skips_unmatched_and_unresolved_library_addons() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let matches = vec![
-            MatchResult {
-                local: test_local_addon("UnmatchedAddon", true, false),
-                status: match_remote::MatchStatus::NoMatch,
-                remote: None,
-                candidates: Vec::new(),
-                debug_candidates: Vec::new(),
-            },
-            MatchResult {
-                local: test_local_addon("LibraryAddon", true, true),
-                status: match_remote::MatchStatus::Library,
-                remote: None,
-                candidates: Vec::new(),
-                debug_candidates: Vec::new(),
-            },
-        ];
-
-        let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
-        let metadata = load_installed_metadata(&addons_dir);
-
-        assert_eq!(result.detected_addons, 2);
-        assert_eq!(result.imported, 0);
-        assert_eq!(result.skipped_no_match, 1);
-        assert_eq!(result.skipped_libraries, 1);
-        assert!(metadata.addons.is_empty());
-        assert!(metadata.first_run_baseline_complete);
-    }
-
-    #[test]
-    fn first_run_import_skips_ambiguous_addons() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let matches = vec![MatchResult {
-            local: test_local_addon("AmbiguousAddon", true, false),
-            status: match_remote::MatchStatus::Ambiguous,
-            remote: None,
-            candidates: vec![
-                test_remote_candidate("42", "2.0.0"),
-                test_remote_candidate("43", "2.0.0"),
-            ],
-            debug_candidates: Vec::new(),
-        }];
-
-        let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
-        let metadata = load_installed_metadata(&addons_dir);
-
-        assert_eq!(result.detected_addons, 1);
-        assert_eq!(result.imported, 0);
-        assert_eq!(result.skipped_ambiguous, 1);
-        assert!(!metadata.addons.contains_key("AmbiguousAddon"));
-    }
-
-    #[test]
-    fn first_run_import_does_not_modify_addon_or_savedvariables_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let live_dir = dir.path().join("live");
-        let addons_dir = live_dir.join("AddOns");
-        write_test_addon(&addons_dir, "ExampleAddon");
-        let addon_manifest = addons_dir.join("ExampleAddon").join("ExampleAddon.txt");
-        let saved_variables = live_dir.join("SavedVariables").join("ExampleAddon.lua");
-        fs::create_dir_all(saved_variables.parent().unwrap()).unwrap();
-        fs::write(&saved_variables, "saved = true").unwrap();
-        let before_manifest = fs::read_to_string(&addon_manifest).unwrap();
-        let before_saved_variables = fs::read_to_string(&saved_variables).unwrap();
-        let matches = vec![MatchResult {
-            local: test_local_addon("ExampleAddon", true, false),
-            status: match_remote::MatchStatus::Matched,
-            remote: Some(test_remote_candidate("42", "1.0.0")),
-            candidates: Vec::new(),
-            debug_candidates: Vec::new(),
-        }];
-
-        import_existing_matches_as_current(&addons_dir, &matches).unwrap();
-
-        assert_eq!(fs::read_to_string(&addon_manifest).unwrap(), before_manifest);
-        assert_eq!(
-            fs::read_to_string(&saved_variables).unwrap(),
-            before_saved_variables
-        );
-        assert!(manager_metadata::installed_metadata_path()
-            .unwrap()
-            .exists());
-        assert!(!live_dir.join(".scribe-addon-manager").exists());
-    }
-
-    #[test]
-    fn incomplete_first_run_baseline_is_repaired_on_refresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let matches = vec![
-            MatchResult {
-                local: test_local_addon("AlreadyImported", true, false),
-                status: match_remote::MatchStatus::NoMatch,
-                remote: None,
-                candidates: Vec::new(),
-                debug_candidates: Vec::new(),
-            },
-            MatchResult {
-                local: test_local_addon("MissingFromOldImport", true, false),
-                status: match_remote::MatchStatus::PossibleUpdate,
-                remote: Some(test_remote_candidate("99", "2.0.0")),
-                candidates: Vec::new(),
-                debug_candidates: Vec::new(),
-            },
-        ];
-        let mut metadata = InstalledMetadata::default();
-        metadata.addons.insert(
-            "AlreadyImported".to_owned(),
-            first_run_metadata_for_match(&matches[0], "1"),
-        );
-        save_installed_metadata(&addons_dir, &metadata).unwrap();
-
-        let repaired = ensure_first_run_baseline_complete(&addons_dir, &matches).unwrap();
-
-        assert!(repaired.first_run_baseline_complete);
-        assert!(repaired.addons.contains_key("AlreadyImported"));
-        assert!(repaired.addons.contains_key("MissingFromOldImport"));
-        assert_eq!(
-            update_confidence_for_match(&matches[1], &repaired).confidence,
-            "current"
-        );
-    }
-
-    #[test]
-    fn first_run_import_does_not_repair_unmatched_addons() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let matches = vec![
-            MatchResult {
-                local: test_local_addon("AlreadyImported", true, false),
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let local = test_local_addon("ExampleAddon", true, false);
+            let matches = vec![MatchResult {
+                local,
                 status: match_remote::MatchStatus::PossibleUpdate,
                 remote: Some(test_remote_candidate("42", "2.0.0")),
                 candidates: Vec::new(),
                 debug_candidates: Vec::new(),
-            },
-            MatchResult {
-                local: test_local_addon("UnmatchedAddon", true, false),
-                status: match_remote::MatchStatus::NoMatch,
-                remote: None,
+            }];
+
+            let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
+            let metadata = load_installed_metadata(&addons_dir);
+            let imported = metadata.addons.get("ExampleAddon").unwrap();
+
+            assert_eq!(result.detected_addons, 1);
+            assert_eq!(result.imported, 1);
+            assert_eq!(imported.remote_uid.as_deref(), Some("42"));
+            assert_eq!(imported.remote_name.as_deref(), Some("Example Addon"));
+            assert_eq!(imported.remote_version.as_deref(), Some("2.0.0"));
+            assert_eq!(imported.remote_updated_date, Some(1_700_000_000));
+            assert_eq!(
+                imported.remote_info_url.as_deref(),
+                Some("https://www.esoui.com/downloads/info42.html")
+            );
+            assert_eq!(
+                imported.installed_by,
+                manager_metadata::INSTALLED_BY_IMPORTED_CURRENT
+            );
+            assert!(!imported.installed_at.is_empty());
+            assert_eq!(imported.local_title.as_deref(), Some("ExampleAddon"));
+            assert_eq!(imported.local_version.as_deref(), Some("1.0.0"));
+            assert!(metadata.first_run_baseline_complete);
+        });
+    }
+
+    #[test]
+    fn first_run_import_skips_matched_addons_without_remote_version() {
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let mut remote = test_remote_candidate("42", "2.0.0");
+            remote.version = None;
+            let matches = vec![MatchResult {
+                local: test_local_addon("ExampleAddon", true, false),
+                status: match_remote::MatchStatus::UnknownUpdate,
+                remote: Some(remote),
                 candidates: Vec::new(),
                 debug_candidates: Vec::new(),
-            },
-        ];
-        let mut metadata = InstalledMetadata::default();
-        metadata.addons.insert(
-            "AlreadyImported".to_owned(),
-            first_run_metadata_for_match(&matches[0], "1"),
-        );
-        save_installed_metadata(&addons_dir, &metadata).unwrap();
+            }];
 
-        let repaired = ensure_first_run_baseline_complete(&addons_dir, &matches).unwrap();
+            let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
+            let metadata = load_installed_metadata(&addons_dir);
 
-        assert!(repaired.addons.contains_key("AlreadyImported"));
-        assert!(!repaired.addons.contains_key("UnmatchedAddon"));
+            assert_eq!(result.detected_addons, 1);
+            assert_eq!(result.imported, 0);
+            assert_eq!(result.skipped_missing_remote_version, 1);
+            assert!(!metadata.addons.contains_key("ExampleAddon"));
+            assert!(metadata.first_run_baseline_complete);
+        });
+    }
+
+    #[test]
+    fn first_run_import_skips_unmatched_and_unresolved_library_addons() {
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let matches = vec![
+                MatchResult {
+                    local: test_local_addon("UnmatchedAddon", true, false),
+                    status: match_remote::MatchStatus::NoMatch,
+                    remote: None,
+                    candidates: Vec::new(),
+                    debug_candidates: Vec::new(),
+                },
+                MatchResult {
+                    local: test_local_addon("LibraryAddon", true, true),
+                    status: match_remote::MatchStatus::Library,
+                    remote: None,
+                    candidates: Vec::new(),
+                    debug_candidates: Vec::new(),
+                },
+            ];
+
+            let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
+            let metadata = load_installed_metadata(&addons_dir);
+
+            assert_eq!(result.detected_addons, 2);
+            assert_eq!(result.imported, 0);
+            assert_eq!(result.skipped_no_match, 1);
+            assert_eq!(result.skipped_libraries, 1);
+            assert!(metadata.addons.is_empty());
+            assert!(metadata.first_run_baseline_complete);
+        });
+    }
+
+    #[test]
+    fn first_run_import_skips_ambiguous_addons() {
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let matches = vec![MatchResult {
+                local: test_local_addon("AmbiguousAddon", true, false),
+                status: match_remote::MatchStatus::Ambiguous,
+                remote: None,
+                candidates: vec![
+                    test_remote_candidate("42", "2.0.0"),
+                    test_remote_candidate("43", "2.0.0"),
+                ],
+                debug_candidates: Vec::new(),
+            }];
+
+            let result = import_existing_matches_as_current(&addons_dir, &matches).unwrap();
+            let metadata = load_installed_metadata(&addons_dir);
+
+            assert_eq!(result.detected_addons, 1);
+            assert_eq!(result.imported, 0);
+            assert_eq!(result.skipped_ambiguous, 1);
+            assert!(!metadata.addons.contains_key("AmbiguousAddon"));
+        });
+    }
+
+    #[test]
+    fn first_run_import_does_not_modify_addon_or_savedvariables_files() {
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let live_dir = dir.path().join("live");
+            let addons_dir = live_dir.join("AddOns");
+            write_test_addon(&addons_dir, "ExampleAddon");
+            let addon_manifest = addons_dir.join("ExampleAddon").join("ExampleAddon.txt");
+            let saved_variables = live_dir.join("SavedVariables").join("ExampleAddon.lua");
+            fs::create_dir_all(saved_variables.parent().unwrap()).unwrap();
+            fs::write(&saved_variables, "saved = true").unwrap();
+            let before_manifest = fs::read_to_string(&addon_manifest).unwrap();
+            let before_saved_variables = fs::read_to_string(&saved_variables).unwrap();
+            let matches = vec![MatchResult {
+                local: test_local_addon("ExampleAddon", true, false),
+                status: match_remote::MatchStatus::Matched,
+                remote: Some(test_remote_candidate("42", "1.0.0")),
+                candidates: Vec::new(),
+                debug_candidates: Vec::new(),
+            }];
+
+            import_existing_matches_as_current(&addons_dir, &matches).unwrap();
+
+            assert_eq!(fs::read_to_string(&addon_manifest).unwrap(), before_manifest);
+            assert_eq!(
+                fs::read_to_string(&saved_variables).unwrap(),
+                before_saved_variables
+            );
+            assert!(manager_metadata::installed_metadata_path()
+                .unwrap()
+                .exists());
+            assert!(!live_dir.join(".crux-addon-manager").exists());
+        });
+    }
+
+    #[test]
+    fn incomplete_first_run_baseline_is_repaired_on_refresh() {
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let matches = vec![
+                MatchResult {
+                    local: test_local_addon("AlreadyImported", true, false),
+                    status: match_remote::MatchStatus::NoMatch,
+                    remote: None,
+                    candidates: Vec::new(),
+                    debug_candidates: Vec::new(),
+                },
+                MatchResult {
+                    local: test_local_addon("MissingFromOldImport", true, false),
+                    status: match_remote::MatchStatus::PossibleUpdate,
+                    remote: Some(test_remote_candidate("99", "2.0.0")),
+                    candidates: Vec::new(),
+                    debug_candidates: Vec::new(),
+                },
+            ];
+            let mut metadata = InstalledMetadata::default();
+            metadata.addons.insert(
+                "AlreadyImported".to_owned(),
+                first_run_metadata_for_match(&matches[0], "1"),
+            );
+            save_installed_metadata(&addons_dir, &metadata).unwrap();
+
+            let repaired = ensure_first_run_baseline_complete(&addons_dir, &matches).unwrap();
+
+            assert!(repaired.first_run_baseline_complete);
+            assert!(repaired.addons.contains_key("AlreadyImported"));
+            assert!(repaired.addons.contains_key("MissingFromOldImport"));
+            assert_eq!(
+                update_confidence_for_match(&matches[1], &repaired).confidence,
+                "current"
+            );
+        });
+    }
+
+    #[test]
+    fn first_run_import_does_not_repair_unmatched_addons() {
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let matches = vec![
+                MatchResult {
+                    local: test_local_addon("AlreadyImported", true, false),
+                    status: match_remote::MatchStatus::PossibleUpdate,
+                    remote: Some(test_remote_candidate("42", "2.0.0")),
+                    candidates: Vec::new(),
+                    debug_candidates: Vec::new(),
+                },
+                MatchResult {
+                    local: test_local_addon("UnmatchedAddon", true, false),
+                    status: match_remote::MatchStatus::NoMatch,
+                    remote: None,
+                    candidates: Vec::new(),
+                    debug_candidates: Vec::new(),
+                },
+            ];
+            let mut metadata = InstalledMetadata::default();
+            metadata.addons.insert(
+                "AlreadyImported".to_owned(),
+                first_run_metadata_for_match(&matches[0], "1"),
+            );
+            save_installed_metadata(&addons_dir, &metadata).unwrap();
+
+            let repaired = ensure_first_run_baseline_complete(&addons_dir, &matches).unwrap();
+
+            assert!(repaired.addons.contains_key("AlreadyImported"));
+            assert!(!repaired.addons.contains_key("UnmatchedAddon"));
+        });
     }
 
     #[test]
@@ -4851,41 +4888,49 @@ mod tests {
 
     #[test]
     fn newer_remote_version_after_import_is_reliable_update() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("AddOns");
-        fs::create_dir_all(&addons_dir).unwrap();
-        let local_addons = vec![test_local_addon("ExampleAddon", true, false)];
-        let imported_matches = vec![MatchResult {
-            local: local_addons[0].clone(),
-            status: match_remote::MatchStatus::PossibleUpdate,
-            remote: Some(test_remote_candidate("42", "2.0.0")),
-            candidates: Vec::new(),
-            debug_candidates: Vec::new(),
-        }];
-        import_existing_matches_as_current(&addons_dir, &imported_matches).unwrap();
-        let metadata = load_installed_metadata(&addons_dir);
-        let remote_addons = vec![test_addon_summary_with_version(
-            "42",
-            "Example Addon",
-            "3.0.0",
-            "10",
-            1_800_000_000,
-            "17",
-            "Graphic UI Mods",
-            "",
-        )];
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("AddOns");
+            fs::create_dir_all(&addons_dir).unwrap();
+            let local_addons = vec![test_local_addon("ExampleAddon", true, false)];
+            let imported_matches = vec![MatchResult {
+                local: local_addons[0].clone(),
+                status: match_remote::MatchStatus::PossibleUpdate,
+                remote: Some(test_remote_candidate("42", "2.0.0")),
+                candidates: Vec::new(),
+                debug_candidates: Vec::new(),
+            }];
+            import_existing_matches_as_current(&addons_dir, &imported_matches).unwrap();
+            let metadata = load_installed_metadata(&addons_dir);
+            let remote_addons = vec![test_addon_summary_with_version(
+                "42",
+                "Example Addon",
+                "3.0.0",
+                "10",
+                1_800_000_000,
+                "17",
+                "Graphic UI Mods",
+                "",
+            )];
 
-        let matches =
-            match_remote::match_installed_addons_with_metadata(&local_addons, &remote_addons, &metadata);
+            let matches = match_remote::match_installed_addons_with_metadata(
+                &local_addons,
+                &remote_addons,
+                &metadata,
+            );
 
-        assert_eq!(
-            matches[0].remote.as_ref().and_then(|remote| remote.uid.as_deref()),
-            Some("42")
-        );
-        assert_eq!(
-            update_confidence_for_match(&matches[0], &metadata).confidence,
-            "reliable-update"
-        );
+            assert_eq!(
+                matches[0]
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.uid.as_deref()),
+                Some("42")
+            );
+            assert_eq!(
+                update_confidence_for_match(&matches[0], &metadata).confidence,
+                "reliable-update"
+            );
+        });
     }
 
     #[test]
@@ -4936,45 +4981,51 @@ mod tests {
 
     #[test]
     fn link_only_writes_metadata_without_modifying_addon_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let addons_dir = dir.path().join("live").join("AddOns");
-        let addon_dir = addons_dir.join("ExampleAddon");
-        fs::create_dir_all(&addon_dir).unwrap();
-        let sentinel = addon_dir.join("sentinel.txt");
-        fs::write(&sentinel, "keep").unwrap();
+        with_temp_app_data(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let addons_dir = dir.path().join("live").join("AddOns");
+            let addon_dir = addons_dir.join("ExampleAddon");
+            fs::create_dir_all(&addon_dir).unwrap();
+            let sentinel = addon_dir.join("sentinel.txt");
+            fs::write(&sentinel, "keep").unwrap();
 
-        let mut local = test_local_addon("ExampleAddon", true, false);
-        local.author = Some("Author".to_owned());
-        let remote_addons = vec![test_addon_summary_with_version(
-            "42",
-            "ExampleAddon",
-            "2.0.0",
-            "10",
-            100,
-            "17",
-            "Graphic UI Mods",
-            "",
-        )];
-        let candidate = match_remote::remote_match_candidate_by_uid(&local, &remote_addons, "42")
-            .expect("candidate");
-        let details = test_addon_details("42", "ExampleAddon", "2.0.0", 100);
+            let mut local = test_local_addon("ExampleAddon", true, false);
+            local.author = Some("Author".to_owned());
+            let remote_addons = vec![test_addon_summary_with_version(
+                "42",
+                "ExampleAddon",
+                "2.0.0",
+                "10",
+                100,
+                "17",
+                "Graphic UI Mods",
+                "",
+            )];
+            let candidate =
+                match_remote::remote_match_candidate_by_uid(&local, &remote_addons, "42")
+                    .expect("candidate");
+            let details = test_addon_details("42", "ExampleAddon", "2.0.0", 100);
 
-        link_installed_addon_metadata(&addons_dir, &local, &candidate, &details, "42", "123")
-            .unwrap();
+            link_installed_addon_metadata(&addons_dir, &local, &candidate, &details, "42", "123")
+                .unwrap();
 
-        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep");
-        let metadata = manager_metadata::load_installed_metadata(&addons_dir).unwrap();
-        let addon = metadata.addons.get("ExampleAddon").unwrap();
-        assert_eq!(addon.remote_uid.as_deref(), Some("42"));
-        assert_eq!(addon.remote_name.as_deref(), Some("ExampleAddon"));
-        assert_eq!(addon.remote_version.as_deref(), Some("2.0.0"));
-        assert_eq!(addon.remote_updated_date, Some(100));
-        assert_eq!(addon.installed_by, manager_metadata::INSTALLED_BY_LINKED_EXISTING);
-        assert_eq!(addon.linked_at.as_deref(), Some("123"));
-        assert_eq!(addon.match_confidence.as_deref(), Some("very-high"));
-        assert_eq!(addon.remote_download_url, None);
-        assert_eq!(addon.file_name, None);
-        assert_eq!(addon.md5, None);
+            assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep");
+            let metadata = manager_metadata::load_installed_metadata(&addons_dir).unwrap();
+            let addon = metadata.addons.get("ExampleAddon").unwrap();
+            assert_eq!(addon.remote_uid.as_deref(), Some("42"));
+            assert_eq!(addon.remote_name.as_deref(), Some("ExampleAddon"));
+            assert_eq!(addon.remote_version.as_deref(), Some("2.0.0"));
+            assert_eq!(addon.remote_updated_date, Some(100));
+            assert_eq!(
+                addon.installed_by,
+                manager_metadata::INSTALLED_BY_LINKED_EXISTING
+            );
+            assert_eq!(addon.linked_at.as_deref(), Some("123"));
+            assert_eq!(addon.match_confidence.as_deref(), Some("very-high"));
+            assert_eq!(addon.remote_download_url, None);
+            assert_eq!(addon.file_name, None);
+            assert_eq!(addon.md5, None);
+        });
     }
 
     fn test_local_addon(folder_name: &str, valid_manifest: bool, is_library: bool) -> LocalAddon {

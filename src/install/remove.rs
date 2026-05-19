@@ -404,7 +404,6 @@ mod tests {
         remove_installed_addon(&addons_dir, "SampleAddon", false).unwrap();
 
         assert!(!backup_dir.exists());
-        assert!(!dir.path().join(".scribe-addon-manager").exists());
     }
 
     #[test]

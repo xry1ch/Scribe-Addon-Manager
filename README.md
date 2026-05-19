@@ -20,7 +20,7 @@ A desktop addon manager for The Elder Scrolls Online, focused on safe addon inst
 - Optionally remove matching SavedVariables during uninstall.
 - Clear matching SavedVariables for an installed addon without uninstalling it.
 - Create manual compressed backups, optionally including SavedVariables.
-- Inspect and restore Scribe backup ZIP files.
+- Inspect and restore Crux backup ZIP files.
 - Cache HTTP metadata and remote images.
 - Import or adopt existing local addons for more reliable future update checks.
 - Resolve remote matches for manually installed or ambiguous local addons.
@@ -32,9 +32,15 @@ A desktop addon manager for The Elder Scrolls Online, focused on safe addon inst
 
 Get the latest release from GitHub Releases:
 
-`https://github.com/xry1ch/Scribe-Addon-Manager/releases`
+`https://github.com/xry1ch/Crux-Addon-Manager/releases`
 
 Download the installer or executable for your platform, then run the app.
+
+Release assets use these base names:
+
+- `Crux.Addon.Manager.Setup.exe`
+- `Crux.Addon.Manager.Portable.exe`
+- `Crux.Addon.Manager.macOS.dmg`
 
 ### From Source
 
@@ -47,8 +53,8 @@ Requirements:
 Clone and run the desktop app:
 
 ```bash
-git clone https://github.com/xry1ch/Scribe-Addon-Manager.git
-cd Scribe-Addon-Manager
+git clone https://github.com/xry1ch/Crux-Addon-Manager.git
+cd Crux-Addon-Manager
 npm install
 npm run tauri -- dev
 ```
@@ -62,14 +68,14 @@ npm run tauri -- build
 
 ## Basic Usage
 
-1. Start Scribe Addon Manager.
+1. Start Crux Addon Manager.
 2. Confirm or select your ESO `AddOns` folder. On Windows this is usually under `Documents\Elder Scrolls Online\live\AddOns`.
 3. Use Installed to review local addons, update candidates, dependencies, and unmatched addons.
 4. Use Search to browse addons and open addon details.
 5. Review the install or update preview before confirming changes.
 6. Configure a backup folder in Settings before large update or reinstall work.
 
-On first setup, Scribe can import existing addon matches as the current baseline. This helps prevent already-installed addons from being treated as unmanaged when checking for future updates.
+On first setup, Crux can import existing addon matches as the current baseline. This helps prevent already-installed addons from being treated as unmanaged when checking for future updates.
 
 ## Development
 
@@ -103,4 +109,4 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## License
 
-Scribe Addon Manager is licensed under `GPL-3.0-only`. See [LICENSE](LICENSE).
+Crux Addon Manager is licensed under `GPL-3.0-only`. See [LICENSE](LICENSE).

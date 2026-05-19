@@ -276,7 +276,7 @@ fn create_compressed_backup_at_with_reader(
 
     debug!("creating compressed AddOns backup at {:?}", backup_zip_path);
     let mut temp_file = Builder::new()
-        .prefix(".scribe-backup-")
+        .prefix(".crux-backup-")
         .suffix(".zip.tmp")
         .tempfile_in(&backup_dir)?;
 
@@ -524,7 +524,7 @@ fn create_unique_backup_zip_path(
     backup_dir: &Path,
     timestamp: &str,
 ) -> Result<PathBuf, BackupError> {
-    let base_name = format!("Scribe-Backup-{timestamp}");
+    let base_name = format!("Crux-Backup-{timestamp}");
     for suffix in 0.. {
         let name = if suffix == 0 {
             format!("{base_name}.zip")
@@ -816,7 +816,7 @@ fn extract_backup_zip_to_temp(
     let mut archive = ZipArchive::new(file)?;
     let inspection = inspect_backup_archive(zip_path, &mut archive)?;
     let temp_dir = Builder::new()
-        .prefix(".scribe-restore-extract-")
+        .prefix(".crux-restore-extract-")
         .tempdir_in(live_dir)?;
 
     for index in 0..archive.len() {
@@ -1058,7 +1058,7 @@ fn ensure_rollback_root(
 }
 
 fn create_unique_rollback_folder(live_dir: &Path, timestamp: &str) -> Result<PathBuf, BackupError> {
-    let base_name = format!(".scribe-restore-rollback-{timestamp}");
+    let base_name = format!(".crux-restore-rollback-{timestamp}");
     for suffix in 0.. {
         let name = if suffix == 0 {
             base_name.clone()
@@ -1280,7 +1280,7 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy(),
-            format!("Scribe-Backup-{TIMESTAMP}.zip")
+            format!("Crux-Backup-{TIMESTAMP}.zip")
         );
         assert!(!result.included_saved_variables);
         assert_eq!(result.file_count, 1);
@@ -1377,7 +1377,7 @@ mod tests {
         );
         fs::create_dir_all(&backup_dir).unwrap();
         fs::write(
-            backup_dir.join(format!("Scribe-Backup-{TIMESTAMP}.zip")),
+            backup_dir.join(format!("Crux-Backup-{TIMESTAMP}.zip")),
             "taken",
         )
         .unwrap();
@@ -1392,7 +1392,7 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy(),
-            format!("Scribe-Backup-{TIMESTAMP}-1.zip")
+            format!("Crux-Backup-{TIMESTAMP}-1.zip")
         );
     }
 

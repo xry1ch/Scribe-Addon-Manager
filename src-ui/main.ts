@@ -276,15 +276,15 @@ const ADDON_CONTEXT_MENU_WIDTH = 224;
 const ADDON_CONTEXT_MENU_HEIGHT = 132;
 const CONTEXT_MENU_MARGIN = 8;
 const SEARCH_SCROLL_THRESHOLD_PX = 300;
-const UPDATE_ALL_PROGRESS_EVENT = "scribe-update-all-progress";
+const UPDATE_ALL_PROGRESS_EVENT = "crux-update-all-progress";
 const TOAST_AUTO_DISMISS_MS = 4200;
 const TEXT_INPUT_IDS = {
-  setupAddonsPath: "scribe-setup-addons-path",
-  installedFilter: "scribe-installed-filter",
-  addonSearch: "scribe-addon-search",
-  settingsAddonsPath: "scribe-addons-path",
-  settingsBackupFolder: "scribe-backup-folder",
-  settingsDownloadFolder: "scribe-download-folder",
+  setupAddonsPath: "crux-setup-addons-path",
+  installedFilter: "crux-installed-filter",
+  addonSearch: "crux-addon-search",
+  settingsAddonsPath: "crux-addons-path",
+  settingsBackupFolder: "crux-backup-folder",
+  settingsDownloadFolder: "crux-download-folder",
 } as const;
 const noAutocompleteAttrs = [
   `autocomplete="off"`,
@@ -377,7 +377,7 @@ function render() {
         <div class="brand sidebar-brand">
           ${brandMark()}
           <div>
-            <h1>Scribe</h1>
+            <h1>Crux</h1>
             <p>ESO Addon Manager</p>
           </div>
         </div>
@@ -435,13 +435,13 @@ function renderToast(toast: ToastNotification) {
 
 function renderStartupLoader() {
   return `
-    <main id="startup-loader" class="startup-loader" role="status" aria-live="polite" aria-label="Loading Scribe">
+    <main id="startup-loader" class="startup-loader" role="status" aria-live="polite" aria-label="Loading Crux">
       <div class="startup-loader-content">
         <span class="startup-logo-frame" aria-hidden="true">
           <img class="startup-logo" src="${escapeAttr(logoUrl)}" alt="" />
         </span>
         <div>
-          <h1>Scribe</h1>
+          <h1>Crux</h1>
           <p class="startup-subtitle">ESO Addon Manager</p>
         </div>
         <span class="startup-shimmer" aria-hidden="true"></span>
@@ -459,11 +459,11 @@ function renderStartupError() {
           <img class="startup-logo" src="${escapeAttr(logoUrl)}" alt="" />
         </span>
         <div>
-          <h1>Scribe</h1>
+          <h1>Crux</h1>
           <p class="startup-subtitle">ESO Addon Manager</p>
         </div>
         <div class="startup-error-box">
-          <h2>Could not start Scribe</h2>
+          <h2>Could not start Crux</h2>
           <p>${escapeHtml(state.startupFatalError ?? "An unknown startup error occurred.")}</p>
           <button class="secondary startup-retry-button" id="retry-startup" type="button">Retry</button>
         </div>
@@ -489,14 +489,14 @@ function renderInitialSetup() {
         <div class="brand setup-brand">
           ${brandMark()}
           <div>
-            <h1>Scribe</h1>
+            <h1>Crux</h1>
             <p>ESO Addon Manager</p>
           </div>
         </div>
         ${state.error ? `<div class="banner error">${escapeHtml(state.error)}</div>` : ""}
         <div class="setup-heading">
           <h2>Select AddOns Path</h2>
-          <p>Choose the ESO AddOns folder Scribe should manage.</p>
+          <p>Choose the ESO AddOns folder Crux should manage.</p>
         </div>
         ${state.detectedAddonsPath ? `<div class="banner info">Detected AddOns path: ${escapeHtml(state.detectedAddonsPath)}</div>` : `<div class="banner warning">No ESO AddOns path was detected automatically.</div>`}
         <div class="field" id="setup-addons-field">
@@ -527,8 +527,8 @@ function renderInitialImportModal() {
         <div class="modal-icon">${icon("target")}</div>
         <div class="modal-content">
           <h2 id="setup-import-title">Import Existing AddOns As Current</h2>
-          <p>Scribe found ${state.setupExistingAddonsCount} existing addon${state.setupExistingAddonsCount === 1 ? "" : "s"} in this folder.</p>
-          <p>Before continuing, update them with your current addon manager. Scribe cannot reliably verify every existing installed version.</p>
+          <p>Crux found ${state.setupExistingAddonsCount} existing addon${state.setupExistingAddonsCount === 1 ? "" : "s"} in this folder.</p>
+          <p>Before continuing, update them with your current addon manager. Crux cannot reliably verify every existing installed version.</p>
           <p>If you confirm, matched existing addons will be imported as up to date and used as the baseline for future updates.</p>
           <div class="modal-path" title="${escapeAttr(state.setupImportPath)}">${escapeHtml(state.setupImportPath)}</div>
         </div>
@@ -554,7 +554,7 @@ function renderRemoveConfirmationModal() {
           <p class="modal-path" title="${escapeAttr(local.folder_name)}">${escapeHtml(local.folder_name)}</p>
           <div class="modal-option">
             <label class="checkbox-line" for="remove-addon-savedvariables">
-              <input ${checkboxInputAttrs("remove-addon-savedvariables", "scribe-remove-addon-savedvariables")} type="checkbox" ${state.removeSavedVariables ? "checked" : ""} ${disabledAttr()} />
+              <input ${checkboxInputAttrs("remove-addon-savedvariables", "crux-remove-addon-savedvariables")} type="checkbox" ${state.removeSavedVariables ? "checked" : ""} ${disabledAttr()} />
               <span>Also delete SavedVariables</span>
             </label>
             <p class="setting-helper">SavedVariables store addon settings and account/character data. Leave this unchecked to keep your settings.</p>
@@ -601,7 +601,7 @@ function renderManualBackupConfirmationModal() {
           <p>This will create a compressed ZIP backup in the configured backup folder.</p>
           <div class="modal-option">
             <label class="checkbox-line" for="manual-backup-savedvariables">
-              <input ${checkboxInputAttrs("manual-backup-savedvariables", "scribe-manual-backup-savedvariables")} type="checkbox" ${state.manualBackupIncludeSavedVariables ? "checked" : ""} ${disabledAttr()} />
+              <input ${checkboxInputAttrs("manual-backup-savedvariables", "crux-manual-backup-savedvariables")} type="checkbox" ${state.manualBackupIncludeSavedVariables ? "checked" : ""} ${disabledAttr()} />
               <span>Include SavedVariables</span>
             </label>
             <p class="setting-helper">SavedVariables contain addon settings and account/character data.</p>
@@ -637,11 +637,11 @@ function renderRestoreBackupModal() {
           ${inspection.contains_saved_variables ? pathDisplay(`Target SavedVariables folder: ${inspection.target_saved_variables_folder}`) : ""}
           <div class="modal-option">
             <label class="checkbox-line" for="restore-backup-addons">
-              <input ${checkboxInputAttrs("restore-backup-addons", "scribe-restore-backup-addons")} type="checkbox" ${state.restoreAddons ? "checked" : ""} ${disabledAttr()} />
+              <input ${checkboxInputAttrs("restore-backup-addons", "crux-restore-backup-addons")} type="checkbox" ${state.restoreAddons ? "checked" : ""} ${disabledAttr()} />
               <span>Restore AddOns</span>
             </label>
             <label class="checkbox-line ${inspection.contains_saved_variables ? "" : "disabled-option"}" for="restore-backup-savedvariables">
-              <input ${checkboxInputAttrs("restore-backup-savedvariables", "scribe-restore-backup-savedvariables")} type="checkbox" ${state.restoreSavedVariables ? "checked" : ""} ${!inspection.contains_saved_variables || state.loading ? "disabled" : ""} />
+              <input ${checkboxInputAttrs("restore-backup-savedvariables", "crux-restore-backup-savedvariables")} type="checkbox" ${state.restoreSavedVariables ? "checked" : ""} ${!inspection.contains_saved_variables || state.loading ? "disabled" : ""} />
               <span>Restore SavedVariables</span>
             </label>
           </div>
@@ -1640,7 +1640,7 @@ function renderSettings() {
   const settings = state.settings;
   const addonsMissing = Boolean(settings?.addons_dir_override) && state.addonsPathExists === false;
   return `
-    ${pageHeader("Settings", "Choose where Scribe manages addons and how downloads are handled.", `
+    ${pageHeader("Settings", "Choose where Crux manages addons and how downloads are handled.", `
       <div class="toolbar-actions">
         <button class="secondary icon-button" id="reset-settings" ${disabledAttr()}>${loadingButtonContent(`${icon("rotate")} Reset`, "Loading...", "settings")}</button>
         <button class="primary icon-button" id="save-settings" ${disabledAttr()}>${loadingButtonContent(`${icon("check")} Save`, "Loading...", "settings")}</button>
@@ -1701,7 +1701,7 @@ function renderFolderSettings(settings: AppSettings | null) {
       <div class="settings-detail-heading">
         <div>
           <h3>Folders</h3>
-          <p>Leave blank to let Scribe choose automatically.</p>
+          <p>Leave blank to let Crux choose automatically.</p>
         </div>
       </div>
       <div class="settings-detail-body">
@@ -1712,8 +1712,8 @@ function renderFolderSettings(settings: AppSettings | null) {
         })}
         ${settingField("Backup folder", TEXT_INPUT_IDS.settingsBackupFolder, settings?.backup_dir_override ?? "", {
           browse: true,
-          helper: "Leave blank to store backups in Scribe's app data folder.",
-          placeholder: "Use Scribe's default backup folder",
+          helper: "Leave blank to store backups in Crux's app data folder.",
+          placeholder: "Use Crux's default backup folder",
         })}
         ${renderManualBackupSettings()}
       </div>
@@ -1727,7 +1727,7 @@ function renderDownloadsSettings(settings: AppSettings | null) {
       <div class="settings-detail-heading">
         <div>
           <h3>Downloads</h3>
-          <p>Control where update packages go and which uncertain updates Scribe shows.</p>
+          <p>Control where update packages go and which uncertain updates Crux shows.</p>
         </div>
       </div>
       <div class="settings-detail-body">
@@ -1746,7 +1746,7 @@ function renderDownloadsSettings(settings: AppSettings | null) {
           "Show uncertain updates",
           "settings-include-unknown",
           settings?.include_unknown_updates_default ?? false,
-          "Shows addons where Scribe cannot confidently compare versions.",
+          "Shows addons where Crux cannot confidently compare versions.",
         )}
       </div>
     </section>
@@ -1773,7 +1773,7 @@ function renderDisplaySettings(settings: AppSettings | null) {
           "Hide installed libraries",
           "settings-hide-libraries-installed",
           settings?.hide_libraries_in_installed ?? false,
-          "Installed libraries will be hidden unless Scribe finds an update for them.",
+          "Installed libraries will be hidden unless Crux finds an update for them.",
         )}
       </div>
     </section>
@@ -2129,7 +2129,7 @@ function updateAllStoppedMessage(result: ApplyUpdateAllResponse) {
   const failure = result.failure;
   const updatedCount = result.results.length;
   const updatedText = `${updatedCount} addon${updatedCount === 1 ? "" : "s"}`;
-  return `Scribe updated ${updatedText} before stopping at ${plainEsoText(failure?.local_folder ?? "the next addon")}.`;
+  return `Crux updated ${updatedText} before stopping at ${plainEsoText(failure?.local_folder ?? "the next addon")}.`;
 }
 
 function resultCheckIcon() {
@@ -3032,8 +3032,8 @@ function refreshInstalledAfterUpdate(target?: string) {
       syncSelectedStateAfterUpdate(target);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      state.warning = `Update completed, but Scribe could not refresh installed addons. ${message}`;
-      addToast("warning", "Refresh failed", "Update completed, but Scribe could not refresh installed addons.");
+      state.warning = `Update completed, but Crux could not refresh installed addons. ${message}`;
+      addToast("warning", "Refresh failed", "Update completed, but Crux could not refresh installed addons.");
     }
     render();
   })();

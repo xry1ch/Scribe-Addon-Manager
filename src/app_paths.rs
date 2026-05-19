@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 use directories::BaseDirs;
 
-pub const APP_DISPLAY_NAME: &str = "Scribe Addon Manager";
-pub const APP_SLUG: &str = "scribe-addon-manager";
-pub const APP_DATA_DIR_ENV: &str = "SCRIBE_ADDON_MANAGER_APP_DATA_DIR";
-pub const APP_CACHE_DIR_ENV: &str = "SCRIBE_ADDON_MANAGER_APP_CACHE_DIR";
+pub const APP_DISPLAY_NAME: &str = "Crux Addon Manager";
+pub const APP_SLUG: &str = "crux-addon-manager";
+pub const APP_DATA_DIR_ENV: &str = "CRUX_ADDON_MANAGER_APP_DATA_DIR";
+pub const APP_CACHE_DIR_ENV: &str = "CRUX_ADDON_MANAGER_APP_CACHE_DIR";
 
 pub fn app_data_dir() -> io::Result<PathBuf> {
     #[cfg(test)]
@@ -43,17 +43,17 @@ pub fn app_cache_dir() -> io::Result<PathBuf> {
     let base = BaseDirs::new()
         .ok_or_else(|| missing_base_dir("cache"))?
         .cache_dir()
-        .to_path_buf()
-        .join(app_dir_name());
+        .to_path_buf();
+    let app_cache_root = base.join(app_dir_name());
 
     #[cfg(windows)]
     {
-        Ok(base.join("cache"))
+        Ok(app_cache_root.join("cache"))
     }
 
     #[cfg(not(windows))]
     {
-        Ok(base)
+        Ok(app_cache_root)
     }
 }
 
