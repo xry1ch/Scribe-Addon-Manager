@@ -735,15 +735,26 @@ fn shared_token_count(left: &str, right: &str) -> usize {
 }
 
 fn version_status(local: &LocalAddon, remote: &AddonSummary) -> MatchStatus {
-    let local_version = local.addon_version.as_deref().or(local.version.as_deref());
     let remote_version = remote.version.as_deref();
 
-    match compare_versions(local_version, remote_version) {
+    match compare_local_manifest_version(local, remote_version) {
         VersionComparison::RemoteNewer => MatchStatus::PossibleUpdate,
         VersionComparison::Same => MatchStatus::Matched,
         VersionComparison::LocalNewer => MatchStatus::LocalNewer,
         VersionComparison::Unknown => MatchStatus::UnknownUpdate,
     }
+}
+
+fn compare_local_manifest_version(
+    local: &LocalAddon,
+    remote_version: Option<&str>,
+) -> VersionComparison {
+    let addon_version_comparison = compare_versions(local.addon_version.as_deref(), remote_version);
+    if addon_version_comparison != VersionComparison::Unknown {
+        return addon_version_comparison;
+    }
+
+    compare_versions(local.version.as_deref(), remote_version)
 }
 
 fn normalize_identity(value: &str) -> String {
@@ -824,6 +835,17 @@ mod tests {
             description: None,
             valid_manifest: true,
         }
+    }
+
+    fn local_with_versions(
+        folder_name: &str,
+        title: Option<&str>,
+        addon_version: Option<&str>,
+        version: Option<&str>,
+    ) -> LocalAddon {
+        let mut local = local(folder_name, title, addon_version);
+        local.version = version.map(ToOwned::to_owned);
+        local
     }
 
     fn local_with_author(
@@ -1198,6 +1220,46 @@ mod tests {
         let result = match_one(
             &local("Addon", Some("Addon"), Some("1.0")),
             &[remote("1", "Addon", "1.1", &["Addon"])],
+        );
+
+        assert_eq!(result.status, MatchStatus::PossibleUpdate);
+    }
+
+    #[test]
+    fn falls_back_to_manifest_version_when_addon_version_is_incomparable() {
+        let result = match_one(
+            &local_with_versions(
+                "DolgubonsLazyWritCreator",
+                Some("Dolgubon's Lazy Writ Creator v4.0.5.7.5"),
+                Some("4057"),
+                Some("4.0.5.7.5"),
+            ),
+            &[remote(
+                "112",
+                "Dolgubon's Lazy Writ Crafter",
+                "4.0.5.7.6",
+                &["DolgubonsLazyWritCreator"],
+            )],
+        );
+
+        assert_eq!(result.status, MatchStatus::PossibleUpdate);
+    }
+
+    #[test]
+    fn falls_back_to_two_part_manifest_version_when_addon_version_is_incomparable() {
+        let result = match_one(
+            &local_with_versions(
+                "LibLazyCrafting",
+                Some("LibLazyCrafting v4.035"),
+                Some("4035"),
+                Some("4.035"),
+            ),
+            &[remote(
+                "1594",
+                "LibLazyCrafting",
+                "4.038",
+                &["LibLazyCrafting"],
+            )],
         );
 
         assert_eq!(result.status, MatchStatus::PossibleUpdate);
